@@ -1,0 +1,31 @@
+# Local system files
+.DS_Store
+Thumbs.db
+
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+!.env.*.example
+*.pem
+*.key
+
+# Dependencies and caches
+node_modules/
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.cache/
+coverage/
+
+# Reproducible build and rendering output
+dist/
+build/
+renders/
+outputs/
+*.log
+
+# Local large media; keep durable references and backups separately
+media-local/
+scratch/
