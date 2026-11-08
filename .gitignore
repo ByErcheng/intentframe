@@ -29,3 +29,12 @@ outputs/
 # Local large media; keep durable references and backups separately
 media-local/
 scratch/
+
+# 长期本机资产与实际执行证据不进入系统仓库，兼容旧存放位置
+/tests/evidence/
+/intentframe-data/
+/intentframe-backups/
+/works/
+/media/
+/experience/
+/validation/

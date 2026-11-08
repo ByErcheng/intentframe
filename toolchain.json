@@ -1,0 +1,23 @@
+{
+  "dataRoot": "../intentframe-data",
+  "backupRoot": "../intentframe-backups",
+  "tools": {
+    "node": {
+      "path": "../intentframe-tools/bin/node",
+      "version": "24.22.1",
+      "source": "https://nodejs.org/download/release/v24.22.1/",
+      "archiveSha256": "654ba79de6155647e22321932b45f2a1ccb705976cc337c9b8e278beb085a628"
+    },
+    "codex": {
+      "path": "../intentframe-tools/codex-0.163.0/node_modules/.bin/codex",
+      "version": "0.163.0",
+      "source": "https://www.npmjs.com/package/@openai/codex/v/0.163.0"
+    },
+    "restic": {
+      "path": "../intentframe-tools/restic-0.19.1/restic",
+      "version": "0.19.1",
+      "source": "https://github.com/restic/restic/releases/tag/v0.19.1",
+      "archiveSha256": "7be0a144ccc377880f294204aa271d76e4b79554b42a751151d425ce6ebac143"
+    }
+  }
+}

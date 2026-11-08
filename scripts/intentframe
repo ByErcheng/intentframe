@@ -1,0 +1,13 @@
+#!/bin/sh
+set -e
+PROJECT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+if [ -z "$INTENTFRAME_NODE_BIN" ]; then
+  INTENTFRAME_NODE_BIN="$PROJECT_DIR/../intentframe-tools/bin/node"
+fi
+if [ ! -x "$INTENTFRAME_NODE_BIN" ]; then
+  printf '%s\n' '找不到 Node，请按架构文档安装固定工具，或设置 INTENTFRAME_NODE_BIN。' >&2
+  exit 1
+fi
+PATH="$(dirname -- "$INTENTFRAME_NODE_BIN"):$PATH"
+export PATH
+exec "$INTENTFRAME_NODE_BIN" "$PROJECT_DIR/src/cli.ts" "$@"

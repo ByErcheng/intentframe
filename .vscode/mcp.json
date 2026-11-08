@@ -1,0 +1,13 @@
+  {
+  "servers": {
+    "intentframe": {
+      "type": "stdio",
+      "command": "/bin/sh",
+      "args": [
+        "${workspaceFolder}/scripts/intentframe",
+        "mcp"
+      ],
+      "cwd": "${workspaceFolder}"
+    }
+  }
+}
