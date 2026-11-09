@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import {
-  appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync,
+  appendFileSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync,
 } from "node:fs";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { z } from "zod";
@@ -21,6 +21,10 @@ const reviewSchema = z.object({
   source: z.enum(["user", "external_ai", "internal_check"]).optional(),
   checkedAt: z.string().optional(),
 });
+const confirmationSchema = z.object({
+  versionId: versionIdSchema, kind: z.enum(["direction", "acceptance"]),
+  userConfirmation: z.string(), scope: z.string().optional(), confirmedAt: z.string().optional(),
+});
 export const versionSchema = z.object({
   id: versionIdSchema,
   kind: z.enum(["sample", "complete"]),
@@ -35,6 +39,7 @@ export const versionSchema = z.object({
   sourceSnapshot: sourceSnapshotSchema.optional(),
   technicalCheck: z.record(z.string(), z.unknown()).optional(),
   review: reviewSchema,
+  reviews: z.array(reviewSchema).optional(),
   acceptance: z.enum(["pending", "accepted"]),
   userConfirmation: z.string().optional(), error: z.string().optional(),
 });
@@ -50,10 +55,42 @@ export const workSchema = z.object({
     sampleVersionId: versionIdSchema, scope: z.string(), userConfirmation: z.string(), confirmedAt: z.string(),
   }).nullable(),
   feedback: z.array(feedbackSchema),
+  confirmations: z.array(confirmationSchema).optional(),
   versions: z.array(versionSchema),
 });
 export type WorkRecord = z.infer<typeof workSchema>;
 const now = () => new Date().toISOString();
+
+function validateRecord(input: unknown): WorkRecord {
+  const record = workSchema.parse(input), workPath = "works/" + record.id;
+  if (record.briefPath !== workPath + "/brief.md") throw new Error("需求路径与所属作品不一致。");
+  const ids = new Set<string>();
+  for (const version of record.versions) {
+    if (ids.has(version.id)) throw new Error("作品版本编号重复。");
+    ids.add(version.id);
+    if (version.sourcePath !== workPath + "/versions/" + version.id + "/source/entry.tsx" ||
+        version.mediaPath !== "media/" + record.id + "/" + version.id + "/video.mp4") {
+      throw new Error("源码或媒体路径与所属作品版本不一致。");
+    }
+  }
+  return record;
+}
+
+// 在第一次更新历史时保留旧记录中的已知事实，不补造原记录没有的确认时间。
+function preserveConfirmations(record: WorkRecord): NonNullable<WorkRecord["confirmations"]> {
+  if (record.confirmations) return record.confirmations;
+  record.confirmations = [];
+  if (record.directionApproval) {
+    const { sampleVersionId, ...confirmation } = record.directionApproval;
+    record.confirmations.push({ kind: "direction", versionId: sampleVersionId, ...confirmation });
+  }
+  for (const version of record.versions) {
+    if (version.acceptance === "accepted" && version.userConfirmation) {
+      record.confirmations.push({ kind: "acceptance", versionId: version.id, userConfirmation: version.userConfirmation });
+    }
+  }
+  return record.confirmations;
+}
 
 /** 同一作品的记录是一处事实来源；媒体与源码路径相对数据根目录保存。 */
 export class WorkStore {
@@ -69,21 +106,30 @@ export class WorkStore {
     if (isAbsolute(path) || child === ".." || child.startsWith(".." + sep)) {
       throw new Error("记录路径必须位于数据根目录内。");
     }
+    // 数据根目录可以由用户显式指定；内部链接不能重定向任务、源码或媒体写入。
+    let current = this.dataRoot;
+    for (const part of child.split(sep).filter(Boolean)) {
+      current = join(current, part);
+      if (lstatSync(current, { throwIfNoEntry: false })?.isSymbolicLink()) {
+        throw new Error("数据目录内的记录路径不能经过符号链接：" + path);
+      }
+    }
     return target;
   }
 
   workDirectory(id: string): string {
-    return join(this.dataRoot, "works", idSchema.parse(id));
+    return this.resolvePath(join("works", idSchema.parse(id)));
   }
 
   read(id: string): WorkRecord {
-    const record = workSchema.parse(JSON.parse(readFileSync(join(this.workDirectory(id), "task.json"), "utf8")));
+    const path = this.resolvePath(join("works", idSchema.parse(id), "task.json"));
+    const record = validateRecord(JSON.parse(readFileSync(path, "utf8")));
     if (record.id !== id) throw new Error("任务记录的标识与目录不一致。");
     return record;
   }
 
   list() {
-    const directory = join(this.dataRoot, "works");
+    const directory = this.resolvePath("works");
     if (!existsSync(directory)) return [];
     return readdirSync(directory, { withFileTypes: true })
       .filter(entry => entry.isDirectory() && existsSync(join(directory, entry.name, "task.json")))
@@ -97,8 +143,8 @@ export class WorkStore {
   }
 
   save(record: WorkRecord): void {
-    const valid = workSchema.parse(record);
-    const target = join(this.workDirectory(valid.id), "task.json");
+    const valid = validateRecord(record);
+    const target = this.resolvePath(join("works", valid.id, "task.json"));
     const temporary = target + "." + randomUUID() + ".tmp";
     writeFileSync(temporary, JSON.stringify(valid, null, 2) + "\n", { flag: "wx" });
     renameSync(temporary, target);
@@ -151,7 +197,10 @@ export class WorkStore {
       const record = this.read(id);
       this.version(record, versionId);
       record.feedback.push({ id: randomUUID(), versionId, text, source, changesDirection, createdAt: now() });
-      if (changesDirection) record.directionApproval = null;
+      if (changesDirection) {
+        preserveConfirmations(record);
+        record.directionApproval = null;
+      }
       this.save(record);
       return record;
     });
@@ -167,17 +216,20 @@ export class WorkStore {
       const version = this.version(record, versionId);
       if (version.production !== "ready") throw new Error("只能确认已实际生成的作品版本。");
       this.assertAvailable(version);
+      const confirmations = preserveConfirmations(record), confirmedAt = now();
       if (kind === "direction") {
         if (version.kind !== "sample") throw new Error("方向确认须关联样例版本。");
         record.directionApproval = {
           sampleVersionId: versionId, scope: z.string().trim().min(1).parse(scope),
-          userConfirmation, confirmedAt: now(),
+          userConfirmation, confirmedAt,
         };
       } else {
         if (version.kind !== "complete") throw new Error("成片认可须关联完整作品版本。");
         version.acceptance = "accepted";
         version.userConfirmation = userConfirmation;
       }
+      confirmations.push({ kind, versionId, userConfirmation, confirmedAt,
+        ...(kind === "direction" ? { scope: record.directionApproval!.scope } : {}) });
       this.save(record);
       return record;
     });
@@ -193,16 +245,19 @@ export class WorkStore {
       const version = this.version(record, versionId);
       if (version.production !== "ready") throw new Error("须先取得实际作品再记录审查。");
       this.assertAvailable(version);
+      version.reviews ??= version.review.status === "not_reviewed" ? [] : [{ ...version.review }];
       version.review = { status, notes, source, checkedAt: now() };
+      version.reviews.push(version.review);
       this.save(record);
       return record;
     });
   }
 
   appendEvent(id: string, runId: string, event: Record<string, unknown>): void {
+    const path = this.resolvePath(join("works", idSchema.parse(id), "runs", idSchema.parse(runId) + ".jsonl"));
     const directory = join(this.workDirectory(id), "runs");
     mkdirSync(directory, { recursive: true });
-    appendFileSync(join(directory, idSchema.parse(runId) + ".jsonl"), JSON.stringify({ at: now(), ...event }) + "\n");
+    appendFileSync(path, JSON.stringify({ at: now(), ...event }) + "\n");
   }
 
   verifySource(version: WorkVersion): void {

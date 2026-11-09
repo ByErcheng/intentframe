@@ -27,7 +27,7 @@ test("真实 Restic 恢复核对完整清单，报告只写本机数据目录", 
   } finally { root.cleanup(); }
 });
 
-for (const mode of ["new-file", "active-lock", "temporary-change"]) {
+for (const mode of ["new-file", "active-lock", "temporary-change", "mode-change", "root-mode-change"]) {
   test("备份清点后并发变化不能报告通过：" + mode, { timeout: 60_000 }, () => {
     const root = fixtureRoot();
     try {
@@ -36,12 +36,14 @@ for (const mode of ["new-file", "active-lock", "temporary-change"]) {
       const script = [
         "#!" + process.execPath,
         'import {execFileSync} from "node:child_process";',
-        'import {mkdirSync,writeFileSync} from "node:fs";',
+        'import {chmodSync,mkdirSync,statSync,writeFileSync} from "node:fs";',
         "const args=process.argv.slice(2), data=" + JSON.stringify(options.dataRoot) + ";",
         'const copying=args.includes("backup");',
         "if(copying){",
         mode === "active-lock" ? 'mkdirSync(data+"/work/.write-lock",{recursive:true});writeFileSync(data+"/work/.write-lock/owner.json","{}");' :
           mode === "new-file" ? 'writeFileSync(data+"/new-task.json",JSON.stringify({status:"running"}));' :
+          mode === "mode-change" ? 'chmodSync(data+"/task.txt",0o700);' :
+          mode === "root-mode-change" ? 'chmodSync(data,statSync(data).mode ^ 0o010);' :
           'writeFileSync(data+"/task.txt","复制期间改变的内容");',
         "}",
         "const output=execFileSync(" + JSON.stringify(configuration.restic) + ',args,{env:process.env,encoding:"utf8"});',

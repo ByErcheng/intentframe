@@ -23,6 +23,13 @@ const rpcMessageSchema = z.object({
 export class UnknownExecutionOutcome extends Error {}
 export class RpcRequestRejected extends Error {}
 
+/** 只有制作可能已开始且未取得终态，才需要阻止重发；握手失败不等于制作结果未知。 */
+export function executionFailureStatus(
+  error: unknown, phase: "preparing" | "awaiting_result" | "checking_result" | "rendering",
+): "failed" | "unknown" {
+  return phase === "awaiting_result" && !(error instanceof RpcRequestRejected) ? "unknown" : "failed";
+}
+
 export function describeError(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }

@@ -114,8 +114,11 @@ export async function renderVersion(entryPoint: string, output: string, cacheDir
   const previews: string[] = [];
   for (const [index, fraction] of [0.12, 0.5, 0.86].entries()) {
     const path = join(dirname(output), "frame-" + (index + 1) + ".png");
-    execFileSync(ffmpeg, ["-v", "error", "-ss", String(duration * fraction), "-i", output, "-frames:v", "1", "-y", path],
+    // 按有效帧号确定取图时间，避免极短片段定位到最后一帧之后。
+    const frame = Math.floor((composition.durationInFrames - 1) * fraction);
+    execFileSync(ffmpeg, ["-v", "error", "-ss", String(frame / composition.fps), "-i", output, "-frames:v", "1", "-y", path],
       { timeout: 30_000, env: mediaEnvironment() });
+    if (!existsSync(path) || statSync(path).size === 0) throw new Error("预览图片未实际生成：" + path);
     previews.push(path);
   }
   if (fileHash(output) !== videoSha256) throw new Error("检查期间成片发生变化，结果未获确认。");

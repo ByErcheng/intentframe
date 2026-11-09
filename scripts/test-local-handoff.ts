@@ -9,7 +9,7 @@ import { McpServer } from "@modelcontextprotocol/server";
 import { serveStdio } from "@modelcontextprotocol/server/stdio";
 import { z } from "zod";
 import { configuration } from "../src/config.ts";
-import { CodexAppServerClient, UnknownExecutionOutcome, RpcRequestRejected, codexTurnSchema, describeError } from "../src/runtime/codex-client.ts";
+import { CodexAppServerClient, UnknownExecutionOutcome, RpcRequestRejected, codexTurnSchema, describeError, executionFailureStatus } from "../src/runtime/codex-client.ts";
 
 /**
  * 固定范围的接入验证：MCP 客户端 → 测试 MCP 服务 → Codex → 文本文件。
@@ -67,17 +67,6 @@ function appendExecutionEvent(taskDirectory: string, data: Record<string, unknow
 
 type ProbeStage = "create" | "resume" | "fresh";
 type ExecutionPhase = "preparing" | "awaiting_result" | "checking_result";
-
-/**
- * 只在捕获异常时调用，执行阶段说明此时已经取得哪些事实：
- * 请求被明确拒绝，或已取得终态后校验失败，都有失败依据；
- * 已发出请求却未取得终态时，不能根据通信错误推断远端执行结果。
- */
-function determineFailureStatus(error: unknown, phase: ExecutionPhase): "failed" | "unknown" {
-  if (error instanceof RpcRequestRejected) return "failed";
-  if (error instanceof UnknownExecutionOutcome || phase === "awaiting_result") return "unknown";
-  return "failed";
-}
 
 function buildProbePrompt(stage: ProbeStage, version: number, marker: string): string {
   // 提示词属于被测行为，不能当作普通说明注释翻译。
@@ -165,7 +154,7 @@ async function runProbeStage(taskDirectory: string, stage: ProbeStage): Promise<
     });
     return state;
   } catch (error) {
-    state.status = determineFailureStatus(error, phase);
+    state.status = executionFailureStatus(error, phase);
     state.error = describeError(error);
     saveTaskState(taskDirectory, state);
     appendExecutionEvent(taskDirectory, {
@@ -259,11 +248,11 @@ function createTestDirectory(): string {
 function verifyOutcomeRules(): void {
   // 按事实区分结果：同样的本地错误，在取得执行终态前后具有不同含义。
   const localError = new Error("本地文件无法读取");
-  assert.equal(determineFailureStatus(localError, "preparing"), "failed");
-  assert.equal(determineFailureStatus(localError, "awaiting_result"), "unknown");
-  assert.equal(determineFailureStatus(localError, "checking_result"), "failed");
-  assert.equal(determineFailureStatus(new RpcRequestRejected("请求被拒绝"), "awaiting_result"), "failed");
-  assert.equal(determineFailureStatus(new UnknownExecutionOutcome("响应丢失"), "preparing"), "unknown");
+  assert.equal(executionFailureStatus(localError, "preparing"), "failed");
+  assert.equal(executionFailureStatus(localError, "awaiting_result"), "unknown");
+  assert.equal(executionFailureStatus(localError, "checking_result"), "failed");
+  assert.equal(executionFailureStatus(new RpcRequestRejected("请求被拒绝"), "awaiting_result"), "failed");
+  assert.equal(executionFailureStatus(new UnknownExecutionOutcome("响应丢失"), "preparing"), "failed");
 }
 
 function verifyArtifactChecks(testDirectory: string): void {

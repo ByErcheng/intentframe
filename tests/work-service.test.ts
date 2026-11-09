@@ -163,3 +163,69 @@ test("旧记录按已有证据读取，不补造完整快照或改写认可", as
     assert.equal(readFileSync(path, "utf8"), before);
   } finally { root.cleanup(); }
 });
+
+test("部分完成后等待输入，新会话延续草稿与阻塞依据但不能提前渲染", async () => {
+  const root = fixtureRoot();
+  try {
+    const store = new WorkStore(join(root.path, "data")), work = store.create("部分完成", "保留已完成修改。");
+    work.versions.push(readyVersion(store, work.id, "v001", "sample")); store.save(work);
+    await store.feedback(work.id, "v001", "修改标题", "user");
+    const requested = await store.feedback(work.id, "v001", "补充参考图片", "user");
+    const partial = new WorkService(store, { codexExecutable: fakeCodex(root.path, "partial_input"), render: fixtureRender });
+    const blocked = await partial.produce(work.id, "sample");
+    const draft = blocked.versions.at(-1)!;
+    assert.equal(draft.production, "blocked");
+    assert(draft.sourceSnapshot, "部分完成的工程必须可核对并接续");
+    assert.deepEqual(draft.appliedFeedbackIds, [requested.feedback[0]!.id]);
+    await assert.rejects(partial.renderExisting(work.id, draft.id), /不能直接重渲染/);
+    const completed = await new WorkService(store, { codexExecutable: fakeCodex(root.path), render: fixtureRender }).produce(work.id, "sample");
+    const next = completed.versions.at(-1)!;
+    assert.equal(next.basedOnVersionId, draft.id);
+    assert.deepEqual(next.feedbackIds, [requested.feedback[1]!.id]);
+    assert(readFileSync(store.resolvePath(next.sourcePath), "utf8").includes("已保留的部分制作进度"));
+    assert(readFileSync(join(dirname(store.resolvePath(next.sourcePath)), "context.md"), "utf8").includes("请提供参考素材"));
+  } finally { root.cleanup(); }
+});
+
+test("制作请求发送前断线是明确准备失败，可以重新发起", async () => {
+  const root = fixtureRoot();
+  try {
+    const store = new WorkStore(join(root.path, "data")), work = store.create("准备断线", "不调用真实模型。");
+    const service = new WorkService(store, { codexExecutable: fakeCodex(root.path, "initialize_disconnect"), render: fixtureRender });
+    await assert.rejects(service.produce(work.id, "sample"));
+    assert.equal(store.read(work.id).execution.status, "failed");
+    const result = await new WorkService(store, { codexExecutable: fakeCodex(root.path), render: fixtureRender }).produce(work.id, "sample");
+    assert.equal(result.execution.status, "idle");
+  } finally { root.cleanup(); }
+});
+
+test("确认新方向后，完整制作不能绕回未延续该样例的历史基线", async () => {
+  const root = fixtureRoot();
+  try {
+    const store = new WorkStore(join(root.path, "data")), work = store.create("方向与基线", "已确认第二个方向。");
+    work.versions.push(readyVersion(store, work.id, "v001", "sample"), readyVersion(store, work.id, "v002", "sample"));
+    work.versions[1]!.basedOnVersionId = "v001"; store.save(work);
+    await store.confirm(work.id, "v002", "direction", "确认第二版样例", "第二个方向");
+    const service = new WorkService(store, { codexExecutable: fakeCodex(root.path), render: fixtureRender });
+    await assert.rejects(service.produce(work.id, "complete", undefined, "fresh", "v001", "从最早的工程开始"), /已确认.*样例|方向/);
+    assert.equal(store.read(work.id).versions.length, 2);
+    const complete = await service.produce(work.id, "complete");
+    assert.equal(complete.versions.at(-1)?.basedOnVersionId, "v002");
+  } finally { root.cleanup(); }
+});
+
+test("明确失败留下的草稿可接续编辑，但不会被当作完成工程渲染", async () => {
+  const root = fixtureRoot();
+  try {
+    const store = new WorkStore(join(root.path, "data")), work = store.create("失败草稿", "保留部分成果，不伪造完成。");
+    const service = new WorkService(store, { codexExecutable: fakeCodex(root.path, "partial_failed"), render: fixtureRender });
+    await assert.rejects(service.produce(work.id, "sample"));
+    const draft = store.read(work.id).versions[0]!;
+    assert.equal(draft.production, "failed");
+    assert(draft.sourceSnapshot);
+    await assert.rejects(service.renderExisting(work.id, draft.id), /不能直接重渲染/);
+    const continued = await new WorkService(store, { codexExecutable: fakeCodex(root.path), render: fixtureRender }).produce(work.id, "sample");
+    assert.equal(continued.versions.at(-1)?.basedOnVersionId, draft.id);
+    assert(readFileSync(store.resolvePath(continued.versions.at(-1)!.sourcePath), "utf8").includes("已保留的部分制作进度"));
+  } finally { root.cleanup(); }
+});

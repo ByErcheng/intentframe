@@ -13,15 +13,16 @@ function shouldExclude(name: string) {
 
 /** 完整目录清单包括新增文件、空目录与符号链接；不跟随链接读取目录外内容。 */
 function inventory(root: string): Map<string, string> {
-  const entries = new Map<string, string>();
+  const entries = new Map<string, string>([[".", "directory:" + (lstatSync(root).mode & 0o7777).toString(8)]]);
   function visit(directory: string, prefix: string) {
     for (const name of readdirSync(directory).sort()) {
       if (shouldExclude(name)) continue;
       if (name === ".write-lock") throw new Error("存在执行写锁，不能确认备份一致性。");
       const path = join(directory, name), key = prefix + name, stat = lstatSync(path);
-      if (stat.isDirectory()) { entries.set(key, "directory"); visit(path, key + "/"); }
+      const mode = (stat.mode & 0o7777).toString(8);
+      if (stat.isDirectory()) { entries.set(key, "directory:" + mode); visit(path, key + "/"); }
       else if (stat.isSymbolicLink()) entries.set(key, "symlink:" + readlinkSync(path));
-      else if (stat.isFile()) entries.set(key, "sha256:" + fileHash(path));
+      else if (stat.isFile()) entries.set(key, "mode:" + mode + ":sha256:" + fileHash(path));
       else throw new Error("备份包含不支持的文件类型：" + path);
     }
   }
@@ -82,8 +83,8 @@ export function backupLocal(options: BackupOptions = {
   const report = {
     at: new Date().toISOString(), result: "passed", snapshotId: summary.snapshot_id,
     repository, sources, restoredTo: target,
-    verifiedFiles: before.reduce((sum, list) => sum + [...list.values()].filter(value => value !== "directory").length, 0),
-    verification: "备份前、恢复结果及结束时源目录的完整清单和内容一致；包含新增、删除、内容变化及执行锁检查。",
+    verifiedFiles: before.reduce((sum, list) => sum + [...list.values()].filter(value => !value.startsWith("directory:")).length, 0),
+    verification: "备份前、恢复结果及结束时源目录的完整清单、权限和内容一致；包含新增、删除、内容或权限变化及执行锁检查。",
     excludes: ["node_modules", ".cache", ".git", ".env*", "*.key", "*.pem"],
     scope: "同一台 Mac 的不同文件夹；检测到并发变化则不报告通过，未自动删除快照或覆盖原文件。",
   };

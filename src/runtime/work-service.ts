@@ -9,7 +9,7 @@ import { WorkStore } from "../records/work-store.ts";
 import type { WorkRecord, WorkVersion } from "../records/work-store.ts";
 import { parseProductionResult, productionOutputSchema } from "./production-result.ts";
 import {
-  CodexAppServerClient, UnknownExecutionOutcome, RpcRequestRejected, codexTurnSchema, describeError,
+  CodexAppServerClient, codexTurnSchema, describeError, executionFailureStatus,
 } from "./codex-client.ts";
 
 type ServiceOptions = { render?: typeof renderVersion; codexExecutable?: string; timeoutMs?: number };
@@ -28,16 +28,24 @@ export class WorkService {
     }
   }
 
-  private appliedFeedback(record: WorkRecord, base?: WorkVersion): string[] {
-    const result = new Set<string>(), visited = new Set<string>();
+  private lineage(record: WorkRecord, base?: WorkVersion): WorkVersion[] {
+    const result: WorkVersion[] = [], visited = new Set<string>();
     let current = base;
     while (current) {
       if (visited.has(current.id)) throw new Error("版本基线关系存在循环。");
       visited.add(current.id);
+      result.push(current);
+      current = current.basedOnVersionId ? this.store.version(record, current.basedOnVersionId) : undefined;
+    }
+    return result;
+  }
+
+  private appliedFeedback(record: WorkRecord, base?: WorkVersion): string[] {
+    const result = new Set<string>();
+    for (const current of this.lineage(record, base)) {
       for (const id of current.appliedFeedbackIds ?? []) result.add(id);
       // 兼容旧记录：入口校验值只会在原生制作明确结束后写入。
       if (!current.agentResult && current.sourceSha256 && current.feedbackId) result.add(current.feedbackId);
-      current = current.basedOnVersionId ? this.store.version(record, current.basedOnVersionId) : undefined;
     }
     return [...result];
   }
@@ -57,6 +65,9 @@ export class WorkService {
         throw new Error("选择历史基线须提供 baseReason，说明如何处理后续修改。");
       }
       if (previous) this.store.verifySource(previous);
+      if (kind === "complete" && !this.lineage(record, previous).some(v => v.id === record.directionApproval?.sampleVersionId)) {
+        throw new Error("完整制作的基线须延续已确认方向的样例；其他方向须先更新样例并取得确认。");
+      }
       if (threadMode === "resume" && !previous?.threadId) throw new Error("没有可恢复的原生线程。");
       // 会失败的只读准备先完成，不为缺失需求留下占位目录。
       const brief = readFileSync(this.store.resolvePath(record.briefPath), "utf8");
@@ -83,6 +94,7 @@ export class WorkService {
         "原始反馈（按接收顺序保留；后续明确变更可替代先前要求，未被替代的要求与已完成修改继续有效）：",
         JSON.stringify(record.feedback.map(item => ({ ...item, inheritedInBase: inherited.includes(item.id), requestedThisTurn: requested.includes(item.id) })), null, 2),
         "本次需要处理的反馈编号：" + JSON.stringify(requested),
+        "上次执行的结果与待补充信息（不是新的授权）：" + JSON.stringify(record.versions.at(-1)?.agentResult ?? null),
         "只处理本次选定的反馈，保留基线中仍有效的修改；其他未处理事项继续保留，不得擅自标记完成。",
         record.directionApproval ? "用户已确认方向：" + record.directionApproval.scope : "尚未确认方向，仅允许制作样例。",
       ].join("\n\n");
@@ -133,6 +145,16 @@ export class WorkService {
         version.agentReply = codex.finalReply(started.turn.id);
         this.store.save(record);
         version.agentResult = parseProductionResult(version.agentReply, requested);
+        if (readFileSync(join(sourceDirectory, "context.md"), "utf8") !== context) throw new Error("主 AI 改写了制作上下文，不能确认本次来源。");
+        const entry = this.store.resolvePath(version.sourcePath);
+        // 可继续编辑的草稿与完成工程分开判断；等待输入不应丢弃已完成的修改。
+        if (existsSync(entry)) {
+          version.sourceSnapshot = captureSourceSnapshot(entry);
+          version.sourceSha256 = fileHash(entry);
+          version.appliedFeedbackIds = [...new Set([...inherited, ...version.agentResult.appliedFeedbackIds])];
+        } else if (version.agentResult.status === "completed" || version.agentResult.appliedFeedbackIds.length) {
+          throw new Error("主 AI 声称完成制作或反馈，但没有可核对的工程入口。");
+        }
         if (version.agentResult.status === "needs_input") {
           version.production = "blocked";
           version.error = version.agentResult.blockers.join("\n");
@@ -141,21 +163,15 @@ export class WorkService {
           return record;
         }
         if (version.agentResult.status === "failed") throw new Error(version.agentResult.summary + "\n" + version.agentResult.blockers.join("\n"));
-        if (readFileSync(join(sourceDirectory, "context.md"), "utf8") !== context) throw new Error("主 AI 改写了制作上下文，不能确认本次来源。");
-        const entry = this.store.resolvePath(version.sourcePath);
-        version.sourceSnapshot = captureSourceSnapshot(entry);
-        version.sourceSha256 = fileHash(entry);
-        version.appliedFeedbackIds = [...new Set([...inherited, ...version.agentResult.appliedFeedbackIds])];
         version.production = "source_ready";
         this.store.save(record);
         phase = "rendering";
         await this.render(record, version);
       } catch (error) {
-        const unknown = error instanceof UnknownExecutionOutcome ||
-          (phase === "awaiting_result" && !(error instanceof RpcRequestRejected));
-        version.production = unknown ? "unknown" : "failed";
+        const status = executionFailureStatus(error, phase);
+        version.production = status;
         version.error = describeError(error);
-        record.execution = { status: unknown ? "unknown" : "failed", runId, versionId, error: version.error };
+        record.execution = { status, runId, versionId, error: version.error };
         this.store.save(record);
         try { this.store.appendEvent(id, runId, { kind: "execution_error", phase, status: record.execution.status, message: version.error }); }
         catch (logError) { throw new Error(version.error + "；错误记录另有失败：" + describeError(logError)); }
@@ -190,7 +206,10 @@ export class WorkService {
       const record = this.store.read(id);
       this.assertCanProduce(record, "sample");
       const version = this.store.version(record, versionId);
-      if (["unknown", "blocked", "creating"].includes(version.production)) throw new Error("尚无已确认完成的源码，不能直接重渲染。");
+      if (["unknown", "blocked", "creating"].includes(version.production) ||
+          (version.agentResult && version.agentResult.status !== "completed")) {
+        throw new Error("尚无已确认完成的源码，不能直接重渲染。");
+      }
       this.store.verifySource(version);
       if (version.production === "ready" && this.store.availability(version).status === "available") return record;
       const historicalReady = version.production === "ready";

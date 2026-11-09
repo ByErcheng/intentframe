@@ -6,7 +6,7 @@ import { describeError } from "../runtime/codex-client.ts";
 
 const id = z.string().regex(/^[a-z0-9][a-z0-9-]{0,79}$/);
 const versionId = z.string().regex(/^v\d{3,}$/);
-const text = z.string().trim().min(1).max(30_000);
+const text = z.string().min(1).max(30_000).refine(value => value.trim().length > 0, "内容不能仅为空白。");
 const inputs = {
   get_runtime_info: z.object({}),
   list_works: z.object({}),
@@ -19,7 +19,7 @@ const inputs = {
   }),
   render_version: z.object({ workId: id, versionId }),
   submit_feedback: z.object({
-    workId: id, versionId, text,
+    workId: id, versionId, text: text.max(10_000),
     source: z.enum(["user", "external_ai", "internal_check", "system_test"]),
     changesDirection: z.boolean().default(false),
   }),
@@ -29,7 +29,7 @@ const inputs = {
   }),
   confirm_version: z.object({
     workId: id, versionId, kind: z.enum(["direction", "acceptance"]),
-    userConfirmation: text, scope: text.optional(),
+    userConfirmation: text.max(10_000), scope: text.optional(),
   }),
 };
 const descriptions: Record<keyof typeof inputs, string> = {

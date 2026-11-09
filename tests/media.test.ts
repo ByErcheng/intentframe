@@ -70,3 +70,14 @@ test("完整工程包含被导入源码和本地素材，拒绝目录外依赖",
     await assert.rejects(renderVersion(entry, join(root.path, "media/video.mp4"), join(root.path, "cache")), /版本目录外/);
   } finally { root.cleanup(); }
 });
+
+test("单帧视频交付的每个预览路径都指向实际生成的图片", { timeout: 90_000 }, async () => {
+  const root = fixtureRoot();
+  try {
+    const entry = join(root.path, "source/entry.tsx"); mkdirSync(dirname(entry));
+    writeFileSync(entry, videoSource("red", 30).replace("durationInFrames={30}", "durationInFrames={1}"));
+    const result = await renderVersion(entry, join(root.path, "media/video.mp4"), join(root.path, "cache"));
+    assert.equal(result.previews.length, 3);
+    for (const preview of result.previews) assert(existsSync(preview), "不能交付不存在的预览：" + preview);
+  } finally { root.cleanup(); }
+});
