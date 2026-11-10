@@ -7,7 +7,7 @@ import { WorkService } from "../src/runtime/work-service.ts";
 import { captureSourceSnapshot, fileHash } from "../src/records/source-snapshot.ts";
 import { fakeCodex, fixtureRender, fixtureRoot, readyVersion, videoSource } from "./helpers.ts";
 
-test("连续反馈延续最新修改；当前上下文保留全部原始反馈与处理状态", async () => {
+test("连续反馈延续最新修改；本轮反馈优先，继承反馈原文按需查阅", async () => {
   const root = fixtureRoot();
   try {
     const store = new WorkStore(join(root.path, "data")), work = store.create("反馈顺序", "红色背景的简单图文。");
@@ -19,7 +19,9 @@ test("连续反馈延续最新修改；当前上下文保留全部原始反馈�
     writeFileSync(store.resolvePath(revised.sourcePath), videoSource("green"));
     revised.sourceSha256 = fileHash(store.resolvePath(revised.sourcePath));
     revised.sourceSnapshot = captureSourceSnapshot(store.resolvePath(revised.sourcePath));
-    revised.basedOnVersionId = "v001"; revised.appliedFeedbackIds = [first.id];
+    // 本例验证已知同方向的连续修改；缺少方向证据的旧多版本另由请求回归验证。
+    revised.basedOnVersionId = "v001"; revised.directionId = "v001"; revised.newDirection = false;
+    revised.appliedFeedbackIds = [first.id];
     record.versions.push(revised); store.save(record);
     const before = fileHash(store.resolvePath(revised.sourcePath));
     const service = new WorkService(store, { codexExecutable: fakeCodex(root.path), render: fixtureRender });
@@ -30,7 +32,12 @@ test("连续反馈延续最新修改；当前上下文保留全部原始反馈�
     assert(readFileSync(store.resolvePath(version.sourcePath), "utf8").includes('"green"'));
     assert.deepEqual(version.appliedFeedbackIds, [first.id, second.id]);
     const context = readFileSync(join(dirname(store.resolvePath(version.sourcePath)), "context.md"), "utf8");
-    assert(context.includes(first.text)); assert(context.includes(second.text));
+    assert(!context.includes(first.text)); assert(context.includes(second.text));
+    assert(context.indexOf(second.text) < context.indexOf("红色背景的简单图文。"));
+    const manifest = JSON.parse(readFileSync(store.resolvePath(version.inputManifestPath!), "utf8"));
+    assert.equal(manifest.history.inheritedFeedback[0].text, first.text);
+    const receipt = JSON.parse(readFileSync(join(store.workDirectory(work.id), "runs", version.runId, "production-result.json"), "utf8"));
+    assert.deepEqual(receipt.feedbackReads, [second.id], "只列索引不能记作已经取得旧反馈原文");
     assert.equal(fileHash(store.resolvePath(revised.sourcePath)), before);
     await assert.rejects(service.produce(work.id, "sample", second.id, "fresh", "v001"), /baseReason/);
     // 显式历史分支保留依据；不会把其他分支已处理的反馈伪装成当前已继承。

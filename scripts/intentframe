@@ -1,13 +1,30 @@
 #!/bin/sh
 set -e
-PROJECT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-if [ -z "$INTENTFRAME_NODE_BIN" ]; then
-  INTENTFRAME_NODE_BIN="$PROJECT_DIR/../intentframe-tools/bin/node"
-fi
-if [ ! -x "$INTENTFRAME_NODE_BIN" ]; then
-  printf '%s\n' '找不到 Node，请按架构文档安装固定工具，或设置 INTENTFRAME_NODE_BIN。' >&2
+PROJECT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)
+CONFIG_FILE="$PROJECT_DIR/config/local.json"
+# Node 尚未启动，只检查引导文件并提取路径；完整字段校验由 src/config.ts 统一负责。
+if [ -L "$PROJECT_DIR/config" ] || [ -L "$CONFIG_FILE" ] || [ ! -f "$CONFIG_FILE" ] ||
+   [ "$(/usr/bin/stat -f '%u:%Lp' "$CONFIG_FILE" 2>/dev/null)" != "$(id -u):600" ]; then
+  printf '%s\n' '本机配置缺失或权限不正确，请按 config/README.md 初始化 config/local.json（当前用户所有、权限 0600、非符号链接）。' >&2
   exit 1
 fi
-PATH="$(dirname -- "$INTENTFRAME_NODE_BIN"):$PATH"
+if [ "${INTENTFRAME_NODE_BIN+x}" = x ]; then
+  NODE_BIN="$INTENTFRAME_NODE_BIN"
+else
+  NODE_BIN=$(/usr/bin/plutil -extract tools.node.path raw -expect string -o - "$CONFIG_FILE" 2>/dev/null) || {
+    printf '%s\n' '无法读取 tools.node.path，请检查 config/local.json 的 JSON 格式与 Node 路径。' >&2
+    exit 1
+  }
+fi
+case "$NODE_BIN" in
+  '') printf '%s\n' 'Node 路径不能为空。' >&2; exit 1 ;;
+  /*) ;;
+  *) NODE_BIN="$PROJECT_DIR/$NODE_BIN" ;;
+esac
+if [ ! -f "$NODE_BIN" ] || [ ! -x "$NODE_BIN" ]; then
+  printf '%s\n' '找不到可执行的 Node，请检查 config/local.json 的 tools.node.path 或 INTENTFRAME_NODE_BIN。' >&2
+  exit 1
+fi
+PATH="$(dirname -- "$NODE_BIN"):$PATH"
 export PATH
-exec "$INTENTFRAME_NODE_BIN" "$PROJECT_DIR/src/cli.ts" "$@"
+exec "$NODE_BIN" "$PROJECT_DIR/src/cli.ts" "$@"

@@ -1,18 +1,10 @@
 import { createHash } from "node:crypto";
-import { closeSync, lstatSync, openSync, readFileSync, readdirSync, readSync } from "node:fs";
+import { lstatSync, readFileSync, readdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { z } from "zod";
 import { repositoryRoot } from "../config.ts";
-
-export function fileHash(path: string): string {
-  const hash = createHash("sha256"), buffer = Buffer.alloc(1024 * 1024);
-  const fd = openSync(path, "r");
-  try {
-    let count: number;
-    while ((count = readSync(fd, buffer, 0, buffer.length, null)) > 0) hash.update(buffer.subarray(0, count));
-  } finally { closeSync(fd); }
-  return hash.digest("hex");
-}
+import { fileHash } from "../common/file-hash.ts";
+export { fileHash } from "../common/file-hash.ts";
 
 export const sourceSnapshotSchema = z.object({
   files: z.record(z.string(), z.string()),

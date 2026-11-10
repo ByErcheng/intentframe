@@ -3,7 +3,7 @@ import { randomBytes, randomUUID } from "node:crypto";
 import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, readlinkSync, realpathSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { configuration, repositoryRoot } from "../config.ts";
-import { fileHash } from "./source-snapshot.ts";
+import { fileHash } from "../common/file-hash.ts";
 
 type BackupOptions = { systemRoot: string; dataRoot: string; backupRoot: string; executable: string };
 const excluded = new Set(["node_modules", ".cache", ".git"]);
@@ -17,7 +17,9 @@ function inventory(root: string): Map<string, string> {
   function visit(directory: string, prefix: string) {
     for (const name of readdirSync(directory).sort()) {
       if (shouldExclude(name)) continue;
-      if (name === ".write-lock") throw new Error("存在执行写锁，不能确认备份一致性。");
+      if ([".write-lock", ".recovery-lock", ".dispatch-lock"].includes(name) || /^(testing\/)?works\/[^/]+\/active-execution\.json$/.test(prefix + name)) {
+        throw new Error("存在执行、恢复占用或后台任务交接，不能确认备份一致性。");
+      }
       const path = join(directory, name), key = prefix + name, stat = lstatSync(path);
       const mode = (stat.mode & 0o7777).toString(8);
       if (stat.isDirectory()) { entries.set(key, "directory:" + mode); visit(path, key + "/"); }
@@ -44,7 +46,7 @@ function canonicalLocation(path: string): string {
 
 /** 同机不同文件夹备份；只有原始、恢复、结束时三份清单一致才记录通过。 */
 export function backupLocal(options: BackupOptions = {
-  systemRoot: repositoryRoot, dataRoot: configuration.dataRoot,
+  systemRoot: repositoryRoot, dataRoot: configuration.assetRoot,
   backupRoot: configuration.backupRoot, executable: configuration.restic,
 }) {
   const sources = [realpathSync(options.systemRoot), realpathSync(options.dataRoot)];
@@ -64,7 +66,7 @@ export function backupLocal(options: BackupOptions = {
   }
   const env = { ...process.env, RESTIC_PASSWORD_FILE: passwordFile, RESTIC_CACHE_DIR: join(options.systemRoot, ".cache", "restic") };
   const restic = (args: string[]) => execFileSync(options.executable, ["--repo", repository, ...args],
-    { env, encoding: "utf8", timeout: 180_000, maxBuffer: 20 * 1024 * 1024 });
+    { env, encoding: "utf8", timeout: configuration.backup.commandTimeoutMs, maxBuffer: 20 * 1024 * 1024 });
   if (!existsSync(join(repository, "config"))) restic(["init"]);
   const output = restic(["backup", ...sources, "--json",
     "--exclude", "node_modules", "--exclude", ".cache", "--exclude", ".git",

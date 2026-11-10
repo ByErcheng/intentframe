@@ -27,6 +27,27 @@ test("真实 Restic 恢复核对完整清单，报告只写本机数据目录", 
   } finally { root.cleanup(); }
 });
 
+test("恢复占用未结束时，不启动备份或创建备份目录", () => {
+  const root = fixtureRoot();
+  try {
+    const options = setup(root.path);
+    mkdirSync(join(options.dataRoot, "testing/works/sample/.recovery-lock"), { recursive: true });
+    assert.throws(() => backupLocal(options), /恢复占用/);
+    assert(!existsSync(options.backupRoot));
+  } finally { root.cleanup(); }
+});
+
+test("后台任务尚未领取时同样阻止备份，不依赖制作写锁已经存在", () => {
+  const root = fixtureRoot();
+  try {
+    const options = setup(root.path), work = join(options.dataRoot, "testing/works/work-fixture");
+    mkdirSync(work, { recursive: true });
+    writeFileSync(join(work, "active-execution.json"), JSON.stringify({ operationId: "accepted", workId: "work-fixture" }));
+    assert.throws(() => backupLocal(options), /后台任务交接/);
+    assert(!existsSync(options.backupRoot));
+  } finally { root.cleanup(); }
+});
+
 for (const mode of ["new-file", "active-lock", "temporary-change", "mode-change", "root-mode-change"]) {
   test("备份清点后并发变化不能报告通过：" + mode, { timeout: 60_000 }, () => {
     const root = fixtureRoot();

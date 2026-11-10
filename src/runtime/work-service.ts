@@ -2,22 +2,44 @@ import { randomUUID } from "node:crypto";
 import { cpSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { z } from "zod";
-import { repositoryRoot } from "../config.ts";
-import { fileHash, renderVersion } from "../media/render.ts";
-import { captureSourceSnapshot } from "../records/source-snapshot.ts";
+import { configuration, repositoryRoot } from "../config.ts";
+import { fileHash, renderVersion, restoreVideoPreviews } from "../media/render.ts";
 import { WorkStore } from "../records/work-store.ts";
 import type { WorkRecord, WorkVersion } from "../records/work-store.ts";
+import { KnowledgeStore, pendingLearningSources } from "../records/knowledge-store.ts";
+import { ComparisonStore } from "../records/comparison-store.ts";
+import { immutableJson, readJson, valueHash } from "../records/files.ts";
+import { learningResultSchema } from "../records/contracts.ts";
+import { knowledgeToolDefinitions, LearningService } from "./learning-service.ts";
+import { executionConditions, productionRules, systemFingerprint } from "./context.ts";
+import { processExists } from "./process-state.ts";
+import { checkExecution } from "./execution-control.ts";
+import { appliedFeedback, selectProduction } from "./production-selection.ts";
+import type { ProductionSelection } from "./production-selection.ts";
+import { fillPrompt, readPrompt } from "./prompts.ts";
+import { productionHistory, productionHistoryTool } from "./production-history.ts";
+import { productionReceiptPath, readProductionReceipt, saveProductionReceipt } from "./production-receipt.ts";
+import type { ProductionReceipt } from "./production-receipt.ts";
 import { parseProductionResult, productionOutputSchema } from "./production-result.ts";
 import {
-  CodexAppServerClient, codexTurnSchema, describeError, executionFailureStatus,
+  CodexAppServerClient, codexTurnSchema, describeError, executionFailureStatus, UnknownExecutionOutcome,
 } from "./codex-client.ts";
 
-type ServiceOptions = { render?: typeof renderVersion; codexExecutable?: string; timeoutMs?: number };
+type ServiceOptions = { render?: typeof renderVersion; restorePreviews?: typeof restoreVideoPreviews; codexExecutable?: string; timeoutMs?: number; knowledge?: KnowledgeStore;
+  signal?: AbortSignal; onProgress?: (phase: string) => void; onRunner?: (pid: number) => void; productionSnapshot?: WorkRecord };
 
 export class WorkService {
   readonly store: WorkStore;
+  readonly knowledge: KnowledgeStore;
+  readonly learning: LearningService;
+  readonly comparisons: ComparisonStore;
   private options: ServiceOptions;
-  constructor(store = new WorkStore(), options: ServiceOptions = {}) { this.store = store; this.options = options; }
+  constructor(store = new WorkStore(), options: ServiceOptions = {}) {
+    this.store = store; this.options = options;
+    this.knowledge = options.knowledge ?? new KnowledgeStore(store.assetRoot);
+    this.learning = new LearningService(store, this.knowledge);
+    this.comparisons = new ComparisonStore(store, this.knowledge);
+  }
 
   assertCanProduce(record: WorkRecord, kind: "sample" | "complete"): void {
     if (["running", "unknown"].includes(record.execution.status)) {
@@ -28,51 +50,35 @@ export class WorkService {
     }
   }
 
-  private lineage(record: WorkRecord, base?: WorkVersion): WorkVersion[] {
-    const result: WorkVersion[] = [], visited = new Set<string>();
-    let current = base;
-    while (current) {
-      if (visited.has(current.id)) throw new Error("版本基线关系存在循环。");
-      visited.add(current.id);
-      result.push(current);
-      current = current.basedOnVersionId ? this.store.version(record, current.basedOnVersionId) : undefined;
-    }
-    return result;
-  }
-
   private appliedFeedback(record: WorkRecord, base?: WorkVersion): string[] {
-    const result = new Set<string>();
-    for (const current of this.lineage(record, base)) {
-      for (const id of current.appliedFeedbackIds ?? []) result.add(id);
-      // 兼容旧记录：入口校验值只会在原生制作明确结束后写入。
-      if (!current.agentResult && current.sourceSha256 && current.feedbackId) result.add(current.feedbackId);
-    }
-    return [...result];
+    return appliedFeedback(this.store, record, base);
   }
 
   async produce(
     id: string, kind: "sample" | "complete", feedbackId?: string,
     threadMode: "fresh" | "resume" = "fresh", baseVersionId?: string, baseReason?: string,
+    operationId?: string, selection: ProductionSelection = {},
   ): Promise<WorkRecord> {
+    checkExecution(this.options.signal);
     return this.store.withLock(id, async () => {
       const record = this.store.read(id);
+      if (this.options.productionSnapshot) {
+        if (this.options.productionSnapshot.id !== id) throw new Error("受理时的制作输入不属于当前作品。");
+        record.feedback = this.options.productionSnapshot.feedback;
+        record.directionApproval = this.options.productionSnapshot.directionApproval;
+      }
       this.assertCanProduce(record, kind);
-      const feedback = feedbackId ? record.feedback.find(item => item.id === feedbackId) : undefined;
-      if (feedbackId && !feedback) throw new Error("反馈标识不存在。");
-      const latest = record.versions.filter(v => v.sourceSnapshot || (v.production === "ready" && v.sourceSha256)).at(-1);
-      const previous = baseVersionId ? this.store.version(record, baseVersionId) : latest;
-      if (baseVersionId && baseVersionId !== latest?.id && !baseReason?.trim()) {
-        throw new Error("选择历史基线须提供 baseReason，说明如何处理后续修改。");
+      const comparison = this.comparisons.context(record);
+      if (comparison && (comparison.state !== "open" || record.versions.length || record.feedback.length)) throw new Error("比较使用固定输入的首次制作；已有结果请先评价或新建比较。");
+      if (record.learningPending) {
+        try { this.learning.finishPending(record); }
+        catch (error) { record.learningError = describeError(error); this.store.save(record); }
       }
-      if (previous) this.store.verifySource(previous);
-      if (kind === "complete" && !this.lineage(record, previous).some(v => v.id === record.directionApproval?.sampleVersionId)) {
-        throw new Error("完整制作的基线须延续已确认方向的样例；其他方向须先更新样例并取得确认。");
-      }
-      if (threadMode === "resume" && !previous?.threadId) throw new Error("没有可恢复的原生线程。");
+      const chosen = selectProduction(this.store, record, kind, feedbackId, threadMode, baseVersionId, baseReason, selection);
+      const { previous, inherited, requested } = chosen;
+      baseReason = chosen.baseReason;
       // 会失败的只读准备先完成，不为缺失需求留下占位目录。
       const brief = readFileSync(this.store.resolvePath(record.briefPath), "utf8");
-      const inherited = this.appliedFeedback(record, previous);
-      const requested = feedback ? [feedback.id] : record.feedback.filter(item => !inherited.includes(item.id)).map(item => item.id);
       let number = Math.max(0, ...record.versions.map(v => Number(v.id.slice(1)))) + 1;
       if (!Number.isSafeInteger(number)) throw new Error("版本编号超出可用范围。");
       // 旧实现可能留下未登记目录；保留它并使用新编号，不覆盖或删除未知文件。
@@ -84,20 +90,44 @@ export class WorkService {
         mediaPath: "media/" + id + "/" + versionId + "/video.mp4",
         createdAt: new Date().toISOString(), feedbackId, feedbackIds: requested, runId,
         basedOnVersionId: previous?.id, baseReason, review: { status: "not_reviewed" }, acceptance: "pending",
+        directionId: chosen.newDirection || !previous ? versionId : previous.directionId ?? previous.id,
+        newDirection: chosen.newDirection,
+        operationId, sendState: "not_sent", systemFingerprint: systemFingerprint(),
       };
       const sourceDirectory = dirname(this.store.resolvePath(version.sourcePath));
-      const context = [
-        "# 本次制作上下文", brief,
-        "本次版本：" + versionId + "；类型：" + kind,
-        previous ? "修改基线：" + previous.id : "首次样例",
-        baseReason ? "基线选择依据：" + baseReason : "延续最新已有工程。",
-        "原始反馈（按接收顺序保留；后续明确变更可替代先前要求，未被替代的要求与已完成修改继续有效）：",
-        JSON.stringify(record.feedback.map(item => ({ ...item, inheritedInBase: inherited.includes(item.id), requestedThisTurn: requested.includes(item.id) })), null, 2),
-        "本次需要处理的反馈编号：" + JSON.stringify(requested),
-        "上次执行的结果与待补充信息（不是新的授权）：" + JSON.stringify(record.versions.at(-1)?.agentResult ?? null),
-        "只处理本次选定的反馈，保留基线中仍有效的修改；其他未处理事项继续保留，不得擅自标记完成。",
-        record.directionApproval ? "用户已确认方向：" + record.directionApproval.scope : "尚未确认方向，仅允许制作样例。",
-      ].join("\n\n");
+      const relevantFeedback = record.feedback.filter(f => inherited.includes(f.id) || requested.includes(f.id));
+      const pendingSources = pendingLearningSources(record);
+      pendingSources.items = pendingSources.items.filter(source => source.kind === "feedback" ?
+        relevantFeedback.some(f => source.id === "feedback:" + f.id) : source.versionId === previous?.id);
+      const sourceIds = pendingSources.items.map(source => source.id);
+      const tools = this.learning.tools(record, runId);
+      const history = productionHistory(record, previous, inherited, tools.feedbackReads);
+      const selectedFeedback = relevantFeedback.filter(item => requested.includes(item.id));
+      const feedbackText = JSON.stringify(selectedFeedback.map(item => ({ ...item, inheritedInBase: inherited.includes(item.id), requestedThisTurn: true })), null, 2);
+      const inlineFeedback = feedbackText.length <= 25_000;
+      if (inlineFeedback) for (const item of selectedFeedback) tools.feedbackReads.add(item.id);
+      const developer = readPrompt("production", "执行约束"), template = readPrompt("task"), startPrompt = readPrompt("production", "启动消息");
+      const rules = productionRules(kind, relevantFeedback.some(f => f.location), relevantFeedback.length > 0);
+      const turnInput = fillPrompt(startPrompt.text, { runId });
+      const context = fillPrompt(template.text, {
+        brief: previous ? brief : "首次制作的原始需求已在上方完整提供；本轮尚无历史工程。",
+        task: JSON.stringify({ purpose: record.purpose ?? "unspecified", versionId, kind, newDirection: chosen.newDirection }),
+        baseline: previous ? JSON.stringify({ baseVersionId: previous.id, baseReason,
+          currentProduction: previous.production, availability: this.store.availability(previous),
+          review: previous.review, acceptance: previous.acceptance,
+          ...(previous.error ? { error: previous.error } : {}),
+          ...(previous.agentResult && previous.production !== "ready" ? { unfinished: {
+            summary: previous.agentResult.summary, blockers: previous.agentResult.blockers,
+            unresolvedFeedbackIds: previous.agentResult.unresolvedFeedbackIds } } : {}) }, null, 2) : "首次制作，无历史工程。",
+        feedback: selectedFeedback.length ? inlineFeedback ? feedbackText : "本轮反馈较多，使用 intentframe_read_feedback 按本轮编号读取完整原文；未读取前不能声称处理完成。" : previous ? "本轮没有选定反馈；按本轮制作阶段和所选基线接续，保留有效成果，不执行其他未选意见。" : brief,
+        inherited: JSON.stringify(history.snapshot.inheritedFeedback.map(item => ({ id: item.id, versionId: item.versionId,
+          supersededByFeedbackIds: item.supersededByFeedbackIds })), null, 2),
+        feedbackIds: JSON.stringify(requested), direction: record.directionApproval ? JSON.stringify(record.directionApproval, null, 2) : "尚未确认方向，仅制作样例。",
+        conditionalRules: rules.filter(r => r.section !== "经验使用").map(r => r.text).join("\n"),
+        experience: rules.find(r => r.section === "经验使用")!.text + (comparison ? "\n本轮为固定输入比较，仅使用已开放的知识范围。" : ""),
+        sourceIds: JSON.stringify(sourceIds), sources: pendingSources.items.length ? JSON.stringify(pendingSources.items.map(source =>
+          source.kind === "feedback" ? { id: source.id, kind: source.kind, versionId: source.versionId } : source), null, 2) : "无待整理来源。",
+      });
 
       let codex: CodexAppServerClient | undefined;
       let phase: "preparing" | "awaiting_result" | "checking_result" | "rendering" = "preparing";
@@ -106,89 +136,362 @@ export class WorkService {
       // 先登记版本，再准备文件；后续准备失败仍有明确失败记录和下次可用编号。
       this.store.save(record);
       try {
+        checkExecution(this.options.signal);
+        this.options.onProgress?.("准备制作输入与版本工程");
         mkdirSync(sourceDirectory, { recursive: true });
         if (previous) cpSync(dirname(this.store.resolvePath(previous.sourcePath)), sourceDirectory, { recursive: true });
+        else this.comparisons.prepare(record, sourceDirectory);
         writeFileSync(join(sourceDirectory, "context.md"), context);
+        version.contextSha256 = fileHash(join(sourceDirectory, "context.md"));
+        version.inputManifestPath = "works/" + id + "/runs/" + runId + "/input.json";
+        immutableJson(this.store.resolvePath(version.inputManifestPath), { context, developerInstructions: developer.text, turnInput,
+          outputSchema: productionOutputSchema, sources: [developer, template, startPrompt, ...rules], history: history.snapshot });
+        version.inputManifestSha256 = fileHash(this.store.resolvePath(version.inputManifestPath));
+        this.store.save(record);
         this.store.appendEvent(id, runId, { kind: "production_started", versionId, basedOnVersionId: previous?.id, feedbackIds: requested });
+        version.executionConditions = executionConditions(this.options.codexExecutable, this.options.timeoutMs);
+        this.store.save(record);
         codex = new CodexAppServerClient({
           cwd: sourceDirectory, executable: this.options.codexExecutable,
           onEvent: event => this.store.appendEvent(id, runId, event),
-          timeoutMs: this.options.timeoutMs ?? 240_000,
+          timeoutMs: this.options.timeoutMs, turnTimeoutMs: this.options.timeoutMs ?? configuration.runtime.productionTimeoutMs,
+          signal: this.options.signal,
+          onToolCall: (name, input, identity) => {
+            if (identity.threadId !== version.threadId || (version.turnId && identity.turnId !== version.turnId)) throw new Error("工具调用不属于本轮制作。");
+            if (name === productionHistoryTool.name) return history.read(input);
+            return tools.call(name, input);
+          },
         });
+        version.runnerPid = codex.pid; this.store.save(record);
+        if (codex.pid) this.options.onRunner?.(codex.pid);
         await codex.initializeConnection();
+        checkExecution(this.options.signal);
         const response = z.object({ thread: z.object({ id: z.string() }), model: z.string().optional() })
           .parse(await codex.sendRequest(threadMode === "resume" ? "thread/resume" : "thread/start", {
             ...(threadMode === "resume" ? { threadId: previous?.threadId, excludeTurns: true } : {}),
             cwd: sourceDirectory, sandbox: "workspace-write", approvalPolicy: "never",
-            developerInstructions: [
-              "你承担 intentframe 的项目主 AI，按 context.md 创建或修改本目录的 Remotion 工程。",
-              "交付 entry.tsx，使用 React 和 remotion，调用 registerRoot 注册 id 为 Video 的 Composition。",
-              "只修改本目录的源码和本地素材；保留 context.md，不引用目录外的工程或素材，不安装依赖、不联网、不读取凭据、不委派其他 Agent。",
-              "渲染与任务状态由外层负责。说明性注释使用中文。",
-              "最终按指定 JSON 结构返回真实结果：completed 表示本次源码及选定反馈已完成；needs_input 表示缺少必要输入，blockers 写明缺口；failed 表示明确失败。",
-              "appliedFeedbackIds 只列本次实际完成的反馈；unresolvedFeedbackIds 列本次未解决项。不因旧源码存在便声称本次完成。",
-            ].join("\n"),
+            dynamicTools: [...knowledgeToolDefinitions, productionHistoryTool],
+            developerInstructions: developer.text,
           }));
         version.threadId = response.thread.id;
         version.model = response.model;
         this.store.save(record);
+        checkExecution(this.options.signal);
+        this.options.onProgress?.("项目主 AI 正在制作工程");
         phase = "awaiting_result";
+        version.sendState = "sending"; this.store.save(record);
         const started = z.object({ turn: codexTurnSchema }).parse(await codex.sendRequest("turn/start", {
           threadId: version.threadId, outputSchema: productionOutputSchema,
-          input: [{ type: "text", text: "阅读 context.md 和已有工程，完成本次制作。保存源码后返回结构化结果；缺少必要信息时明确报告，不用旧结果代替本次完成。" }],
+          input: [{ type: "text", text: turnInput }],
         }));
         version.turnId = started.turn.id;
+        version.sendState = "acknowledged";
         this.store.save(record);
-        const completed = await codex.waitForTurnCompletion(started.turn.id);
+        const completed = await codex.waitForTurnCompletion(started.turn.id, version.threadId);
+        if (completed.status === "inProgress") throw new UnknownExecutionOutcome("原执行尚未结束。");
         phase = "checking_result";
-        if (completed.status !== "completed") throw new Error(completed.error?.message ?? ("原生执行结束：" + completed.status));
-        version.agentReply = codex.finalReply(started.turn.id);
-        this.store.save(record);
-        version.agentResult = parseProductionResult(version.agentReply, requested);
-        if (readFileSync(join(sourceDirectory, "context.md"), "utf8") !== context) throw new Error("主 AI 改写了制作上下文，不能确认本次来源。");
-        const entry = this.store.resolvePath(version.sourcePath);
-        // 可继续编辑的草稿与完成工程分开判断；等待输入不应丢弃已完成的修改。
-        if (existsSync(entry)) {
-          version.sourceSnapshot = captureSourceSnapshot(entry);
-          version.sourceSha256 = fileHash(entry);
-          version.appliedFeedbackIds = [...new Set([...inherited, ...version.agentResult.appliedFeedbackIds])];
-        } else if (version.agentResult.status === "completed" || version.agentResult.appliedFeedbackIds.length) {
-          throw new Error("主 AI 声称完成制作或反馈，但没有可核对的工程入口。");
+        let reply = "";
+        try { reply = codex.finalReply(started.turn.id); } catch { /* 终态仍保存；空结果在制作判定中明确失败。 */ }
+        const receipt = saveProductionReceipt(this.store, record, version, {
+          threadId: version.threadId!, turnId: completed.id, status: completed.status, reply,
+          ...(completed.error ? { error: completed.error.message } : {}),
+          knowledgeReads: [...tools.reads.values()], feedbackReads: [...tools.feedbackReads], learningSourceIds: sourceIds,
+        });
+        if (this.applyProductionReceipt(record, version, receipt)) {
+          checkExecution(this.options.signal);
+          phase = "rendering";
+          await this.render(record, version);
         }
-        if (version.agentResult.status === "needs_input") {
-          version.production = "blocked";
-          version.error = version.agentResult.blockers.join("\n");
-          record.execution = { status: "waiting_input", runId, versionId, error: version.error };
-          this.store.save(record);
-          return record;
-        }
-        if (version.agentResult.status === "failed") throw new Error(version.agentResult.summary + "\n" + version.agentResult.blockers.join("\n"));
-        version.production = "source_ready";
-        this.store.save(record);
-        phase = "rendering";
-        await this.render(record, version);
+        this.saveLearningResult(record, version, receipt);
       } catch (error) {
         const status = executionFailureStatus(error, phase);
-        version.production = status;
-        version.error = describeError(error);
+        if (version.production !== "ready") version.production = status;
+        version.error = (codex?.stopReason ? codex.stopReason + " " : "") + describeError(error);
         record.execution = { status, runId, versionId, error: version.error };
         this.store.save(record);
         try { this.store.appendEvent(id, runId, { kind: "execution_error", phase, status: record.execution.status, message: version.error }); }
         catch (logError) { throw new Error(version.error + "；错误记录另有失败：" + describeError(logError)); }
-        throw error;
+        throw new Error(version.error, { cause: error });
       } finally { await codex?.close(); }
       return record;
     });
   }
 
+  private applyProductionReceipt(record: WorkRecord, version: WorkVersion, receipt: ProductionReceipt): boolean {
+    version.turnId = receipt.turnId;
+    version.nativeResult = { threadId: receipt.threadId, turnId: receipt.turnId, status: receipt.status, reply: receipt.reply,
+      ...(receipt.error ? { error: receipt.error } : {}) };
+    version.agentReply = receipt.reply;
+    if (receipt.status !== "completed") throw new Error(receipt.error ?? ("原生执行结束：" + receipt.status));
+    if (!receipt.reply) throw new Error("原生执行结束，但没有明确的最终制作结果。");
+    const result = parseProductionResult(receipt.reply, version.feedbackIds ?? []);
+    version.agentResult = result;
+    const used = result.usedExperienceRefs ?? [];
+    if (used.some(ref => !receipt.knowledgeReads.some(read => valueHash(ref) === valueHash(read)))) throw new Error("主 AI 声称采用了未实际取得的经验版本。");
+    if (result.appliedFeedbackIds.some(id => !receipt.feedbackReads.includes(id))) throw new Error("主 AI 声称完成了未取得原文的反馈。");
+    version.knowledgeUsed = used;
+    const previous = version.basedOnVersionId ? this.store.version(record, version.basedOnVersionId) : undefined;
+    if (receipt.sourceSnapshot) {
+      version.sourceSnapshot = receipt.sourceSnapshot;
+      version.sourceSha256 = receipt.sourceSnapshot.files["entry.tsx"];
+      version.appliedFeedbackIds = [...new Set([...this.appliedFeedback(record, previous), ...result.appliedFeedbackIds])];
+    } else if (result.status === "completed" || result.appliedFeedbackIds.length) throw new Error("主 AI 声称完成制作或反馈，但没有可核对的工程入口。");
+    if (result.status === "needs_input") {
+      version.production = "blocked"; version.error = result.blockers.join("\n");
+      record.execution = { status: "waiting_input", runId: version.runId, versionId: version.id, error: version.error };
+      this.store.save(record); return false;
+    }
+    if (result.status === "failed") throw new Error(result.summary + "\n" + result.blockers.join("\n"));
+    // 已交付版本的完成事实不随媒体缺失或只补存而降级；可用性另行核对。
+    if (version.production !== "ready") version.production = "source_ready";
+    version.error = undefined;
+    this.store.save(record); return true;
+  }
+
+  private saveLearningResult(record: WorkRecord, version: WorkVersion, receipt: ProductionReceipt) {
+    const result = version.agentResult?.learning;
+    if (!result || (!result.checkedSourceIds.length && !result.proposals.length)) return;
+    try {
+      // 来源编号仅限定可整理范围；正文已内联或由工具读回才算取得反馈原文。
+      if (result.checkedSourceIds.some(id => id.startsWith("feedback:") && !receipt.feedbackReads.includes(id.slice("feedback:".length)))) {
+        throw new Error("主 AI 声称检查了未取得原文的反馈，经验整理进度未保存。");
+      }
+      this.learning.accept(record, version, "learning-" + version.runId, result, receipt.learningSourceIds);
+    }
+    catch (error) {
+      // 制作完成和经验保存分别报告；未保存的进度继续可见，不抹掉已经完成的作品。
+      record.learningError = describeError(error); this.store.save(record);
+    }
+  }
+
+  /** 使用同一项目主 AI 整理已保存事实；只读分析，不编辑制作工程。 */
+  async organize(id: string): Promise<WorkRecord> {
+    checkExecution(this.options.signal);
+    return this.store.withLock(id, async () => {
+      const record = this.store.read(id);
+      this.assertCanProduce(record, "sample");
+      if (record.learningPending) { this.learning.finishPending(record); return record; }
+      if (record.learningRun && !record.learningRun.completed) throw new Error("原经验整理尚未核清，请先恢复原调用。");
+      const pending = this.learning.pending(record);
+      if (!pending.items.length) return record;
+      const version = record.versions.at(-1);
+      if (!version) throw new Error("暂无可关联的制作版本。");
+      const runId = "learning-" + randomUUID(), directory = this.store.resolvePath("works/" + id + "/learning/" + runId);
+      mkdirSync(directory, { recursive: true });
+      const learningPrompt = readPrompt("learning", "执行约束"), startPrompt = readPrompt("learning", "启动消息");
+      const turnInput = fillPrompt(startPrompt.text, { runId });
+      const input = { workId: id, purpose: record.purpose ?? "unspecified", versionId: version.id,
+        sources: pending.items, remaining: pending.remaining,
+        rule: learningPrompt.text, promptSources: [learningPrompt, startPrompt], turnInput, outputSchema: z.toJSONSchema(learningResultSchema) };
+      immutableJson(join(directory, "context.json"), input);
+      record.learningRun = { id: runId, versionId: version.id, sourceIds: pending.items.map(source => source.id),
+        contextSha256: fileHash(join(directory, "context.json")), sendState: "not_sent",
+        previousExecution: { ...record.execution }, completed: false, createdAt: new Date().toISOString() };
+      record.execution = { status: "running", runId, versionId: version.id };
+      this.store.save(record);
+      const run = record.learningRun, tools = this.learning.tools(record, runId);
+      let client: CodexAppServerClient | undefined;
+      let ended = false;
+      try {
+        checkExecution(this.options.signal);
+        this.options.onProgress?.("项目主 AI 正在整理新增记录");
+        client = new CodexAppServerClient({ cwd: directory, executable: this.options.codexExecutable,
+          timeoutMs: this.options.timeoutMs, turnTimeoutMs: this.options.timeoutMs ?? configuration.runtime.productionTimeoutMs,
+          signal: this.options.signal,
+          onEvent: event => this.store.appendEvent(id, runId, event),
+          onToolCall: (name, args, identity) => {
+            if (identity.threadId !== run.threadId || (run.turnId && identity.turnId !== run.turnId)) throw new Error("工具调用不属于本轮整理。");
+            return tools.call(name, args);
+          } });
+        run.runnerPid = client.pid; this.store.save(record);
+        if (client.pid) this.options.onRunner?.(client.pid);
+        await client.initializeConnection();
+        checkExecution(this.options.signal);
+        const started = z.object({ thread: z.object({ id: z.string() }) }).parse(await client.sendRequest("thread/start", {
+          cwd: directory, sandbox: "read-only", approvalPolicy: "never", dynamicTools: knowledgeToolDefinitions,
+          developerInstructions: learningPrompt.text,
+        }));
+        run.threadId = started.thread.id;
+        checkExecution(this.options.signal);
+        run.sendState = "sending"; this.store.save(record);
+        const response = z.object({ turn: codexTurnSchema }).parse(await client.sendRequest("turn/start", {
+          threadId: run.threadId, outputSchema: z.toJSONSchema(learningResultSchema),
+          input: [{ type: "text", text: turnInput }],
+        }));
+        run.turnId = response.turn.id; run.sendState = "acknowledged"; this.store.save(record);
+        const completed = await client.waitForTurnCompletion(run.turnId, run.threadId);
+        ended = completed.status !== "inProgress";
+        if (completed.status !== "completed") throw new Error(completed.error?.message ?? "经验整理未完成。");
+        const reply = client.finalReply(run.turnId);
+        immutableJson(join(directory, "result.json"), { threadId: run.threadId, turnId: run.turnId, reply, contextSha256: run.contextSha256 });
+        this.applyLearningReply(record, reply);
+        return record;
+      } catch (error) {
+        record.learningError = (client?.stopReason ? client.stopReason + " " : "") + describeError(error);
+        const phase = run.sendState === "not_sent" ? "preparing" : ended ? "checking_result" : "awaiting_result";
+        if (executionFailureStatus(error, phase) === "failed") { run.completed = true; record.execution = run.previousExecution; }
+        else record.execution = { status: "unknown", runId, versionId: version.id, error: record.learningError };
+        this.store.save(record); throw new Error(record.learningError, { cause: error });
+      } finally { await client?.close(); }
+    });
+  }
+
+  private applyLearningReply(record: WorkRecord, reply: string): void {
+    const run = record.learningRun;
+    if (!run) throw new Error("缺少原经验整理身份。");
+    const path = this.store.resolvePath("works/" + record.id + "/learning/" + run.id + "/context.json");
+    if (fileHash(path) !== run.contextSha256) throw new Error("原经验整理输入已经变化。");
+    const result = learningResultSchema.parse(JSON.parse(reply));
+    this.learning.accept(record, this.store.version(record, run.versionId), run.id, result, run.sourceIds);
+    run.completed = true; record.execution = run.previousExecution; record.learningError = undefined;
+    this.store.save(record);
+  }
+
+  /** 恢复只沿原身份查询与补存；原进程仍存活或依据不足时保留现场。 */
+  async recover(id: string, render = true) {
+    checkExecution(this.options.signal);
+    this.options.onProgress?.("核对原调用、进程与本机回执");
+    return this.store.withRecoveryGuard(id, async () => {
+      const record = this.store.read(id), owner = this.store.lockOwner(id);
+      if (owner && processExists(owner.pid)) return { status: "running", message: "原任务进程仍在运行，继续查询原进度。", work: this.store.summary(record) };
+      const learningRun = record.learningRun && !record.learningRun.completed && record.execution.runId === record.learningRun.id ? record.learningRun : undefined;
+      const version = record.execution.versionId ? this.store.version(record, record.execution.versionId) : record.versions.at(-1);
+      const runnerPid = learningRun?.runnerPid ?? version?.runnerPid;
+      if (runnerPid && processExists(runnerPid, process.platform !== "win32")) return { status: "running", message: "原运行器或其写入进程尚未结束，保留占用。", work: this.store.summary(record) };
+      if (owner && !runnerPid) return { status: "unknown", message: "旧占用缺少原写入进程依据，未解除保护。", work: this.store.summary(record) };
+      let observed: Awaited<ReturnType<CodexAppServerClient["readOriginalTurn"]>> | undefined;
+      if (owner) {
+        // 解除占用前同时核原进程与原执行；仅看到PID消失不能证明调用已结束。
+        if (learningRun && learningRun.sendState !== "not_sent") {
+          const resultPath = this.store.resolvePath("works/" + id + "/learning/" + learningRun.id + "/result.json");
+          if (existsSync(resultPath)) this.readLearningReceipt(record);
+          else {
+            if (!learningRun.threadId) throw new UnknownExecutionOutcome("缺少原整理线程，保留占用。");
+            observed = await this.inspectOriginal(learningRun.threadId, learningRun.turnId,
+              this.store.resolvePath("works/" + id + "/learning/" + learningRun.id), learningRun.id);
+          }
+        } else if (!learningRun && version?.sendState !== "not_sent") {
+          if (!version?.threadId || !version.contextSha256) throw new UnknownExecutionOutcome("缺少原制作身份，保留占用。");
+          if (existsSync(productionReceiptPath(this.store, id, version.runId))) readProductionReceipt(this.store, record, version);
+          else observed = await this.inspectOriginal(version.threadId, version.turnId, dirname(this.store.resolvePath(version.sourcePath)), version.runId);
+        }
+        if (observed?.turn.status === "inProgress") return { status: "running", message: "原执行未取得终态，保留占用。", work: this.store.summary(record) };
+      }
+      if (owner) this.store.releaseStaleLock(id, owner);
+      return this.store.withLock(id, async () => {
+        if (learningRun) return this.recoverLearning(record, observed);
+        if (!version) return { status: "unchanged", work: this.store.summary(record) };
+        if (version.production === "ready" && this.store.availability(version).status === "available") {
+          if (render && this.store.previewAvailability(version).status !== "available") await this.repairPreviews(record, version);
+          if (existsSync(productionReceiptPath(this.store, id, version.runId))) this.saveLearningResult(record, version, readProductionReceipt(this.store, record, version));
+          if (record.learningPending) this.learning.finishPending(record);
+          // 只收尾已核实版本对应的执行；未完成的经验保存与历史错误证据仍保留。
+          if (!record.learningPending && !record.learningError &&
+              record.execution.runId === version.runId && record.execution.versionId === version.id) {
+            version.error = undefined;
+            record.execution = { status: "idle" };
+            this.store.save(record);
+          }
+          return { status: "recovered", work: this.store.summary(record) };
+        }
+        if (version.sendState === "not_sent") {
+          version.production = "failed"; version.error = "原制作尚未发送；准备现场已保留，可用新的操作继续。";
+          record.execution = { status: "failed", runId: version.runId, versionId: version.id, error: version.error };
+          this.store.save(record); return { status: "not_sent", work: this.store.summary(record) };
+        }
+        const receiptPath = productionReceiptPath(this.store, id, version.runId);
+        if (!existsSync(receiptPath)) {
+          if (!version.threadId || !version.contextSha256) return { status: "unknown", message: "原调用缺少可靠身份或输入记录，未重新制作。", work: this.store.summary(record) };
+          const original = observed ?? await this.inspectOriginal(version.threadId, version.turnId, dirname(this.store.resolvePath(version.sourcePath)), version.runId);
+          if (original.turn.status === "inProgress") return { status: "running", work: this.store.summary(record) };
+          version.nativeResult = { threadId: version.threadId, turnId: original.turn.id, status: original.turn.status, reply: original.reply,
+            ...(original.turn.error ? { error: original.turn.error.message } : {}) };
+          version.turnId = original.turn.id;
+          // 原终态与文件身份分开记录；当前文件不能补造当时未保存的源码证据。
+          version.production = "unknown";
+          version.error = "已核回原执行终态，但缺少当时的工程回执；保留原结果与文件，须进一步核对。";
+          record.execution = { status: "unknown", runId: version.runId, versionId: version.id, error: version.error };
+          this.store.save(record);
+          return { status: "needs_verification", work: this.store.summary(record) };
+        }
+        const historicalReady = version.production === "ready";
+        // 身份或工程依据尚未核实时，保留原状态和重发保护，不按明确制作失败收尾。
+        const receipt = readProductionReceipt(this.store, record, version);
+        try {
+          if (this.applyProductionReceipt(record, version, receipt)) {
+            if (render) await this.render(record, version);
+            else { record.execution = { status: "idle" }; this.store.save(record); }
+          }
+          this.saveLearningResult(record, version, receipt);
+          return { status: "recovered", work: this.store.summary(record) };
+        } catch (error) {
+          version.error = describeError(error);
+          version.production = historicalReady ? "ready" : "failed";
+          record.execution = { status: "failed", runId: version.runId, versionId: version.id, error: version.error };
+          this.store.save(record); throw error;
+        }
+      }, true);
+    });
+  }
+
+  private async inspectOriginal(threadId: string, turnId: string | undefined, cwd: string, runId: string) {
+    checkExecution(this.options.signal);
+    const client = new CodexAppServerClient({ cwd, executable: this.options.codexExecutable,
+      timeoutMs: this.options.timeoutMs ?? configuration.runtime.requestTimeoutMs });
+    if (client.pid) this.options.onRunner?.(client.pid);
+    try { await client.initializeConnection(); return await client.readOriginalTurn(threadId, turnId, cwd, runId); }
+    finally { await client.close(); }
+  }
+
+  private async recoverLearning(record: WorkRecord, known?: Awaited<ReturnType<CodexAppServerClient["readOriginalTurn"]>>) {
+    const run = record.learningRun!;
+    if (run.sendState === "not_sent") {
+      run.completed = true; record.execution = run.previousExecution;
+      record.learningError = "原整理未发送，待处理来源已保留。"; this.store.save(record);
+      return { status: "not_sent", work: this.store.summary(record) };
+    }
+    const directory = this.store.resolvePath("works/" + record.id + "/learning/" + run.id), receiptPath = join(directory, "result.json");
+    if (!existsSync(receiptPath)) {
+      if (!run.threadId) throw new UnknownExecutionOutcome("原整理缺少线程身份。");
+      const observed = known ?? await this.inspectOriginal(run.threadId, run.turnId, directory, run.id);
+      if (observed.turn.status === "inProgress") return { status: "running", work: this.store.summary(record) };
+      if (observed.turn.status !== "completed") {
+        run.completed = true; record.execution = run.previousExecution;
+        record.learningError = observed.turn.error?.message ?? "原整理已失败或停止，未推进整理进度。";
+        this.store.save(record); return { status: "failed", work: this.store.summary(record) };
+      }
+      run.turnId = observed.turn.id;
+      immutableJson(receiptPath, { threadId: run.threadId, turnId: run.turnId, reply: observed.reply, contextSha256: run.contextSha256 });
+    }
+    const receipt = this.readLearningReceipt(record);
+    try { this.applyLearningReply(record, receipt.reply); }
+    catch (error) {
+      // 只读原调用的身份与终态已核对；内容无效或保存失败属于明确失败，待办仍保留。
+      run.completed = true; record.execution = run.previousExecution; record.learningError = describeError(error);
+      this.store.save(record); throw error;
+    }
+    return { status: "recovered", work: this.store.summary(record) };
+  }
+
+  private readLearningReceipt(record: WorkRecord) {
+    const run = record.learningRun!;
+    const directory = this.store.resolvePath("works/" + record.id + "/learning/" + run.id);
+    const receipt = z.object({ threadId: z.string(), turnId: z.string(), reply: z.string(), contextSha256: z.string() }).parse(readJson(join(directory, "result.json")));
+    if (receipt.threadId !== run.threadId || (run.turnId && receipt.turnId !== run.turnId) || receipt.contextSha256 !== run.contextSha256 ||
+        fileHash(join(directory, "context.json")) !== run.contextSha256) throw new UnknownExecutionOutcome("整理结果与原调用或输入不一致。");
+    return receipt;
+  }
+
   private async render(record: WorkRecord, version: WorkVersion): Promise<void> {
+    checkExecution(this.options.signal);
+    this.options.onProgress?.("正在渲染并核对成片");
     // 修复已交付文件的可用性时，保留历史完成与用户认可。
     if (version.production !== "ready") version.production = "rendering";
     this.store.save(record);
     const result = await (this.options.render ?? renderVersion)(
       this.store.resolvePath(version.sourcePath), this.store.resolvePath(version.mediaPath),
       join(repositoryRoot, ".cache", "render", record.id, version.id),
-      { sourceSnapshot: version.sourceSnapshot, expectedVideoSha256: version.videoSha256 },
+      { sourceSnapshot: version.sourceSnapshot, expectedVideoSha256: version.videoSha256, signal: this.options.signal },
     );
     version.technicalCheck = result;
     version.sourceSha256 = result.sourceSha256;
@@ -200,8 +503,31 @@ export class WorkService {
     this.store.save(record);
   }
 
+  private async repairPreviews(record: WorkRecord, version: WorkVersion): Promise<void> {
+    this.options.onProgress?.("正在从原视频恢复预览");
+    try {
+      if (!version.videoSha256) throw new Error("缺少原视频校验值，不能恢复预览。");
+      const result = await (this.options.restorePreviews ?? restoreVideoPreviews)(
+        this.store.resolvePath(version.mediaPath), version.videoSha256, this.options.signal);
+      this.store.verifySource(version);
+      version.technicalCheck = { ...version.technicalCheck, ...result };
+      if (this.store.previewAvailability(version).status !== "available") throw new Error("预览恢复后仍有不可交付文件。");
+      version.error = undefined;
+      this.store.appendEvent(record.id, version.runId, { kind: "previews_ready", versionId: version.id, ...result });
+    } catch (error) {
+      version.error = "预览恢复失败：" + describeError(error);
+      record.execution = { status: "failed", runId: version.runId, versionId: version.id, error: version.error };
+      this.store.save(record);
+      throw new Error(version.error);
+    }
+    // 修复派生产物只清除此版本的失败，不抹掉其他版本或整理任务的执行状态。
+    if (record.execution.versionId === version.id && record.execution.runId === version.runId) record.execution = { status: "idle" };
+    this.store.save(record);
+  }
+
   /** 校验已有结果，或从已完成工程恢复丢失产物；不重复调用模型。 */
   async renderExisting(id: string, versionId: string): Promise<WorkRecord> {
+    checkExecution(this.options.signal);
     return this.store.withLock(id, async () => {
       const record = this.store.read(id);
       this.assertCanProduce(record, "sample");
@@ -211,7 +537,10 @@ export class WorkService {
         throw new Error("尚无已确认完成的源码，不能直接重渲染。");
       }
       this.store.verifySource(version);
-      if (version.production === "ready" && this.store.availability(version).status === "available") return record;
+      if (version.production === "ready" && this.store.availability(version).status === "available") {
+        if (this.store.previewAvailability(version).status !== "available") await this.repairPreviews(record, version);
+        return record;
+      }
       const historicalReady = version.production === "ready";
       record.execution = { status: "running", runId: version.runId, versionId };
       try { await this.render(record, version); }

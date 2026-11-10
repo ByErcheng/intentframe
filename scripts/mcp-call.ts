@@ -18,14 +18,17 @@ try {
   const tools = await client.listTools();
   if (!tools.tools.some(tool => tool.name === name)) throw new Error("服务未公开工具：" + name);
   // 写操作前先核对服务实际目录；连接成功不代表连接到了预期数据。
-  const identity = await client.callTool({ name: "get_runtime_info", arguments: {} });
+  const identity = await client.callTool({ name: "get_runtime_info", arguments: {} }, { timeout: configuration.mcp.toolTimeoutMs });
   const identityText = identity.content.find(item => item.type === "text");
-  if (identity.isError || !identityText || identityText.type !== "text") throw new Error("无法核对服务数据目录。");
-  const info = z.object({ dataRoot: z.string() }).parse(JSON.parse(identityText.text));
-  if (info.dataRoot !== configuration.dataRoot) throw new Error("服务数据目录与请求配置不一致，已停止调用。");
+  if (identity.isError || !identityText || identityText.type !== "text") {
+    throw new Error("无法核对服务数据目录。" + (identityText?.type === "text" ? " 原因：" + identityText.text : ""));
+  }
+  const info = z.object({ assetRoot: z.string(), workRoots: z.object({ production: z.string(), test: z.string() }) }).parse(JSON.parse(identityText.text));
+  if (info.assetRoot !== configuration.assetRoot || info.workRoots.production !== configuration.workRoots.production ||
+      info.workRoots.test !== configuration.workRoots.test) throw new Error("服务资产目录或作品区域与请求配置不一致，已停止调用。");
   const result = await client.callTool(
     { name, arguments: JSON.parse(readFileSync(inputFile, "utf8")) },
-    { timeout: 600_000 },
+    { timeout: configuration.mcp.toolTimeoutMs },
   );
   const content = result.content.find(item => item.type === "text");
   if (!content || content.type !== "text") throw new Error("工具没有返回文本结果。");

@@ -1,16 +1,19 @@
-import { execFileSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { existsSync, linkSync, mkdirSync, readFileSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, linkSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { dirname, isAbsolute, join, relative, sep } from "node:path";
 import { bundle } from "@remotion/bundler";
-import { renderMedia, selectComposition } from "@remotion/renderer";
+import { makeCancelSignal, renderMedia, selectComposition } from "@remotion/renderer";
 import type { Compiler } from "webpack";
 import { z } from "zod";
-import { repositoryRoot } from "../config.ts";
-import { captureSourceSnapshot, fileHash, sourceFingerprint, verifySourceSnapshot } from "../records/source-snapshot.ts";
+import { configuration, repositoryRoot } from "../config.ts";
+import { captureSourceSnapshot, sourceFingerprint, verifySourceSnapshot } from "../records/source-snapshot.ts";
+import { fileHash } from "../common/file-hash.ts";
 import type { SourceSnapshot } from "../records/source-snapshot.ts";
-export { fileHash } from "../records/source-snapshot.ts";
+import { checkExecution, ExecutionBudgetExceeded } from "../runtime/execution-control.ts";
+import { previewFractions, previewPath } from "./previews.ts";
+export { fileHash } from "../common/file-hash.ts";
 
 const require = createRequire(import.meta.url);
 export function mediaBinaries() {
@@ -27,10 +30,91 @@ function inside(root: string, path: string) {
 }
 
 const receiptSchema = z.object({ sourceFingerprint: z.string(), videoSha256: z.string() });
-export type RenderOptions = { sourceSnapshot?: SourceSnapshot; expectedVideoSha256?: string };
+export type RenderOptions = { sourceSnapshot?: SourceSnapshot; expectedVideoSha256?: string; signal?: AbortSignal };
+
+/** 停止后等实际子进程关闭，避免释放任务占用时媒体工具仍在写文件。 */
+function mediaCommand(executable: string, args: string[], timeoutMs: number, signal?: AbortSignal): Promise<string> {
+  checkExecution(signal);
+  return new Promise((resolve, reject) => {
+    const child = spawn(executable, args, { env: mediaEnvironment(), stdio: ["ignore", "pipe", "pipe"] });
+    let output = "", errors = "", stopped: unknown, force: ReturnType<typeof setTimeout> | undefined;
+    const stop = (reason: unknown) => {
+      if (stopped) return;
+      stopped = reason; child.kill("SIGTERM");
+      force = setTimeout(() => child.kill("SIGKILL"), configuration.runtime.stopTimeoutMs);
+    };
+    const timer = setTimeout(() => stop(new ExecutionBudgetExceeded("媒体检查达到已配置的等待上限。")), timeoutMs);
+    const abort = () => stop(signal?.reason ?? new Error("媒体处理已请求停止。"));
+    signal?.addEventListener("abort", abort, { once: true });
+    if (signal?.aborted) abort();
+    const cleanup = () => { clearTimeout(timer); if (force) clearTimeout(force); signal?.removeEventListener("abort", abort); };
+    child.stdout.on("data", chunk => { output += String(chunk); if (output.length > 8_000_000) stop(new Error("媒体工具返回内容超出本次核对范围。")); });
+    child.stderr.on("data", chunk => { errors = (errors + String(chunk)).slice(-8_000); });
+    child.once("error", error => { cleanup(); reject(error); });
+    child.once("close", code => {
+      cleanup();
+      if (stopped) reject(stopped);
+      else if (code !== 0) reject(new Error("媒体工具执行失败：" + errors));
+      else resolve(output);
+    });
+  });
+}
 
 /** 现有成片只有在来源与字节均能核对时才复用；未知文件保留并报错。 */
 export async function renderVersion(entryPoint: string, output: string, cacheDirectory: string, options: RenderOptions = {}) {
+  const deadline = new AbortController();
+  const timer = setTimeout(() => deadline.abort(new ExecutionBudgetExceeded("渲染达到已配置的等待上限。")), configuration.media.renderTimeoutMs);
+  const signal = options.signal ? AbortSignal.any([options.signal, deadline.signal]) : deadline.signal;
+  try { return await renderAndVerify(entryPoint, output, cacheDirectory, { ...options, signal }); }
+  finally { clearTimeout(timer); }
+}
+
+async function extractPreviews(output: string, fps: number, frames: number, signal?: AbortSignal) {
+  const previews: string[] = [];
+  for (const [index, fraction] of previewFractions.entries()) {
+    const path = previewPath(output, index), temporary = path + "." + randomUUID() + ".png";
+    // 以有效帧号定位，单帧视频也不会定位到末帧之后；完整生成后再替换派生预览。
+    const frame = Math.floor((frames - 1) * fraction);
+    try {
+      await mediaCommand(mediaBinaries().ffmpeg, ["-v", "error", "-ss", String(frame / fps), "-i", output,
+        "-frames:v", "1", "-y", temporary], configuration.media.previewTimeoutMs, signal);
+      if (!existsSync(temporary) || statSync(temporary).size === 0) throw new Error("预览图片未实际生成：" + path);
+      previewPath(output, index); // 发布前再次拒绝被换成符号链接的目标。
+      renameSync(temporary, path);
+      previews.push(path);
+    } finally { rmSync(temporary, { force: true }); }
+  }
+  return previews;
+}
+
+/** 从已核对字节的原视频重建派生预览，不打包工程、不渲染或替换视频。 */
+export async function restoreVideoPreviews(output: string, expectedVideoSha256: string, signal?: AbortSignal) {
+  const deadline = new AbortController();
+  const timer = setTimeout(() => deadline.abort(new ExecutionBudgetExceeded("预览恢复达到已配置的等待上限。")), configuration.media.renderTimeoutMs);
+  try { return await restorePreviews(output, expectedVideoSha256, signal ? AbortSignal.any([signal, deadline.signal]) : deadline.signal); }
+  finally { clearTimeout(timer); }
+}
+
+async function restorePreviews(output: string, expectedVideoSha256: string, signal: AbortSignal) {
+  checkExecution(signal);
+  if (fileHash(output) !== expectedVideoSha256) throw new Error("成片与原版本的校验值不一致，不能恢复预览。");
+  const metadata = z.object({ streams: z.array(z.object({
+    avg_frame_rate: z.string(), nb_read_frames: z.string(),
+  })) }).parse(JSON.parse(await mediaCommand(mediaBinaries().ffprobe,
+    ["-v", "error", "-select_streams", "v:0", "-count_frames", "-show_entries", "stream=avg_frame_rate,nb_read_frames", "-of", "json", output],
+    configuration.media.probeTimeoutMs, signal)));
+  const video = metadata.streams[0];
+  const [numerator, denominator] = (video?.avg_frame_rate ?? "").split("/").map(Number);
+  const fps = numerator !== undefined && denominator !== undefined ? numerator / denominator : NaN;
+  const frames = Number(video?.nb_read_frames);
+  if (!Number.isFinite(fps) || fps <= 0 || !Number.isSafeInteger(frames) || frames < 1) throw new Error("无法核对原视频的帧率和帧数，未恢复预览。");
+  const previews = await extractPreviews(output, fps, frames, signal);
+  if (fileHash(output) !== expectedVideoSha256) throw new Error("恢复预览期间成片发生变化，结果未获确认。");
+  return { previews, previewsCheckedAt: new Date().toISOString() };
+}
+
+async function renderAndVerify(entryPoint: string, output: string, cacheDirectory: string, options: RenderOptions) {
+  checkExecution(options.signal);
   const snapshot = options.sourceSnapshot ?? captureSourceSnapshot(entryPoint);
   verifySourceSnapshot(entryPoint, snapshot);
   const fingerprint = sourceFingerprint(snapshot), receiptPath = join(dirname(output), "render-receipt.json");
@@ -73,19 +157,27 @@ export async function renderVersion(entryPoint: string, output: string, cacheDir
       }],
     }),
   });
+  checkExecution(options.signal);
   const composition = await selectComposition({ serveUrl, id: "Video" });
+  checkExecution(options.signal);
   const temporary = output + ".partial.mp4", candidate = outputExists ? output : temporary;
   if (!outputExists) {
-    await renderMedia({ serveUrl, composition, codec: "h264", outputLocation: temporary,
-      pixelFormat: "yuv420p", concurrency: 2, overwrite: true });
+    const { cancel, cancelSignal } = makeCancelSignal();
+    options.signal?.addEventListener("abort", cancel, { once: true });
+    try {
+      checkExecution(options.signal);
+      await renderMedia({ serveUrl, composition, codec: "h264", outputLocation: temporary,
+        pixelFormat: "yuv420p", concurrency: configuration.media.concurrency, overwrite: true, cancelSignal });
+    } finally { options.signal?.removeEventListener("abort", cancel); }
   }
+  checkExecution(options.signal);
   const { ffmpeg, ffprobe } = mediaBinaries();
   const metadata = z.object({
     streams: z.array(z.object({ codec_type: z.string(), codec_name: z.string().optional(),
       width: z.number().optional(), height: z.number().optional(), avg_frame_rate: z.string().optional() })),
     format: z.object({ duration: z.string() }),
-  }).parse(JSON.parse(execFileSync(ffprobe, ["-v", "error", "-show_streams", "-show_format", "-of", "json", candidate],
-    { encoding: "utf8", timeout: 30_000, env: mediaEnvironment() })));
+  }).parse(JSON.parse(await mediaCommand(ffprobe, ["-v", "error", "-show_streams", "-show_format", "-of", "json", candidate],
+    configuration.media.probeTimeoutMs, options.signal)));
   const video = metadata.streams.find(stream => stream.codec_type === "video");
   const [numerator, denominator] = (video?.avg_frame_rate ?? "").split("/").map(Number);
   const fps = numerator !== undefined && denominator !== undefined ? numerator / denominator : NaN;
@@ -96,8 +188,8 @@ export async function renderVersion(entryPoint: string, output: string, cacheDir
     throw new Error("成片规格（包括实际帧率）与制作工程不一致。");
   }
   // 包内精简 FFmpeg 需要显式选择解码验证的输出编码器。
-  execFileSync(ffmpeg, ["-v", "error", "-xerror", "-i", candidate, "-c:v", "rawvideo", "-c:a", "pcm_s16le", "-f", "null", "-"],
-    { timeout: 60_000, env: mediaEnvironment() });
+  await mediaCommand(ffmpeg, ["-v", "error", "-xerror", "-i", candidate, "-c:v", "rawvideo", "-c:a", "pcm_s16le", "-f", "null", "-"],
+    configuration.media.decodeTimeoutMs, options.signal);
   verifySourceSnapshot(entryPoint, snapshot);
   const videoSha256 = fileHash(candidate);
   if (options.expectedVideoSha256 && videoSha256 !== options.expectedVideoSha256) {
@@ -111,16 +203,7 @@ export async function renderVersion(entryPoint: string, output: string, cacheDir
     linkSync(temporary, output);
     unlinkSync(temporary);
   }
-  const previews: string[] = [];
-  for (const [index, fraction] of [0.12, 0.5, 0.86].entries()) {
-    const path = join(dirname(output), "frame-" + (index + 1) + ".png");
-    // 按有效帧号确定取图时间，避免极短片段定位到最后一帧之后。
-    const frame = Math.floor((composition.durationInFrames - 1) * fraction);
-    execFileSync(ffmpeg, ["-v", "error", "-ss", String(frame / composition.fps), "-i", output, "-frames:v", "1", "-y", path],
-      { timeout: 30_000, env: mediaEnvironment() });
-    if (!existsSync(path) || statSync(path).size === 0) throw new Error("预览图片未实际生成：" + path);
-    previews.push(path);
-  }
+  const previews = await extractPreviews(output, composition.fps, composition.durationInFrames, options.signal);
   if (fileHash(output) !== videoSha256) throw new Error("检查期间成片发生变化，结果未获确认。");
   verifySourceSnapshot(entryPoint, snapshot);
   return { width: video.width, height: video.height, fps, durationSeconds: duration,

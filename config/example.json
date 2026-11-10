@@ -19,5 +19,27 @@
       "source": "https://github.com/restic/restic/releases/tag/v0.19.1",
       "archiveSha256": "7be0a144ccc377880f294204aa271d76e4b79554b42a751151d425ce6ebac143"
     }
+  },
+  "runtime": {
+    "requestTimeoutMs": 180000,
+    "productionTimeoutMs": 1800000,
+    "jobTimeoutMs": 3600000,
+    "stopTimeoutMs": 10000
+  },
+  "mcp": {
+    "toolTimeoutMs": 600000
+  },
+  "media": {
+    "concurrency": 2,
+    "renderTimeoutMs": 1800000,
+    "probeTimeoutMs": 30000,
+    "decodeTimeoutMs": 60000,
+    "previewTimeoutMs": 30000
+  },
+  "backup": {
+    "commandTimeoutMs": 180000
+  },
+  "diagnostics": {
+    "toolTimeoutMs": 10000
   }
 }

@@ -1,12 +1,13 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { configuration } from "./config.ts";
 import { mediaBinaries, mediaEnvironment } from "./media/render.ts";
-import { executeTool, startMcpServer } from "./mcp/server.ts";
-import { describeError } from "./runtime/codex-client.ts";
+import { executeTool, prepareOperation, startMcpServer } from "./mcp/server.ts";
+import { z } from "zod";
+import { describeError } from "./common/errors.ts";
 
 async function main() {
-  const [command, name, file] = process.argv.slice(2);
+  const [command, name, file, output] = process.argv.slice(2);
   if (command === "mcp") { startMcpServer(); return; }
   if (command === "doctor") {
     const media = mediaBinaries();
@@ -16,14 +17,25 @@ async function main() {
       const args = tool === "restic" ? ["version"] : tool === "ffmpeg" || tool === "ffprobe" ? ["-version"] : ["--version"];
       try {
         return [tool, { path, available: true, version: execFileSync(path, args, {
-          encoding: "utf8", timeout: 10_000, env: tool === "ffmpeg" || tool === "ffprobe" ? mediaEnvironment() : process.env,
+          encoding: "utf8", timeout: configuration.diagnostics.toolTimeoutMs,
+          env: tool === "ffmpeg" || tool === "ffprobe" ? mediaEnvironment() : process.env,
         }).split("\n")[0] }];
       } catch (error) {
         return [tool, { path, available: false, error: describeError(error) }];
       }
     }));
-    console.log(JSON.stringify({ dataRoot: configuration.dataRoot, tools: checked }, null, 2));
+    console.log(JSON.stringify({ configPath: configuration.configPath,
+      environmentOverrides: configuration.environmentOverrides,
+      assetRoot: configuration.assetRoot, workRoots: configuration.workRoots, knowledgeRoot: configuration.knowledgeRoot,
+      backupRoot: configuration.backupRoot, tools: checked }, null, 2));
     if (!Object.values(checked).every(tool => tool.available)) process.exitCode = 1;
+    return;
+  }
+  if (command === "prepare" && name && file && output) {
+    const input = z.record(z.string(), z.unknown()).parse(JSON.parse(readFileSync(file, "utf8")));
+    const request = prepareOperation(name, input);
+    writeFileSync(output, JSON.stringify(request.arguments, null, 2) + "\n", { flag: "wx", mode: 0o600 });
+    console.log(JSON.stringify({ tool: name, operationId: request.arguments.operationId, requestFile: output }, null, 2));
     return;
   }
   if (command === "call" && name && file) {
@@ -32,7 +44,7 @@ async function main() {
     return;
   }
   if (!command || command === "--help") {
-    console.log("用法：scripts/intentframe doctor | mcp | call <工具名> <参数 JSON 文件>");
+    console.log("用法：scripts/intentframe doctor | mcp | prepare <工具名> <参数 JSON> <新请求 JSON> | call <工具名> <请求 JSON>");
     return;
   }
   throw new Error("命令或参数不完整，请使用 --help。");

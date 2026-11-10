@@ -12,10 +12,10 @@ export function fixtureRoot() {
   return { path, cleanup: () => rmSync(path, { recursive: true, force: true }) };
 }
 
-export function fakeCodex(root: string, mode = "completed"): string {
+export function fakeCodex(root: string, mode = "completed", completionDelayMs = 1_000): string {
   const path = join(root, "codex-" + mode + ".mjs");
   const source = fileURLToPath(new URL("./fixtures/codex-server.mjs", import.meta.url));
-  writeFileSync(path, "#!" + process.execPath + "\nimport {run} from " + JSON.stringify(pathToFileURL(source).href) + ";\nrun(" + JSON.stringify(mode) + ");\n");
+  writeFileSync(path, "#!" + process.execPath + "\nimport {run} from " + JSON.stringify(pathToFileURL(source).href) + ";\nrun(" + JSON.stringify(mode) + "," + JSON.stringify(join(root, "native-fixture")) + "," + completionDelayMs + ");\n");
   chmodSync(path, 0o700);
   return path;
 }
@@ -25,6 +25,15 @@ export function videoSource(color = "red", fps = 10, helper = false): string {
     (helper ? 'import {color} from "./color";\n' : 'const color=' + JSON.stringify(color) + ';\n') +
     'const Scene=()=> <AbsoluteFill style={{backgroundColor:color}}/>;\n' +
     'registerRoot(()=> <Composition id="Video" component={Scene} durationInFrames={' + fps + '} fps={' + fps + '} width={160} height={90}/>);\n';
+}
+
+function fixturePreviews(output: string) {
+  // 状态测试只需要可定位的合成预览；真实抽帧与解码另由媒体回归验证。
+  return [1, 2, 3].map(index => {
+    const path = join(dirname(output), "frame-" + index + ".png");
+    writeFileSync(path, "合成预览：" + index);
+    return path;
+  });
 }
 
 export function readyVersion(store: WorkStore, workId: string, id: string, kind: "sample" | "complete"): WorkVersion {
@@ -38,6 +47,7 @@ export function readyVersion(store: WorkStore, workId: string, id: string, kind:
   writeFileSync(store.resolvePath(v.sourcePath), videoSource());
   // 状态规则测试只检查字节身份；真实解码与渲染由 media.test.ts 独立验证。
   writeFileSync(store.resolvePath(v.mediaPath), "合成测试产物：" + id);
+  v.technicalCheck = { previews: fixturePreviews(store.resolvePath(v.mediaPath)) };
   v.sourceSha256 = fileHash(store.resolvePath(v.sourcePath));
   v.videoSha256 = fileHash(store.resolvePath(v.mediaPath));
   v.sourceSnapshot = captureSourceSnapshot(store.resolvePath(v.sourcePath));
@@ -49,5 +59,5 @@ export const fixtureRender: typeof renderVersion = async (entry, output, _cache,
   mkdirSync(dirname(output), { recursive: true });
   writeFileSync(output, readFileSync(entry));
   return { width: 160, height: 90, fps: 10, durationSeconds: 1, videoCodec: "fixture", audioStreams: 0,
-    decoded: true, sourceSha256: fileHash(entry), videoSha256: fileHash(output), previews: [], checkedAt: new Date().toISOString() };
+    decoded: true, sourceSha256: fileHash(entry), videoSha256: fileHash(output), previews: fixturePreviews(output), checkedAt: new Date().toISOString() };
 };

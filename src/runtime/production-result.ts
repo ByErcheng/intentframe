@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { experienceRefSchema, learningResultSchema } from "../records/contracts.ts";
 
 // 这是主 AI 的交付声明，不替代媒体检查、内容审查或用户认可。
 export const productionResultSchema = z.object({
@@ -7,9 +8,13 @@ export const productionResultSchema = z.object({
   appliedFeedbackIds: z.array(z.string()),
   unresolvedFeedbackIds: z.array(z.string()),
   blockers: z.array(z.string().trim().min(1)),
+  usedExperienceRefs: z.array(experienceRefSchema).max(100).optional(),
+  learning: learningResultSchema.optional(),
 }).strict();
 export type ProductionResult = z.infer<typeof productionResultSchema>;
-export const productionOutputSchema = z.toJSONSchema(productionResultSchema);
+export const productionOutputSchema = z.toJSONSchema(productionResultSchema.extend({
+  usedExperienceRefs: z.array(experienceRefSchema).max(100), learning: learningResultSchema,
+}));
 
 export function parseProductionResult(text: string, requestedIds: string[]): ProductionResult {
   const result = productionResultSchema.parse(JSON.parse(text));

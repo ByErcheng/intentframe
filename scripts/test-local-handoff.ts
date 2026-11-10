@@ -8,7 +8,7 @@ import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
 import { McpServer } from "@modelcontextprotocol/server";
 import { serveStdio } from "@modelcontextprotocol/server/stdio";
 import { z } from "zod";
-import { configuration } from "../src/config.ts";
+import { configuration, projectEnvironment } from "../src/config.ts";
 import { CodexAppServerClient, UnknownExecutionOutcome, RpcRequestRejected, codexTurnSchema, describeError, executionFailureStatus } from "../src/runtime/codex-client.ts";
 
 /**
@@ -19,8 +19,8 @@ import { CodexAppServerClient, UnknownExecutionOutcome, RpcRequestRejected, code
  * 阅读顺序：任务记录 → Codex 协议连接 → 单阶段执行 → MCP 交接 → 验证入口。
  */
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-// 仅作为本次测试的等待上限；超时表示未取得结果，不表示远端已经停止。
-const requestTimeoutMs = 180_000;
+// 在 Codex 单次等待预算外预留返回时间；超时不表示远端已经停止。
+const probeToolTimeoutMs = Math.min(configuration.runtime.requestTimeoutMs + 10_000, 2_147_483_647);
 
 const artifactRecordSchema = z.object({
   version: z.number().int(),
@@ -214,14 +214,12 @@ function startProbeMcpServer(taskDirectory: string): void {
 }
 
 async function connectProbeClient(taskDirectory: string): Promise<Client> {
-  const executable = process.env.INTENTFRAME_CODEX_BIN ?? configuration.codex;
-  if (!executable) throw new Error("运行测试前请设置 INTENTFRAME_CODEX_BIN。");
   const client = new Client({ name: "intentframe-test-client", version: "0.1.0" });
   const transport = new StdioClientTransport({
     command: process.execPath,
     args: [fileURLToPath(import.meta.url), "--serve", taskDirectory],
     cwd: repositoryRoot,
-    env: { INTENTFRAME_CODEX_BIN: executable },
+    env: projectEnvironment(),
   });
   try {
     await client.connect(transport);
@@ -312,7 +310,7 @@ async function verifyFailureHandling(testDirectory: string): Promise<void> {
   try {
     const result = await rejectedClient.callTool(
       { name: "run_sample", arguments: { stage: "resume" } },
-      { timeout: requestTimeoutMs + 10_000 },
+      { timeout: probeToolTimeoutMs },
     );
     const state = await queryProbeStatus(rejectedClient);
     assert.equal(result.isError, true);
@@ -355,7 +353,7 @@ async function verifyLocalHandoff(testDirectory: string): Promise<void> {
       }
       const result = await client.callTool(
         { name: "run_sample", arguments: { stage } },
-        { timeout: requestTimeoutMs + 10_000 },
+        { timeout: probeToolTimeoutMs },
       );
       const state = await queryProbeStatus(client);
       console.log(JSON.stringify({

@@ -1,12 +1,18 @@
 import { randomUUID } from "node:crypto";
 import {
-  appendFileSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync,
+  appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync,
 } from "node:fs";
-import { isAbsolute, join, relative, resolve, sep } from "node:path";
+import { join, resolve } from "node:path";
 import { z } from "zod";
 import { configuration } from "../config.ts";
 import { fileHash, sourceSnapshotSchema, verifyLegacySource, verifySourceSnapshot } from "./source-snapshot.ts";
 import { productionResultSchema } from "../runtime/production-result.ts";
+import { atomicJson, immutableJson, ownedPath, readJson, valueHash } from "./files.ts";
+import { experienceRefSchema, feedbackLocationSchema, learningResultSchema, purposeSchema, workInputSchema } from "./contracts.ts";
+import type { FeedbackLocation, WorkPurpose } from "./contracts.ts";
+import { processExists } from "../runtime/process-state.ts";
+import { activeExecution, assertExecutionAccess, ExecutionStore, withExecutionDispatch } from "./execution-store.ts";
+import { inspectPreviews } from "../media/previews.ts";
 
 const idSchema = z.string().regex(/^[a-z0-9][a-z0-9-]{0,79}$/);
 const versionIdSchema = z.string().regex(/^v\d{3,}$/);
@@ -14,6 +20,11 @@ const feedbackSchema = z.object({
   id: z.string(), versionId: versionIdSchema, text: z.string(),
   source: z.enum(["user", "external_ai", "internal_check", "system_test"]),
   changesDirection: z.boolean(), createdAt: z.string(),
+  location: feedbackLocationSchema.optional(),
+  operationId: z.string().optional(), receivedDuringExecutionId: z.string().optional(), receivedDuringRunId: z.string().optional(),
+  invalidatesApproval: z.string().optional(),
+  sequence: z.number().int().nonnegative().optional(),
+  supersedes: z.array(z.string()).optional(),
 });
 const reviewSchema = z.object({
   status: z.enum(["not_reviewed", "needs_changes", "passed"]),
@@ -31,6 +42,7 @@ export const versionSchema = z.object({
   production: z.enum(["creating", "source_ready", "rendering", "ready", "blocked", "failed", "unknown"]),
   sourcePath: z.string(), mediaPath: z.string(), createdAt: z.string(),
   basedOnVersionId: versionIdSchema.optional(),
+  directionId: versionIdSchema.optional(), newDirection: z.boolean().optional(),
   feedbackId: z.string().optional(), runId: z.string(),
   feedbackIds: z.array(z.string()).optional(), appliedFeedbackIds: z.array(z.string()).optional(),
   baseReason: z.string().optional(), agentReply: z.string().optional(), agentResult: productionResultSchema.optional(),
@@ -42,21 +54,46 @@ export const versionSchema = z.object({
   reviews: z.array(reviewSchema).optional(),
   acceptance: z.enum(["pending", "accepted"]),
   userConfirmation: z.string().optional(), error: z.string().optional(),
+  operationId: z.string().optional(), contextSha256: z.string().optional(),
+  inputManifestPath: z.string().optional(), inputManifestSha256: z.string().optional(),
+  systemFingerprint: z.string().optional(),
+  executionConditions: z.object({
+    runner: z.object({ executable: z.string(), sha256: z.string(), declaredVersion: z.string().optional() }),
+    node: z.object({ version: z.string(), platform: z.string(), architecture: z.string() }),
+    timeoutMs: z.number().positive(), media: z.record(z.string(), z.number()), dependencyLockSha256: z.string(),
+  }).optional(),
+  runnerPid: z.number().int().positive().optional(),
+  sendState: z.enum(["not_sent", "sending", "acknowledged"]).optional(),
+  nativeResult: z.object({ threadId: z.string(), turnId: z.string(), status: z.enum(["completed", "failed", "interrupted"]), reply: z.string(), error: z.string().optional() }).optional(),
+  knowledgeUsed: z.array(experienceRefSchema).optional(),
 });
 export type WorkVersion = z.infer<typeof versionSchema>;
+const executionSchema = z.object({
+  status: z.enum(["idle", "running", "waiting_input", "failed", "unknown"]),
+  runId: z.string().optional(), versionId: z.string().optional(), error: z.string().optional(),
+});
 export const workSchema = z.object({
   schemaVersion: z.literal(1),
+  purpose: purposeSchema.optional(), scopeId: z.string().optional(),
+  creationOperationId: z.string().optional(),
+  comparison: z.object({ id: idSchema, side: z.enum(["before", "after"]), inputHash: z.string() }).optional(),
   id: idSchema, title: z.string(), briefPath: z.string(), createdAt: z.string(),
-  execution: z.object({
-    status: z.enum(["idle", "running", "waiting_input", "failed", "unknown"]),
-    runId: z.string().optional(), versionId: z.string().optional(), error: z.string().optional(),
-  }),
+  execution: executionSchema,
   directionApproval: z.object({
     sampleVersionId: versionIdSchema, scope: z.string(), userConfirmation: z.string(), confirmedAt: z.string(),
+    feedbackAcknowledgedIds: z.array(z.string()).optional(),
   }).nullable(),
   feedback: z.array(feedbackSchema),
   confirmations: z.array(confirmationSchema).optional(),
   versions: z.array(versionSchema),
+  learningBatches: z.array(z.object({ id: idSchema, checkedSourceIds: z.array(z.string()), notes: z.string(), versionId: z.string(),
+    experienceRefs: z.array(experienceRefSchema), savedAt: z.string(), staged: z.boolean(), draftSha256: z.string().optional() })).optional(),
+  learningPending: z.object({ id: idSchema, result: learningResultSchema, versionId: z.string(), sourceIds: z.array(z.string()), createdAt: z.string() }).optional(),
+  learningError: z.string().optional(),
+  learningRun: z.object({ id: idSchema, versionId: z.string(), sourceIds: z.array(z.string()), contextSha256: z.string(),
+    threadId: z.string().optional(), turnId: z.string().optional(), runnerPid: z.number().int().positive().optional(),
+    sendState: z.enum(["not_sent", "sending", "acknowledged"]), previousExecution: executionSchema,
+    completed: z.boolean(), createdAt: z.string() }).optional(),
 });
 export type WorkRecord = z.infer<typeof workSchema>;
 const now = () => new Date().toISOString();
@@ -68,6 +105,7 @@ function validateRecord(input: unknown): WorkRecord {
   for (const version of record.versions) {
     if (ids.has(version.id)) throw new Error("作品版本编号重复。");
     ids.add(version.id);
+    if (version.inputManifestPath && version.inputManifestPath !== workPath + "/runs/" + idSchema.parse(version.runId) + "/input.json") throw new Error("制作输入依据路径与版本执行不一致。");
     if (version.sourcePath !== workPath + "/versions/" + version.id + "/source/entry.tsx" ||
         version.mediaPath !== "media/" + record.id + "/" + version.id + "/video.mp4") {
       throw new Error("源码或媒体路径与所属作品版本不一致。");
@@ -95,26 +133,32 @@ function preserveConfirmations(record: WorkRecord): NonNullable<WorkRecord["conf
 /** 同一作品的记录是一处事实来源；媒体与源码路径相对数据根目录保存。 */
 export class WorkStore {
   readonly dataRoot: string;
+  readonly purpose: WorkPurpose;
+  readonly assetRoot: string;
 
-  constructor(dataRoot = configuration.dataRoot) {
+  readonly backgroundOperationId?: string;
+  constructor(dataRoot = configuration.assetRoot, purpose: WorkPurpose = "production", assetRoot = dataRoot, backgroundOperationId?: string) {
     this.dataRoot = resolve(dataRoot);
+    this.purpose = purpose;
+    this.assetRoot = resolve(assetRoot);
+    this.backgroundOperationId = backgroundOperationId;
   }
 
   resolvePath(path: string): string {
-    const target = resolve(this.dataRoot, path);
-    const child = relative(this.dataRoot, target);
-    if (isAbsolute(path) || child === ".." || child.startsWith(".." + sep)) {
-      throw new Error("记录路径必须位于数据根目录内。");
+    return ownedPath(this.dataRoot, path);
+  }
+
+  scope(create = false): { id: string; purpose: WorkPurpose } | undefined {
+    const path = this.resolvePath(".intentframe-scope.json");
+    if (!existsSync(path)) {
+      if (!create) return undefined;
+      mkdirSync(this.dataRoot, { recursive: true });
+      try { writeFileSync(path, JSON.stringify({ id: randomUUID(), purpose: this.purpose }), { flag: "wx", mode: 0o600 }); }
+      catch (error) { if (!(error instanceof Error && "code" in error && error.code === "EEXIST")) throw error; }
     }
-    // 数据根目录可以由用户显式指定；内部链接不能重定向任务、源码或媒体写入。
-    let current = this.dataRoot;
-    for (const part of child.split(sep).filter(Boolean)) {
-      current = join(current, part);
-      if (lstatSync(current, { throwIfNoEntry: false })?.isSymbolicLink()) {
-        throw new Error("数据目录内的记录路径不能经过符号链接：" + path);
-      }
-    }
-    return target;
+    const scope = z.object({ id: z.string().uuid(), purpose: purposeSchema }).parse(readJson(path));
+    if (scope.purpose !== this.purpose) throw new Error("数据目录的制作用途与本次入口不一致。");
+    return scope;
   }
 
   workDirectory(id: string): string {
@@ -123,12 +167,37 @@ export class WorkStore {
 
   read(id: string): WorkRecord {
     const path = this.resolvePath(join("works", idSchema.parse(id), "task.json"));
-    const record = validateRecord(JSON.parse(readFileSync(path, "utf8")));
+    const record = validateRecord(readJson(path));
     if (record.id !== id) throw new Error("任务记录的标识与目录不一致。");
+    const scope = this.scope();
+    if ((record.purpose && record.purpose !== this.purpose) || (record.scopeId && record.scopeId !== scope?.id)) {
+      throw new Error("任务的制作用途或数据区域与当前入口不一致。");
+    }
+    // 新反馈独立追加；后台保存旧 task 快照不会覆盖这些已收到的原始意见。
+    const feedbackDirectory = this.resolvePath(join("works", id, "feedback"));
+    const originalOrder = new Map(record.feedback.map((item, index) => [item.id, index]));
+    if (existsSync(feedbackDirectory)) {
+      for (const name of readdirSync(feedbackDirectory).filter(name => name.endsWith(".json")).sort()) {
+        const item = feedbackSchema.parse(readJson(this.resolvePath(join("works", id, "feedback", name))));
+        if (name !== item.id + ".json") throw new Error("反馈记录与文件标识不一致。");
+        this.version(record, item.versionId);
+        const existing = record.feedback.find(f => f.id === item.id);
+        if (existing && valueHash(existing) !== valueHash(item)) throw new Error("反馈快照与原始追加记录不一致。");
+        if (!existing) record.feedback.push(item);
+      }
+      record.feedback.sort((a, b) => (a.sequence ?? originalOrder.get(a.id) ?? 0) - (b.sequence ?? originalOrder.get(b.id) ?? 0));
+    }
+    const approval = record.directionApproval;
+    if (approval && record.feedback.some(f => f.changesDirection && (approval.feedbackAcknowledgedIds ?
+      !approval.feedbackAcknowledgedIds.includes(f.id) : f.invalidatesApproval === valueHash(approval)))) {
+      preserveConfirmations(record);
+      record.directionApproval = null;
+    }
     return record;
   }
 
   list() {
+    this.scope();
     const directory = this.resolvePath("works");
     if (!existsSync(directory)) return [];
     return readdirSync(directory, { withFileTypes: true })
@@ -136,7 +205,7 @@ export class WorkStore {
       .map(entry => {
         const record = this.read(entry.name);
         const latest = record.versions.at(-1);
-        return { id: record.id, title: record.title, execution: record.execution.status,
+        return { id: record.id, title: record.title, purpose: record.purpose ?? "unspecified", execution: record.execution.status,
           latestVersion: latest?.id, acceptance: latest?.acceptance,
           availability: latest ? this.availability(latest) : undefined };
       });
@@ -144,19 +213,31 @@ export class WorkStore {
 
   save(record: WorkRecord): void {
     const valid = validateRecord(record);
+    const scope = this.scope(true)!;
+    if ((valid.purpose && valid.purpose !== this.purpose) || (valid.scopeId && valid.scopeId !== scope.id)) throw new Error("不能把任务保存到其他用途的数据区域。");
     const target = this.resolvePath(join("works", valid.id, "task.json"));
-    const temporary = target + "." + randomUUID() + ".tmp";
-    writeFileSync(temporary, JSON.stringify(valid, null, 2) + "\n", { flag: "wx" });
-    renameSync(temporary, target);
+    atomicJson(target, valid);
   }
 
-  create(title: string, brief: string): WorkRecord {
-    z.string().trim().min(1).max(200).parse(title);
-    z.string().trim().min(1).max(30_000).parse(brief);
-    const id = "work-" + randomUUID();
+  plannedWorkId(operationId: string): string {
+    return "work-" + valueHash({ scopeId: this.scope(true)!.id, operationId }).slice(0, 32);
+  }
+
+  create(title: string, brief: string, operationId?: string, comparison?: WorkRecord["comparison"]): WorkRecord {
+    workInputSchema.parse({ title, brief });
+    const scope = this.scope(true)!;
+    const id = operationId ? this.plannedWorkId(operationId) : "work-" + randomUUID();
+    if (existsSync(this.resolvePath(join("works", id, "task.json")))) {
+      const previous = this.read(id);
+      if (previous.creationOperationId !== operationId || previous.title !== title || valueHash(previous.comparison ?? null) !== valueHash(comparison ?? null) ||
+          readFileSync(this.resolvePath(previous.briefPath), "utf8") !== "# 原始需求\n\n" + brief + "\n") throw new Error("原操作的任务内容不一致。");
+      return previous;
+    }
     mkdirSync(this.workDirectory(id), { recursive: true });
     const record: WorkRecord = {
-      schemaVersion: 1, id, title, briefPath: "works/" + id + "/brief.md", createdAt: now(),
+      schemaVersion: 1, purpose: this.purpose, scopeId: scope.id, creationOperationId: operationId,
+      comparison,
+      id, title, briefPath: "works/" + id + "/brief.md", createdAt: now(),
       execution: { status: "idle" }, directionApproval: null, feedback: [], versions: [],
     };
     writeFileSync(this.resolvePath(record.briefPath), "# 原始需求\n\n" + brief + "\n", { flag: "wx" });
@@ -171,9 +252,13 @@ export class WorkStore {
   }
 
   // 写锁覆盖完整操作；并发读者只读取原子替换后的快照。
-  async withLock<T>(id: string, operation: () => Promise<T> | T): Promise<T> {
-    const lock = join(this.workDirectory(id), ".write-lock");
+  async withLock<T>(id: string, operation: () => Promise<T> | T, recovery = false): Promise<T> {
+    assertExecutionAccess(this.dataRoot, id, this.backgroundOperationId);
+    const lock = this.resolvePath(join("works", idSchema.parse(id), ".write-lock"));
+    const recovering = this.resolvePath(join("works", id, ".recovery-lock"));
+    if (!recovery && existsSync(recovering)) throw new Error("作品正在核对恢复，暂不接受新的写操作。");
     try {
+      assertExecutionAccess(this.dataRoot, id, this.backgroundOperationId);
       mkdirSync(lock);
     } catch (error) {
       if (error instanceof Error && "code" in error && error.code === "EEXIST") {
@@ -182,27 +267,91 @@ export class WorkStore {
       throw error;
     }
     try {
+      assertExecutionAccess(this.dataRoot, id, this.backgroundOperationId);
+      if (!recovery && existsSync(recovering)) throw new Error("作品正在核对恢复，暂不接受新的写操作。");
       writeFileSync(join(lock, "owner.json"), JSON.stringify({ pid: process.pid, startedAt: now() }));
       return await operation();
     }
     finally { rmSync(lock, { recursive: true }); }
   }
 
+  async withRecoveryGuard<T>(id: string, operation: () => Promise<T>): Promise<T> {
+    assertExecutionAccess(this.dataRoot, id, this.backgroundOperationId);
+    const guard = this.resolvePath(join("works", idSchema.parse(id), ".recovery-lock"));
+    try { mkdirSync(guard); } catch { throw new Error("已有恢复核对或未正常结束的恢复，请保留现场。"); }
+    try {
+      assertExecutionAccess(this.dataRoot, id, this.backgroundOperationId);
+      writeFileSync(join(guard, "owner.json"), JSON.stringify({ pid: process.pid, startedAt: now() }), { flag: "wx" });
+      return await operation();
+    } finally { rmSync(guard, { recursive: true }); }
+  }
+
+  lockOwner(id: string): { pid: number; startedAt: string } | undefined {
+    const directory = this.resolvePath(join("works", idSchema.parse(id), ".write-lock"));
+    if (!existsSync(directory)) return undefined;
+    return z.object({ pid: z.number().int().positive(), startedAt: z.string() })
+      .parse(readJson(this.resolvePath(join("works", id, ".write-lock", "owner.json"))));
+  }
+
+  /** 调用方必须持恢复围栏并核对原进程、运行器与结果，不能以锁年龄判断。 */
+  releaseStaleLock(id: string, expected: { pid: number; startedAt: string }): void {
+    const guard = readJson(this.resolvePath(join("works", idSchema.parse(id), ".recovery-lock", "owner.json")));
+    if (z.object({ pid: z.number() }).parse(guard).pid !== process.pid) throw new Error("未持有本次恢复围栏。");
+    const actual = this.lockOwner(id);
+    if (!actual || valueHash(actual) !== valueHash(expected) || processExists(actual.pid)) throw new Error("作品占用已变化或原进程仍在运行，停止恢复。");
+    rmSync(this.resolvePath(join("works", id, ".write-lock")), { recursive: true });
+  }
+
+  validateFeedbackLocation(record: WorkRecord, versionId: string, location?: FeedbackLocation) {
+    const version = this.version(record, versionId), target = location ? feedbackLocationSchema.parse(location) : undefined;
+    if (target?.startSeconds !== undefined) {
+      const duration = version.technicalCheck?.durationSeconds;
+      if (typeof duration === "number" && (target.startSeconds >= duration || (target.endSeconds ?? 0) > duration)) throw new Error("反馈时间超出已核实的视频范围。");
+      if (target.precision === "verified" && typeof duration !== "number") throw new Error("媒体时长尚未核实，不能登记已核准的时间定位。");
+    }
+    return target;
+  }
+
+  validateFeedbackReferences(record: WorkRecord, supersedes?: string[]) {
+    if (!supersedes) return;
+    if (new Set(supersedes).size !== supersedes.length || supersedes.some(id => !record.feedback.some(f => f.id === id))) {
+      throw new Error("supersedes 须引用本作品已存在且不重复的反馈编号；不能猜测或引用其他作品。");
+    }
+  }
+
   async feedback(
     id: string, versionId: string, text: string,
-    source: z.infer<typeof feedbackSchema>["source"], changesDirection = false,
+    source: z.infer<typeof feedbackSchema>["source"], changesDirection = false, location?: FeedbackLocation,
+    operationId?: string, supersedes?: string[],
   ): Promise<WorkRecord> {
     z.string().trim().min(1).max(10_000).parse(text);
-    return this.withLock(id, () => {
+    return withExecutionDispatch(this.dataRoot, id, () => {
       const record = this.read(id);
-      this.version(record, versionId);
-      record.feedback.push({ id: randomUUID(), versionId, text, source, changesDirection, createdAt: now() });
-      if (changesDirection) {
-        preserveConfirmations(record);
-        record.directionApproval = null;
+      if (existsSync(this.resolvePath(join("works", id, ".recovery-lock")))) throw new Error("作品正在核对恢复，暂不接受新的写操作。");
+      const active = activeExecution(this.dataRoot, id);
+      if (active) {
+        const state = new ExecutionStore(this.assetRoot).view(active.operationId);
+        if (state.workId !== id || !["queued", "running"].includes(state.status)) throw new Error("原执行状态须先核对，不能绕过未知占用保存反馈。");
+      } else if (record.execution.status === "unknown" || existsSync(this.resolvePath(join("works", id, ".write-lock")))) {
+        const owner = this.lockOwner(id);
+        if (record.execution.status !== "running" || !owner || owner.pid !== process.pid) throw new Error("作品正在被操作，或前次操作未正常退出；须核对记录和进程后再继续。");
       }
-      this.save(record);
-      return record;
+      const target = this.validateFeedbackLocation(record, versionId, location);
+      this.validateFeedbackReferences(record, supersedes);
+      const feedbackId = operationId ? "feedback-" + valueHash({ operationId }).slice(0, 32) : randomUUID();
+      const input = { versionId, text, source, changesDirection, location: target, operationId, supersedes };
+      const previous = record.feedback.find(f => f.id === feedbackId);
+      if (previous) {
+        const { versionId, text, source, changesDirection, location, operationId, supersedes } = previous;
+        if (valueHash({ versionId, text, source, changesDirection, location, operationId, supersedes }) !== valueHash(input)) throw new Error("同一操作的反馈内容不一致。");
+        return record;
+      }
+      const item = { id: feedbackId, ...input, createdAt: now(), receivedDuringExecutionId: active?.operationId,
+        sequence: record.feedback.length,
+        receivedDuringRunId: record.execution.status === "running" ? record.execution.runId : undefined,
+        invalidatesApproval: changesDirection && record.directionApproval ? valueHash(record.directionApproval) : undefined };
+      immutableJson(this.resolvePath(join("works", id, "feedback", feedbackId + ".json")), item);
+      return this.read(id);
     });
   }
 
@@ -222,6 +371,7 @@ export class WorkStore {
         record.directionApproval = {
           sampleVersionId: versionId, scope: z.string().trim().min(1).parse(scope),
           userConfirmation, confirmedAt,
+          feedbackAcknowledgedIds: record.feedback.map(f => f.id),
         };
       } else {
         if (version.kind !== "complete") throw new Error("成片认可须关联完整作品版本。");
@@ -291,6 +441,10 @@ export class WorkStore {
     if (result.status !== "available") throw new Error(result.reason ?? "版本当前不可用。");
   }
 
+  previewAvailability(version: WorkVersion) {
+    return inspectPreviews(this.resolvePath(version.mediaPath), version.technicalCheck?.previews);
+  }
+
   summary(record: WorkRecord) {
     return {
       ...record,
@@ -298,7 +452,11 @@ export class WorkStore {
       briefLocation: this.resolvePath(record.briefPath),
       versions: record.versions.map(version => {
         const availability = this.availability(version);
-        return { ...version, availability, sourceLocation: this.resolvePath(version.sourcePath),
+        const previewAvailability = availability.status === "available" ? this.previewAvailability(version) :
+          { status: "unverified", paths: [], issues: ["工程与成片尚未核对通过，不能交付对应预览。"] };
+        return { ...version, availability, previewAvailability,
+          technicalCheck: version.technicalCheck ? { ...version.technicalCheck, previews: previewAvailability.paths } : undefined,
+          sourceLocation: this.resolvePath(version.sourcePath),
           videoLocation: availability.status === "available" ? this.resolvePath(version.mediaPath) : null };
       }),
     };
