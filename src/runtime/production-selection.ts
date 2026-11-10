@@ -1,7 +1,9 @@
 import type { WorkRecord, WorkVersion } from "../records/work-store.ts";
 import { WorkStore } from "../records/work-store.ts";
+import { DocumentStore } from "../records/document-store.ts";
+import type { DocumentRef } from "../records/authoring-contracts.ts";
 
-export type ProductionSelection = { feedbackIds?: string[]; newDirection?: boolean };
+export type ProductionSelection = { feedbackIds?: string[]; newDirection?: boolean; designRef?: DocumentRef; assetIds?: string[] };
 
 /** 累计应用记录含继承成果；本轮应用还须与通过回执及工程校验的模型声明对应。 */
 export function feedbackAppliedByVersion(version: WorkVersion): string[] {
@@ -40,12 +42,15 @@ export function selectProduction(store: WorkStore, record: WorkRecord, kind: "sa
   feedbackId?: string, threadMode: "fresh" | "resume" = "fresh", baseVersionId?: string, baseReason?: string,
   selection: ProductionSelection = {}) {
   if (["running", "unknown"].includes(record.execution.status)) throw new Error("已有执行尚未取得明确结果，不能重复发起。请查询原执行并核对恢复。");
+  if (record.authoring && !selection.designRef) throw new Error("新流程制作须明确提供 designRef，不能猜测采用哪份设计。");
+  if (!record.authoring && selection.designRef) throw new Error("旧任务尚未启用稿件流程，不能忽略或跨任务采用 designRef；请先提交本任务草稿。");
+  if (record.authoring) new DocumentStore(store).adopted(record, selection.designRef);
   if (feedbackId !== undefined && selection.feedbackIds !== undefined) throw new Error("feedbackId 与 feedbackIds 不能同时提供。请选择单条编号或明确编号数组。");
   const latest = record.versions.filter(v => v.sourceSnapshot || (v.production === "ready" && v.sourceSha256)).at(-1);
   // 首个工程可以作为自己的起点；其他缺值无法证明是沿用、改向还是另建备选。
   const unknownDirections = record.versions.some((v, index) => !v.directionId && (index > 0 || Boolean(v.basedOnVersionId)));
   let previous = baseVersionId ? store.version(record, baseVersionId) : latest;
-  if (!baseVersionId && record.directionApproval && !selection.newDirection) {
+  if (!baseVersionId && !record.authoring && record.directionApproval && !selection.newDirection) {
     const approved = store.version(record, record.directionApproval.sampleVersionId);
     if (record.versions.slice(record.versions.indexOf(approved) + 1).some(v => !v.directionId)) {
       throw new Error("历史版本缺少方向范围，不能自动确定基线。请查询 get_work 后明确提供 baseVersionId、baseReason 和 feedbackIds。");
@@ -61,7 +66,7 @@ export function selectProduction(store: WorkStore, record: WorkRecord, kind: "sa
   }
   if (baseVersionId && baseVersionId !== latest?.id && !baseReason?.trim()) throw new Error("选择历史基线须提供 baseReason，说明如何处理后续修改。");
   if (previous) store.verifySource(previous);
-  if (kind === "complete") {
+  if (kind === "complete" && !record.authoring) {
     if (!record.directionApproval) throw new Error("尚无用户对样例方向的明确确认，不能展开完整制作。请先取得并记录方向确认。");
     const approved = store.version(record, record.directionApproval.sampleVersionId);
     if (selection.newDirection || !continuesApprovedDirection(store, record, previous, approved)) {

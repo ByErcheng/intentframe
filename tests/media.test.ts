@@ -8,6 +8,19 @@ import { WorkStore } from "../src/records/work-store.ts";
 import { WorkService } from "../src/runtime/work-service.ts";
 import { fixtureRoot, readyVersion, videoSource } from "./helpers.ts";
 
+test("局部预览按实际帧范围渲染并保存可用帧图，不与完整渲染混用", { timeout: 90000 }, async () => {
+  const root = fixtureRoot();
+  try {
+    const entry = join(root.path, "source/entry.tsx"); mkdirSync(dirname(entry)); writeFileSync(entry, videoSource("green", 10));
+    const output = join(root.path, "media/preview.mp4");
+    const result = await renderVersion(entry, output, join(root.path, "cache"), { frameRange: [2, 5] });
+    assert(Math.abs(result.durationSeconds - 0.4) < 0.1); assert(result.previews.every(path => existsSync(path)));
+    await assert.rejects(renderVersion(entry, output, join(root.path, "cache")), /帧范围/);
+    const repeat = await renderVersion(entry, output, join(root.path, "cache"), { frameRange: [2, 5] });
+    assert.equal(repeat.videoSha256, result.videoSha256);
+  } finally { root.cleanup(); }
+});
+
 test("真实渲染核对帧率、拒绝陌生成片，并能恢复丢失的已认可文件", { timeout: 180_000 }, async () => {
   const root = fixtureRoot();
   try {

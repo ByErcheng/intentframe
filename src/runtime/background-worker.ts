@@ -80,11 +80,15 @@ async function run(id: string) {
   let status: ExecutionOutcome["status"];
   if (originalUnresolved || writersAlive || ["running", "unknown", "needs_verification"].includes(String(resultStatus))) status = "unknown";
   else if (failure) status = controller.signal.reason instanceof StopRequested ? "cancelled" : "failed";
-  else status = ["produce_version", "recover_work"].includes(request.name) && work.execution.status === "waiting_input" ? "waiting_input" : "succeeded";
+  else if (["produce_version", "revise_draft", "design_video", "recover_work"].includes(request.name) && work.execution.status === "failed") status = "failed";
+  else {
+    const awaitingThisTask = ["produce_version", "recover_work", "revise_draft", "design_video", "prepare_review_materials"].includes(request.name);
+    status = awaitingThisTask && work.execution.status === "waiting_input" ? "waiting_input" : "succeeded";
+  }
   const cause = failure instanceof Error ? failure.message : failure === undefined ? undefined : String(failure);
   const error = cause && controller.signal.reason instanceof Error ? controller.signal.reason.message + " " + cause : cause;
   executions.finish(request, { status, result,
-    error: error ?? (status === "unknown" ? "执行或写入尚未得到可靠终态，保留原占用并沿原调用恢复。" : undefined) });
+    error: error ?? (status === "failed" ? work.execution.error : status === "unknown" ? "执行或写入尚未得到可靠终态，保留原占用并沿原调用恢复。" : undefined) });
   await withExecutionDispatch(dataRoot, request.workId, () => {
     if (status !== "unknown" && activeExecution(dataRoot, request.workId)?.operationId === id) executions.clearActive(request, dataRoot);
   });

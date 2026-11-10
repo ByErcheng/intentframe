@@ -21,11 +21,24 @@ import { productionHistory, productionHistoryTool } from "./production-history.t
 import { productionReceiptPath, readProductionReceipt, saveProductionReceipt } from "./production-receipt.ts";
 import type { ProductionReceipt } from "./production-receipt.ts";
 import { parseProductionResult, productionOutputSchema } from "./production-result.ts";
+import { AuthoringService } from "./authoring-service.ts";
+import { DocumentStore } from "../records/document-store.ts";
+import { ReviewService } from "./review-service.ts";
+import { AssetService } from "./asset-service.ts";
+import type { ReviewRange } from "../media/review-materials.ts";
+import { MAX_INTERNAL_REPAIRS, internalReviewPassed } from "../records/media-contracts.ts";
+import type { AssetOptions } from "./asset-service.ts";
+import { ProductionMediaTools, mediaToolDefinitions } from "./production-media.ts";
+import { readAudioPlan } from "./audio-plan.ts";
+import type { LibraryRoot } from "../records/asset-catalog.ts";
+import { ProviderRequestError, speechSegments } from "../media/providers.ts";
 import {
   CodexAppServerClient, codexTurnSchema, describeError, executionFailureStatus, UnknownExecutionOutcome,
 } from "./codex-client.ts";
 
-type ServiceOptions = { render?: typeof renderVersion; restorePreviews?: typeof restoreVideoPreviews; codexExecutable?: string; timeoutMs?: number; knowledge?: KnowledgeStore;
+type ServiceOptions = AssetOptions & { render?: typeof renderVersion; restorePreviews?: typeof restoreVideoPreviews; codexExecutable?: string; timeoutMs?: number; knowledge?: KnowledgeStore;
+  assetLibraries?: LibraryRoot[];
+  prepareReview?: (record: WorkRecord, version: WorkVersion) => Promise<unknown>;
   signal?: AbortSignal; onProgress?: (phase: string) => void; onRunner?: (pid: number) => void; productionSnapshot?: WorkRecord };
 
 export class WorkService {
@@ -33,19 +46,27 @@ export class WorkService {
   readonly knowledge: KnowledgeStore;
   readonly learning: LearningService;
   readonly comparisons: ComparisonStore;
+  readonly authoring: AuthoringService;
+  readonly documents: DocumentStore;
+  readonly reviewMaterials: ReviewService;
+  readonly assets: AssetService;
   private options: ServiceOptions;
   constructor(store = new WorkStore(), options: ServiceOptions = {}) {
     this.store = store; this.options = options;
     this.knowledge = options.knowledge ?? new KnowledgeStore(store.assetRoot);
     this.learning = new LearningService(store, this.knowledge);
     this.comparisons = new ComparisonStore(store, this.knowledge);
+    this.authoring = new AuthoringService(store, options);
+    this.documents = this.authoring.documents;
+    this.reviewMaterials = new ReviewService(store, options);
+    this.assets = new AssetService(store, options);
   }
 
   assertCanProduce(record: WorkRecord, kind: "sample" | "complete"): void {
     if (["running", "unknown"].includes(record.execution.status)) {
       throw new Error("已有执行尚未取得明确结果，不能重复发起。");
     }
-    if (kind === "complete" && !record.directionApproval) {
+    if (kind === "complete" && !record.authoring && !record.directionApproval) {
       throw new Error("尚无用户对样例方向的明确确认，不能展开完整制作。");
     }
   }
@@ -66,7 +87,21 @@ export class WorkService {
         if (this.options.productionSnapshot.id !== id) throw new Error("受理时的制作输入不属于当前作品。");
         record.feedback = this.options.productionSnapshot.feedback;
         record.directionApproval = this.options.productionSnapshot.directionApproval;
+        record.authoring = this.options.productionSnapshot.authoring;
       }
+      await this.produceLocked(record, kind, feedbackId, threadMode, baseVersionId, baseReason, operationId, selection);
+      await this.finishInternalReview(record, record.versions.at(-1)!);
+      return record;
+    });
+  }
+
+  /** 同一制作请求及其自动修复始终持有作品写锁；每次修复仍保存独立版本和原生回执。 */
+  private async produceLocked(
+    record: WorkRecord, kind: "sample" | "complete", feedbackId?: string,
+    threadMode: "fresh" | "resume" = "fresh", baseVersionId?: string, baseReason?: string,
+    operationId?: string, selection: ProductionSelection = {}, internalRepair?: WorkVersion["internalRepair"],
+  ): Promise<void> {
+      const id = record.id;
       this.assertCanProduce(record, kind);
       const comparison = this.comparisons.context(record);
       if (comparison && (comparison.state !== "open" || record.versions.length || record.feedback.length)) throw new Error("比较使用固定输入的首次制作；已有结果请先评价或新建比较。");
@@ -76,6 +111,9 @@ export class WorkService {
       }
       const chosen = selectProduction(this.store, record, kind, feedbackId, threadMode, baseVersionId, baseReason, selection);
       const { previous, inherited, requested } = chosen;
+      const design = this.documents.adopted(record, selection.designRef);
+      const assetIds = [...new Set([...(design?.document.assetIds ?? []), ...(previous?.assets?.map(asset => asset.id) ?? []), ...(selection.assetIds ?? [])])];
+      const selectedAssets = this.assets.assets.select(record, assetIds);
       baseReason = chosen.baseReason;
       // 会失败的只读准备先完成，不为缺失需求留下占位目录。
       const brief = readFileSync(this.store.resolvePath(record.briefPath), "utf8");
@@ -93,6 +131,12 @@ export class WorkService {
         directionId: chosen.newDirection || !previous ? versionId : previous.directionId ?? previous.id,
         newDirection: chosen.newDirection,
         operationId, sendState: "not_sent", systemFingerprint: systemFingerprint(),
+        designRef: design ? { id: design.document.id, sha256: design.document.sha256 } : undefined,
+        designDecisionId: design?.decision.operationId,
+        assets: selectedAssets,
+        mediaToolsVersion: design ? 1 : undefined,
+        audioPlan: previous?.audioPlan ? { ...previous.audioPlan } : undefined,
+        internalRepair: design ? internalRepair ?? { rootVersionId: versionId, attempt: 0 } : undefined,
       };
       const sourceDirectory = dirname(this.store.resolvePath(version.sourcePath));
       const relevantFeedback = record.feedback.filter(f => inherited.includes(f.id) || requested.includes(f.id));
@@ -110,6 +154,12 @@ export class WorkService {
       const rules = productionRules(kind, relevantFeedback.some(f => f.location), relevantFeedback.length > 0);
       const turnInput = fillPrompt(startPrompt.text, { runId });
       const context = fillPrompt(template.text, {
+        assets: JSON.stringify(selectedAssets.map(asset => ({ ...this.assets.assets.view(record, asset.id),
+          source: "assets/" + asset.id + asset.path.slice(asset.path.lastIndexOf(".")),
+          metadataSource: "assets/" + asset.id + "-metadata.json" })), null, 2),
+        design: design ? [JSON.stringify({ designRef: version.designRef, adoptedBy: design.decision.source,
+          adoptionNotes: design.decision.notes, draftRef: { id: design.draft.id, sha256: design.draft.sha256 } }, null, 2),
+          "#### 采用的脚本正文", design.markdown, "#### 用户交接的草稿原文", design.draft.markdown].join("\n\n") : "旧任务没有独立脚本记录，按原有有效需求接续；不补造历史脚本。",
         brief: previous ? brief : "首次制作的原始需求已在上方完整提供；本轮尚无历史工程。",
         task: JSON.stringify({ purpose: record.purpose ?? "unspecified", versionId, kind, newDirection: chosen.newDirection }),
         baseline: previous ? JSON.stringify({ baseVersionId: previous.id, baseReason,
@@ -122,7 +172,7 @@ export class WorkService {
         feedback: selectedFeedback.length ? inlineFeedback ? feedbackText : "本轮反馈较多，使用 intentframe_read_feedback 按本轮编号读取完整原文；未读取前不能声称处理完成。" : previous ? "本轮没有选定反馈；按本轮制作阶段和所选基线接续，保留有效成果，不执行其他未选意见。" : brief,
         inherited: JSON.stringify(history.snapshot.inheritedFeedback.map(item => ({ id: item.id, versionId: item.versionId,
           supersededByFeedbackIds: item.supersededByFeedbackIds })), null, 2),
-        feedbackIds: JSON.stringify(requested), direction: record.directionApproval ? JSON.stringify(record.directionApproval, null, 2) : "尚未确认方向，仅制作样例。",
+        feedbackIds: JSON.stringify(requested), direction: design ? "按上方已采用脚本及本轮制作范围执行；AI 采用不等于用户认可成片。" : record.directionApproval ? JSON.stringify(record.directionApproval, null, 2) : "尚未确认方向，仅制作样例。",
         conditionalRules: rules.filter(r => r.section !== "经验使用").map(r => r.text).join("\n"),
         experience: rules.find(r => r.section === "经验使用")!.text + (comparison ? "\n本轮为固定输入比较，仅使用已开放的知识范围。" : ""),
         sourceIds: JSON.stringify(sourceIds), sources: pendingSources.items.length ? JSON.stringify(pendingSources.items.map(source =>
@@ -130,6 +180,7 @@ export class WorkService {
       });
 
       let codex: CodexAppServerClient | undefined;
+      let mediaTools: ProductionMediaTools | undefined;
       let phase: "preparing" | "awaiting_result" | "checking_result" | "rendering" = "preparing";
       record.versions.push(version);
       record.execution = { status: "running", runId, versionId };
@@ -141,6 +192,7 @@ export class WorkService {
         mkdirSync(sourceDirectory, { recursive: true });
         if (previous) cpSync(dirname(this.store.resolvePath(previous.sourcePath)), sourceDirectory, { recursive: true });
         else this.comparisons.prepare(record, sourceDirectory);
+        this.assets.assets.copyToSource(record, assetIds, sourceDirectory);
         writeFileSync(join(sourceDirectory, "context.md"), context);
         version.contextSha256 = fileHash(join(sourceDirectory, "context.md"));
         version.inputManifestPath = "works/" + id + "/runs/" + runId + "/input.json";
@@ -151,6 +203,9 @@ export class WorkService {
         this.store.appendEvent(id, runId, { kind: "production_started", versionId, basedOnVersionId: previous?.id, feedbackIds: requested });
         version.executionConditions = executionConditions(this.options.codexExecutable, this.options.timeoutMs);
         this.store.save(record);
+        mediaTools = new ProductionMediaTools(this.store, record, runId, this.assets, version,
+          { libraries: this.options.assetLibraries, render: this.options.render, signal: this.options.signal });
+        const currentMediaTools = mediaTools;
         codex = new CodexAppServerClient({
           cwd: sourceDirectory, executable: this.options.codexExecutable,
           onEvent: event => this.store.appendEvent(id, runId, event),
@@ -159,6 +214,7 @@ export class WorkService {
           onToolCall: (name, input, identity) => {
             if (identity.threadId !== version.threadId || (version.turnId && identity.turnId !== version.turnId)) throw new Error("工具调用不属于本轮制作。");
             if (name === productionHistoryTool.name) return history.read(input);
+            if (currentMediaTools.has(name)) return currentMediaTools.call(name, input);
             return tools.call(name, input);
           },
         });
@@ -170,7 +226,8 @@ export class WorkService {
           .parse(await codex.sendRequest(threadMode === "resume" ? "thread/resume" : "thread/start", {
             ...(threadMode === "resume" ? { threadId: previous?.threadId, excludeTurns: true } : {}),
             cwd: sourceDirectory, sandbox: "workspace-write", approvalPolicy: "never",
-            dynamicTools: [...knowledgeToolDefinitions, productionHistoryTool],
+            dynamicTools: [...knowledgeToolDefinitions, productionHistoryTool, ...mediaToolDefinitions(!design)],
+            config: { web_search: "live" },
             developerInstructions: developer.text,
           }));
         version.threadId = response.thread.id;
@@ -189,6 +246,7 @@ export class WorkService {
         this.store.save(record);
         const completed = await codex.waitForTurnCompletion(started.turn.id, version.threadId);
         if (completed.status === "inProgress") throw new UnknownExecutionOutcome("原执行尚未结束。");
+        await mediaTools.drain();
         phase = "checking_result";
         let reply = "";
         try { reply = codex.finalReply(started.turn.id); } catch { /* 终态仍保存；空结果在制作判定中明确失败。 */ }
@@ -197,6 +255,7 @@ export class WorkService {
           ...(completed.error ? { error: completed.error.message } : {}),
           knowledgeReads: [...tools.reads.values()], feedbackReads: [...tools.feedbackReads], learningSourceIds: sourceIds,
         });
+        await mediaTools.settled();
         if (this.applyProductionReceipt(record, version, receipt)) {
           checkExecution(this.options.signal);
           phase = "rendering";
@@ -204,7 +263,7 @@ export class WorkService {
         }
         this.saveLearningResult(record, version, receipt);
       } catch (error) {
-        const status = executionFailureStatus(error, phase);
+        const status = record.execution.status === "unknown" || (error instanceof ProviderRequestError && error.uncertain) ? "unknown" : executionFailureStatus(error, phase);
         if (version.production !== "ready") version.production = status;
         version.error = (codex?.stopReason ? codex.stopReason + " " : "") + describeError(error);
         record.execution = { status, runId, versionId, error: version.error };
@@ -212,12 +271,63 @@ export class WorkService {
         try { this.store.appendEvent(id, runId, { kind: "execution_error", phase, status: record.execution.status, message: version.error }); }
         catch (logError) { throw new Error(version.error + "；错误记录另有失败：" + describeError(logError)); }
         throw new Error(version.error, { cause: error });
-      } finally { await codex?.close(); }
-      return record;
+      } finally { await mediaTools?.drain(); await codex?.close(); }
+  }
+
+  private async finishInternalReview(record: WorkRecord, startingVersion: WorkVersion, operationId?: string): Promise<void> {
+    let version = startingVersion;
+    operationId ??= startingVersion.reviewPreparation?.operationId ?? startingVersion.operationId;
+    if (!version.designRef || version.production !== "ready") return;
+    for (;;) {
+      checkExecution(this.options.signal);
+      if (internalReviewPassed(version.reviewPreparation)) {
+        version.error = undefined; record.execution = { status: "idle" }; this.store.save(record); return;
+      }
+      const inspection = version.reviewPreparation?.inspections.at(-1), quality = inspection?.result?.quality;
+      const cycle = version.internalRepair ?? { rootVersionId: version.id, attempt: 0 };
+      if (version.reviewPreparation?.status !== "available" || inspection?.status !== "completed" ||
+          quality?.status !== "needs_repair" || cycle.attempt >= MAX_INTERNAL_REPAIRS) {
+        const reason = quality?.status === "needs_confirmation" ? "内检发现问题需要调整设计或澄清意图，须返回确认。" :
+          cycle.attempt >= MAX_INTERNAL_REPAIRS ? "已达到本次自动修复上限，复查仍有问题，未作为合格结果交付。" :
+          "项目内检或材料覆盖尚未通过，未交付给外部 AI 验收。";
+        version.error = [reason, ...(quality?.issues.map(item => item.description) ?? []), version.reviewPreparation?.error].filter(Boolean).join("\n");
+        record.execution = { status: "waiting_input", runId: version.runId, versionId: version.id, error: version.error };
+        this.store.save(record); return;
+      }
+      const text = ["项目内检发现以下实现问题。保持已采用的设计与原有有效修改，仅修复这些缺陷；不能擅自改变设计。",
+        ...quality.issues.map((item, index) => `${index + 1}. ${item.description}\n修正要求：${item.correction}`),
+        "修复后由项目重新渲染并回看，源码修改本身不能证明问题已经消失。"].join("\n\n");
+      const feedbackId = await this.store.internalFeedback(record, version.id, text, inspection.id);
+      this.options.onProgress?.(`项目正在内部修复并复查（${cycle.attempt + 1}/${MAX_INTERNAL_REPAIRS}）`);
+      record.execution = { status: "idle" }; this.store.save(record);
+      await this.produceLocked(record, version.kind, undefined, "fresh", version.id, "按项目内检修复实现缺陷，保持采用设计。",
+        operationId ?? version.operationId, { designRef: version.designRef, assetIds: version.assets?.map(asset => asset.id), feedbackIds: [feedbackId] },
+        { rootVersionId: cycle.rootVersionId, attempt: cycle.attempt + 1, inspectionId: inspection.id });
+      version = record.versions.at(-1)!;
+      if (version.production !== "ready") return;
+    }
+  }
+
+  async prepareMaterials(id: string, versionId: string, ranges: ReviewRange[], operationId?: string) {
+    return this.store.withLock(id, async () => {
+      const record = this.store.read(id), version = this.store.version(record, versionId);
+      this.assertCanProduce(record, "sample");
+      version.reviewPreparation ??= { status: "preparing", batches: [], inspections: [] };
+      version.reviewPreparation.operationId = operationId;
+      record.execution = { status: "running", runId: version.runId, versionId };
+      this.store.save(record);
+      await this.reviewMaterials.prepare(record, version, ranges, true);
+      const count = record.versions.length;
+      await this.finishInternalReview(record, version, operationId);
+      if (!version.designRef) { record.execution = { status: "idle" }; this.store.save(record); }
+      const final = record.versions.length > count ? record.versions.at(-1)! : version;
+      return { ...this.reviewMaterials.view(record, final), requestedVersionId: versionId, versionId: final.id,
+        delivery: this.store.delivery({ ...record, versions: [final] }) };
     });
   }
 
   private applyProductionReceipt(record: WorkRecord, version: WorkVersion, receipt: ProductionReceipt): boolean {
+    this.assets.assertSettled(record, version);
     version.turnId = receipt.turnId;
     version.nativeResult = { threadId: receipt.threadId, turnId: receipt.turnId, status: receipt.status, reply: receipt.reply,
       ...(receipt.error ? { error: receipt.error } : {}) };
@@ -242,6 +352,9 @@ export class WorkService {
       this.store.save(record); return false;
     }
     if (result.status === "failed") throw new Error(result.summary + "\n" + result.blockers.join("\n"));
+    const audio = version.audioPlan ? readAudioPlan(this.store, version) : undefined;
+    if (version.mediaToolsVersion === 1 && version.designRef && speechSegments(this.documents.read(record, version.designRef).markdown).length &&
+      !audio?.clips.some(clip => clip.words?.length && clip.volume > 0)) throw new Error("采用脚本包含人声，但缺少已编排的真实配音与字词时间，不能交付为完成。");
     // 已交付版本的完成事实不随媒体缺失或只补存而降级；可用性另行核对。
     if (version.production !== "ready") version.production = "source_ready";
     version.error = undefined;
@@ -274,8 +387,8 @@ export class WorkService {
       if (record.learningRun && !record.learningRun.completed) throw new Error("原经验整理尚未核清，请先恢复原调用。");
       const pending = this.learning.pending(record);
       if (!pending.items.length) return record;
-      const version = record.versions.at(-1);
-      if (!version) throw new Error("暂无可关联的制作版本。");
+      const version = record.versions.at(-1) ?? record.authoring?.designs.at(-1) ?? record.authoring?.drafts.at(-1);
+      if (!version) throw new Error("暂无可关联的稿件或制作版本。");
       const runId = "learning-" + randomUUID(), directory = this.store.resolvePath("works/" + id + "/learning/" + runId);
       mkdirSync(directory, { recursive: true });
       const learningPrompt = readPrompt("learning", "执行约束"), startPrompt = readPrompt("learning", "启动消息");
@@ -287,7 +400,7 @@ export class WorkService {
       record.learningRun = { id: runId, versionId: version.id, sourceIds: pending.items.map(source => source.id),
         contextSha256: fileHash(join(directory, "context.json")), sendState: "not_sent",
         previousExecution: { ...record.execution }, completed: false, createdAt: new Date().toISOString() };
-      record.execution = { status: "running", runId, versionId: version.id };
+      record.execution = { status: "running", runId, versionId: version.id.startsWith("v") ? version.id : undefined };
       this.store.save(record);
       const run = record.learningRun, tools = this.learning.tools(record, runId);
       let client: CodexAppServerClient | undefined;
@@ -330,7 +443,7 @@ export class WorkService {
         record.learningError = (client?.stopReason ? client.stopReason + " " : "") + describeError(error);
         const phase = run.sendState === "not_sent" ? "preparing" : ended ? "checking_result" : "awaiting_result";
         if (executionFailureStatus(error, phase) === "failed") { run.completed = true; record.execution = run.previousExecution; }
-        else record.execution = { status: "unknown", runId, versionId: version.id, error: record.learningError };
+        else record.execution = { status: "unknown", runId, versionId: version.id.startsWith("v") ? version.id : undefined, error: record.learningError };
         this.store.save(record); throw new Error(record.learningError, { cause: error });
       } finally { await client?.close(); }
     });
@@ -342,14 +455,17 @@ export class WorkService {
     const path = this.store.resolvePath("works/" + record.id + "/learning/" + run.id + "/context.json");
     if (fileHash(path) !== run.contextSha256) throw new Error("原经验整理输入已经变化。");
     const result = learningResultSchema.parse(JSON.parse(reply));
-    this.learning.accept(record, this.store.version(record, run.versionId), run.id, result, run.sourceIds);
+    this.learning.accept(record, this.learning.target(record, run.versionId), run.id, result, run.sourceIds);
     run.completed = true; record.execution = run.previousExecution; record.learningError = undefined;
     this.store.save(record);
   }
 
-  /** 恢复只沿原身份查询与补存；原进程仍存活或依据不足时保留现场。 */
+  /** 沿原身份核对并接续已知剩余工作；未知调用不重发，原进程存活时保留现场。 */
   async recover(id: string, render = true) {
     checkExecution(this.options.signal);
+    const before = this.store.read(id);
+    if (before.execution.runId?.startsWith("asset-")) return this.assets.recover(id);
+    if (before.authoring?.runs.some(run => run.id === before.execution.runId)) return this.authoring.recover(id);
     this.options.onProgress?.("核对原调用、进程与本机回执");
     return this.store.withRecoveryGuard(id, async () => {
       const record = this.store.read(id), owner = this.store.lockOwner(id);
@@ -381,18 +497,23 @@ export class WorkService {
       return this.store.withLock(id, async () => {
         if (learningRun) return this.recoverLearning(record, observed);
         if (!version) return { status: "unchanged", work: this.store.summary(record) };
+        const operationId = version.reviewPreparation?.operationId ?? version.operationId;
         if (version.production === "ready" && this.store.availability(version).status === "available") {
           if (render && this.store.previewAvailability(version).status !== "available") await this.repairPreviews(record, version);
+          if (render && (version.designRef || version.reviewPreparation)) await this.reviewMaterials.prepare(record, version);
           if (existsSync(productionReceiptPath(this.store, id, version.runId))) this.saveLearningResult(record, version, readProductionReceipt(this.store, record, version));
           if (record.learningPending) this.learning.finishPending(record);
+          if (render && version.designRef) await this.finishInternalReview(record, version);
           // 只收尾已核实版本对应的执行；未完成的经验保存与历史错误证据仍保留。
-          if (!record.learningPending && !record.learningError &&
+          const materialsSettled = !version.reviewPreparation || ["available", "needs_attention"].includes(version.reviewPreparation.status);
+          if (!version.designRef && materialsSettled && !record.learningPending && !record.learningError &&
               record.execution.runId === version.runId && record.execution.versionId === version.id) {
             version.error = undefined;
             record.execution = { status: "idle" };
             this.store.save(record);
           }
-          return { status: "recovered", work: this.store.summary(record) };
+          return { status: ["running", "unknown"].includes(record.execution.status) ? record.execution.status : "recovered",
+            operationId, work: this.store.summary(record) };
         }
         if (version.sendState === "not_sent") {
           version.production = "failed"; version.error = "原制作尚未发送；准备现场已保留，可用新的操作继续。";
@@ -415,6 +536,7 @@ export class WorkService {
           return { status: "needs_verification", work: this.store.summary(record) };
         }
         const historicalReady = version.production === "ready";
+        await this.assets.recoverProduction(record, version);
         // 身份或工程依据尚未核实时，保留原状态和重发保护，不按明确制作失败收尾。
         const receipt = readProductionReceipt(this.store, record, version);
         try {
@@ -423,11 +545,13 @@ export class WorkService {
             else { record.execution = { status: "idle" }; this.store.save(record); }
           }
           this.saveLearningResult(record, version, receipt);
-          return { status: "recovered", work: this.store.summary(record) };
+          if (render) await this.finishInternalReview(record, version);
+          return { status: "recovered", operationId, work: this.store.summary(record) };
         } catch (error) {
+          if (record.versions.at(-1)?.id !== version.id) throw error;
           version.error = describeError(error);
           version.production = historicalReady ? "ready" : "failed";
-          record.execution = { status: "failed", runId: version.runId, versionId: version.id, error: version.error };
+          if (record.execution.status !== "unknown") record.execution = { status: "failed", runId: version.runId, versionId: version.id, error: version.error };
           this.store.save(record); throw error;
         }
       }, true);
@@ -482,7 +606,7 @@ export class WorkService {
     return receipt;
   }
 
-  private async render(record: WorkRecord, version: WorkVersion): Promise<void> {
+  private async render(record: WorkRecord, version: WorkVersion, prepareReview = true): Promise<void> {
     checkExecution(this.options.signal);
     this.options.onProgress?.("正在渲染并核对成片");
     // 修复已交付文件的可用性时，保留历史完成与用户认可。
@@ -493,13 +617,18 @@ export class WorkService {
       join(repositoryRoot, ".cache", "render", record.id, version.id),
       { sourceSnapshot: version.sourceSnapshot, expectedVideoSha256: version.videoSha256, signal: this.options.signal },
     );
+    const audio = readAudioPlan(this.store, version);
+    if (audio?.clips.some(clip => clip.endMs > result.durationSeconds * 1000 + 100)) throw new Error("声音播放安排超出实际成片，须调整工程。");
+    if (audio?.clips.some(clip => clip.volume > 0) && result.audioStreams === 0) throw new Error("工程登记了声音但成片没有音轨，须使用 ProjectAudio 并重新制作。");
     version.technicalCheck = result;
     version.sourceSha256 = result.sourceSha256;
     version.videoSha256 = result.videoSha256;
     version.production = "ready";
     version.error = undefined;
-    record.execution = { status: "idle" };
+    record.execution = version.designRef && prepareReview ? { status: "running", runId: version.runId, versionId: version.id } : { status: "idle" };
     this.store.appendEvent(record.id, version.runId, { kind: "video_ready", versionId: version.id, ...result });
+    this.store.save(record);
+    if (version.designRef && prepareReview) await (this.options.prepareReview ?? this.reviewMaterials.prepare.bind(this.reviewMaterials))(record, version);
     this.store.save(record);
   }
 
@@ -543,11 +672,11 @@ export class WorkService {
       }
       const historicalReady = version.production === "ready";
       record.execution = { status: "running", runId: version.runId, versionId };
-      try { await this.render(record, version); }
+      try { await this.render(record, version, false); }
       catch (error) {
         version.production = historicalReady ? "ready" : "failed";
         version.error = describeError(error);
-        record.execution = { status: "failed", runId: version.runId, versionId, error: version.error };
+        if (record.execution.status !== "unknown") record.execution = { status: "failed", runId: version.runId, versionId, error: version.error };
         this.store.save(record);
         try { this.store.appendEvent(id, version.runId, { kind: "render_error", versionId, message: version.error }); }
         catch (logError) { throw new Error(version.error + "；错误记录另有失败：" + describeError(logError)); }

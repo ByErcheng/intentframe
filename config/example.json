@@ -39,6 +39,8 @@
   "backup": {
     "commandTimeoutMs": 180000
   },
+  "providers": {},
+  "assetLibraries": [],
   "diagnostics": {
     "toolTimeoutMs": 10000
   }

@@ -5,6 +5,7 @@ import { purposeSchema } from "./contracts.ts";
 import type { WorkPurpose } from "./contracts.ts";
 
 export const operationIdSchema = z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,79}$/);
+export const recoverableOperations: readonly string[] = ["produce_version", "prepare_review_materials", "revise_draft", "design_video", "generate_image", "synthesize_speech"];
 const operationSchema = z.object({
   schemaVersion: z.literal(1), id: operationIdSchema, name: z.string(), inputHash: z.string().regex(/^[a-f0-9]{64}$/),
   state: z.enum(["unresolved", "accepted", "succeeded", "failed"]), createdAt: z.string(),
@@ -36,7 +37,7 @@ export class OperationStore {
 
   completeRecovery(id: string, workId: string, result: unknown): void {
     const original = this.read(id);
-    if (original.name !== "produce_version" || original.workId !== workId) throw new Error("恢复结果不能写入其他操作的回执。");
+    if (!recoverableOperations.includes(original.name) || original.workId !== workId) throw new Error("恢复结果不能写入其他操作的回执。");
     if (original.state === "succeeded" || original.state === "accepted") return;
     atomicJson(ownedPath(this.root, "operations/" + original.id + "/request.json"), {
       ...original, state: "succeeded", result, recoveredAt: new Date().toISOString(),

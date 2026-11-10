@@ -11,6 +11,15 @@ const toolSchema = z.strictObject({
   path: pathSchema, version: z.string().trim().min(1), source: z.url(),
   archiveSha256: z.string().regex(/^[a-f0-9]{64}$/).optional(),
 });
+export const providersSchema = z.strictObject({
+  image: z.strictObject({ apiKey: z.string().trim().min(1), model: z.string().trim().min(1),
+    timeoutMs: timeoutSchema.default(300_000) }).optional(),
+  speech: z.strictObject({ apiKey: z.string().trim().min(1), speaker: z.string().trim().min(1),
+    resourceId: z.string().trim().min(1), model: z.string().trim().min(1).optional(),
+    timeoutMs: timeoutSchema.default(120_000) }).optional(),
+});
+export const assetLibrarySchema = z.strictObject({ id: z.string().regex(/^[a-z0-9-]{1,40}$/), path: pathSchema,
+  role: z.enum(["reference", "image", "narration", "music"]) });
 const settingsSchema = z.strictObject({
   dataRoot: pathSchema,
   backupRoot: pathSchema,
@@ -22,6 +31,8 @@ const settingsSchema = z.strictObject({
     decodeTimeoutMs: timeoutSchema, previewTimeoutMs: timeoutSchema }),
   backup: z.strictObject({ commandTimeoutMs: timeoutSchema }),
   diagnostics: z.strictObject({ toolTimeoutMs: timeoutSchema }),
+  providers: providersSchema.optional(),
+  assetLibraries: z.array(assetLibrarySchema).max(20).default([]).refine(items => new Set(items.map(item => item.id)).size === items.length, "素材库编号须唯一"),
 });
 
 class ConfigurationError extends Error {}
@@ -88,6 +99,8 @@ export function loadConfiguration(root = repositoryRoot, environment: NodeJS.Pro
     restic: location("INTENTFRAME_RESTIC_BIN", settings.tools.restic.path),
     tools: settings.tools, runtime: settings.runtime, mcp: settings.mcp,
     media: settings.media, backup: settings.backup, diagnostics: settings.diagnostics,
+    providers: settings.providers ?? {},
+    assetLibraries: settings.assetLibraries.map(item => ({ ...item, path: resolve(root, item.path) })),
   };
 }
 

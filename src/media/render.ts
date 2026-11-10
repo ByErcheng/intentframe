@@ -29,11 +29,11 @@ function inside(root: string, path: string) {
   return !isAbsolute(child) && child !== ".." && !child.startsWith(".." + sep);
 }
 
-const receiptSchema = z.object({ sourceFingerprint: z.string(), videoSha256: z.string() });
-export type RenderOptions = { sourceSnapshot?: SourceSnapshot; expectedVideoSha256?: string; signal?: AbortSignal };
+const receiptSchema = z.object({ sourceFingerprint: z.string(), videoSha256: z.string(), frameRange: z.tuple([z.number(), z.number()]).optional() });
+export type RenderOptions = { sourceSnapshot?: SourceSnapshot; expectedVideoSha256?: string; signal?: AbortSignal; frameRange?: [number, number] };
 
 /** 停止后等实际子进程关闭，避免释放任务占用时媒体工具仍在写文件。 */
-function mediaCommand(executable: string, args: string[], timeoutMs: number, signal?: AbortSignal): Promise<string> {
+export function mediaCommand(executable: string, args: string[], timeoutMs: number, signal?: AbortSignal): Promise<string> {
   checkExecution(signal);
   return new Promise((resolve, reject) => {
     const child = spawn(executable, args, { env: mediaEnvironment(), stdio: ["ignore", "pipe", "pipe"] });
@@ -124,6 +124,7 @@ async function renderAndVerify(entryPoint: string, output: string, cacheDirector
     if (!expected && existsSync(receiptPath)) {
       const receipt = receiptSchema.parse(JSON.parse(readFileSync(receiptPath, "utf8")));
       if (receipt.sourceFingerprint !== fingerprint) throw new Error("已有成片的工程来源与本次不一致。");
+      if (JSON.stringify(receipt.frameRange) !== JSON.stringify(options.frameRange)) throw new Error("已有渲染的帧范围与本次不一致。");
       expected = receipt.videoSha256;
     }
     if (!expected) throw new Error("已有成片缺少可核对的来源记录，不能直接复用或覆盖。");
@@ -159,6 +160,8 @@ async function renderAndVerify(entryPoint: string, output: string, cacheDirector
   });
   checkExecution(options.signal);
   const composition = await selectComposition({ serveUrl, id: "Video" });
+  if (options.frameRange && (!options.frameRange.every(Number.isSafeInteger) || options.frameRange[0] < 0 ||
+    options.frameRange[1] < options.frameRange[0] || options.frameRange[1] >= composition.durationInFrames)) throw new Error("预览帧范围超出工程。");
   checkExecution(options.signal);
   const temporary = output + ".partial.mp4", candidate = outputExists ? output : temporary;
   if (!outputExists) {
@@ -167,7 +170,7 @@ async function renderAndVerify(entryPoint: string, output: string, cacheDirector
     try {
       checkExecution(options.signal);
       await renderMedia({ serveUrl, composition, codec: "h264", outputLocation: temporary,
-        pixelFormat: "yuv420p", concurrency: configuration.media.concurrency, overwrite: true, cancelSignal });
+        pixelFormat: "yuv420p", concurrency: configuration.media.concurrency, overwrite: true, cancelSignal, frameRange: options.frameRange });
     } finally { options.signal?.removeEventListener("abort", cancel); }
   }
   checkExecution(options.signal);
@@ -181,7 +184,8 @@ async function renderAndVerify(entryPoint: string, output: string, cacheDirector
   const video = metadata.streams.find(stream => stream.codec_type === "video");
   const [numerator, denominator] = (video?.avg_frame_rate ?? "").split("/").map(Number);
   const fps = numerator !== undefined && denominator !== undefined ? numerator / denominator : NaN;
-  const duration = Number(metadata.format.duration), expectedDuration = composition.durationInFrames / composition.fps;
+  const duration = Number(metadata.format.duration), expectedFrames = options.frameRange ? options.frameRange[1] - options.frameRange[0] + 1 : composition.durationInFrames;
+  const expectedDuration = expectedFrames / composition.fps;
   if (!video || video.width !== composition.width || video.height !== composition.height ||
       !Number.isFinite(fps) || Math.abs(fps - composition.fps) > 0.001 ||
       !Number.isFinite(duration) || Math.abs(duration - expectedDuration) > 0.15) {
@@ -198,12 +202,12 @@ async function renderAndVerify(entryPoint: string, output: string, cacheDirector
   if (!outputExists) {
     // 先留可核对的收据，再以不覆盖已有文件的方式发布；记录补存失败后可安全接续。
     const receiptTemporary = receiptPath + "." + randomUUID() + ".tmp";
-    writeFileSync(receiptTemporary, JSON.stringify({ sourceFingerprint: fingerprint, videoSha256 }) + "\n", { flag: "wx" });
+    writeFileSync(receiptTemporary, JSON.stringify({ sourceFingerprint: fingerprint, videoSha256, frameRange: options.frameRange }) + "\n", { flag: "wx" });
     renameSync(receiptTemporary, receiptPath);
     linkSync(temporary, output);
     unlinkSync(temporary);
   }
-  const previews = await extractPreviews(output, composition.fps, composition.durationInFrames, options.signal);
+  const previews = await extractPreviews(output, composition.fps, expectedFrames, options.signal);
   if (fileHash(output) !== videoSha256) throw new Error("检查期间成片发生变化，结果未获确认。");
   verifySourceSnapshot(entryPoint, snapshot);
   return { width: video.width, height: video.height, fps, durationSeconds: duration,

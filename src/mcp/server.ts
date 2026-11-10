@@ -1,4 +1,6 @@
 import { randomUUID } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { McpServer } from "@modelcontextprotocol/server";
 import { serveStdio } from "@modelcontextprotocol/server/stdio";
 import { z } from "zod";
@@ -11,11 +13,18 @@ import { experienceRefSchema, feedbackLocationSchema, purposeSchema, workInputSc
 import { valueHash } from "../records/files.ts";
 import { experienceInputSchema } from "../records/knowledge-store.ts";
 import { comparisonInputSchema } from "../records/comparison-store.ts";
-import { ExecutionStore, activeExecution, backgroundToolSchema } from "../records/execution-store.ts";
+import { ExecutionStore, activeExecution, assertExecutionAccess, backgroundToolSchema } from "../records/execution-store.ts";
 import { BackgroundService } from "../runtime/background-service.ts";
 import { readUsageGuide, serverInstructions } from "../runtime/usage-guide.ts";
 import { rejectPreflight, validateInput } from "./request-errors.ts";
 import { feedbackAppliedByVersion, selectProduction } from "../runtime/production-selection.ts";
+import { documentRefSchema, markdownSchema } from "../records/authoring-contracts.ts";
+import { assetIdSchema } from "../records/media-contracts.ts";
+import { readReviewBatch, reviewRangeSchema } from "../media/review-materials.ts";
+import { fileHash } from "../common/file-hash.ts";
+import { speechSegments, voiceInstructionSchema } from "../media/providers.ts";
+import { AssetCatalog, assetSearchSchema } from "../records/asset-catalog.ts";
+import { configuration } from "../config.ts";
 
 const id = z.string().regex(/^[a-z0-9][a-z0-9-]{0,79}$/);
 const versionId = z.string().regex(/^v\d{3,}$/);
@@ -33,7 +42,27 @@ export const inputs = {
   create_work: write({ ...workInputSchema.shape,
     purpose: purposeSchema.describe("根据用户明确要求选择 test（测试制作）或 production（正式制作）；无法判断时先询问。与 sample/complete 制作阶段分别判断。") }),
   get_work: z.strictObject({ workId: id, ...page }),
+  submit_draft: write({ workId: id, markdown: markdownSchema, instruction: text, basedOn: documentRefSchema.optional(), assetIds: z.array(id).max(20).optional() }),
+  read_document: z.strictObject({ workId: id, ref: documentRefSchema }),
+  revise_draft: write({ workId: id, base: documentRefSchema, instruction: text, assetIds: z.array(id).max(20).optional() }),
+  handoff_draft: write({ workId: id, draft: documentRefSchema, userInstruction: text }),
+  design_video: write({ workId: id, base: documentRefSchema, instruction: text, assetIds: z.array(id).max(20).optional() }),
+  review_design: write({ workId: id, design: documentRefSchema, status: z.enum(["adopted", "needs_changes"]), notes: text, source: z.enum(["user", "external_ai"]) }),
+  import_asset: write({ workId: id, path: text, role: z.enum(["reference", "image", "narration", "music"]), description: text, document: documentRefSchema.optional() }),
+  get_asset: z.strictObject({ workId: id, assetId: assetIdSchema }),
+  search_assets: assetSearchSchema.extend({ purpose: purposeSchema.default("production") }),
+  generate_image: write({ workId: id, document: documentRefSchema, prompt: text, referenceAssetIds: z.array(assetIdSchema).max(8).default([]), background: z.enum(["auto", "opaque", "transparent"]).optional(), description: text }),
+  read_speech_text: z.strictObject({ workId: id, design: documentRefSchema }),
+  synthesize_speech: write({ workId: id, document: documentRefSchema, segmentIds: z.array(z.string().regex(/^[a-zA-Z0-9_-]+$/)).min(1).max(100),
+    speechRate: z.number().int().min(-50).max(100).default(0), voiceInstruction: voiceInstructionSchema.optional(), description: text }),
+  prepare_review_materials: write({ workId: id, versionId, ranges: z.array(reviewRangeSchema).max(6).default([]) }),
+  get_review_materials: z.strictObject({ workId: id, versionId }),
+  read_media_image: z.strictObject({ workId: id, source: z.discriminatedUnion("kind", [
+    z.strictObject({ kind: z.literal("asset"), assetId: assetIdSchema }),
+    z.strictObject({ kind: z.literal("review"), versionId, indexRef: text, imagePath: text }),
+  ]) }),
   produce_version: write({ workId: id, kind: z.enum(["sample", "complete"]),
+    designRef: documentRefSchema.optional(), assetIds: z.array(id).optional(),
     feedbackId: text.max(100).optional(), feedbackIds: z.array(text.max(100)).max(1_000).optional().describe("明确本轮处理的反馈编号，空数组表示不处理；不能与 feedbackId 同时提供。"),
     newDirection: z.boolean().optional().describe("true 从所选基线创建备选样例；false 或省略沿用原方向，不撤销原确认。"), threadMode: z.enum(["fresh", "resume"]).default("fresh"),
     baseVersionId: versionId.optional(), baseReason: text.optional() }),
@@ -44,6 +73,7 @@ export const inputs = {
     supersedes: z.array(text.max(100)).max(1_000).optional().describe("本次原话明确替代或取消的旧反馈编号；保留原文，旧项不再自动进入新制作。"),
     location: feedbackLocationSchema.optional() }),
   record_review: write({ workId: id, versionId, status: z.enum(["needs_changes", "passed"]), notes: text,
+    materialIndexes: z.array(z.string()).max(100).optional(),
     source: z.enum(["user", "external_ai", "internal_check"]) }),
   confirm_version: write({ workId: id, versionId, kind: z.enum(["direction", "acceptance"]),
     userConfirmation: text.max(10_000), scope: text.optional() }),
@@ -61,8 +91,26 @@ export const inputs = {
 };
 type ToolName = keyof typeof inputs;
 const readOnly = new Set<ToolName>(["read_usage_guide", "get_runtime_info", "get_execution", "prepare_operation", "get_operation", "list_works", "get_work",
+  "read_document",
+  "get_asset", "search_assets", "read_speech_text", "get_review_materials",
+  "read_media_image",
   "search_experience", "read_experience", "learning_status", "get_comparison"]);
 const descriptions: Record<ToolName, string> = {
+  import_asset: "把用户指定的本机图片、录音或背景音乐保存到作品资产目录，核对实际文件并保留来源；不修改原文件。",
+  get_asset: "读取已登记素材的本机位置、用途、来源和实际媒体信息；内容变化时拒绝复用。",
+  generate_image: "通过已配置 GPT 图片 API 生成一张图片，或按所选图片参考编辑；保存到本机并关联稿件。未配置时拒绝，不自动重试结果未知的请求。会使用 API 额度。",
+  read_speech_text: "从确切设计脚本的 speech 区块提取实际人声原文；不润色，不把动作说明当台词。",
+  synthesize_speech: "从已采用脚本的指定台词片段调用已有豆包音色，可通过 voiceInstruction 传递脚本中的声音要求；保存音轨、指令和服务实际返回的字词时间。凭据只读本机配置；会使用 API 额度。",
+  search_assets: "只读查找配置的本机素材库和所选正式或测试区域的已有作品素材，返回候选来源与使用状态，不把检索当作查看或试听。",
+  prepare_review_materials: "由项目保存并补足抽帧材料、回看检查；新流程发现实现问题时自动修复并复查，返回实际最终版本和内检状态。外部 AI 再独立审查。",
+  get_review_materials: "返回当前视频的永久审查文件、采用脚本、项目内检及交付状态；外部 AI 实际读取后独立提交 record_review。",
+  read_media_image: "通过 MCP 图像内容读取已保存素材或审查帧/拼图，同时返回来源及摘要；不重新生成、不另建云端副本。只接受本作品登记的明确文件引用。",
+  submit_draft: "保存外部 AI 提交的完整 Markdown 原文；已有草稿须提供最新 basedOn。修改生成新版本，不自动交接设计或改变在途任务。",
+  read_document: "读取确切版本的草稿或视频脚本正文、来源及本机位置；内容变化时拒绝沿用旧记录。",
+  revise_draft: "提交项目 AI 修改草稿的后台任务，仅按本轮指令返回新 Markdown，不自动进入设计或制作。",
+  handoff_draft: "记录用户明确将最新草稿交给 AI 设计的原话。草稿保存、AI 自评或一般积极反馈不替代这次交接。",
+  design_video: "以已交接草稿或其设计基线生成视频脚本；本轮只设计，完成后返回外部 AI 审查，不自动制作代码。",
+  review_design: "外部 AI 或用户检查确切设计后记录采用或修改结论及依据；AI 采用不是用户成片认可。",
   read_usage_guide: "开始使用前读取 usage 指南，按需读取 workflow 制作规则或 data 数据规则的明确章节。只返回项目说明及版本，不读取任意文件。按指南处理位置、用途、编号和后台查询，用户只需表达视频要求。",
   get_runtime_info: "只读核对资产总目录、正式与测试区域、共享经验位置和系统版本。同一入口服务两类任务，用途在创建任务时选择。",
   get_execution: "按 executionId 查询原后台执行阶段、实际选择及结果；succeeded 查看结果，waiting_input 需补信息，unknown 须核对恢复。timing 记录项目接收至首次最终返回，重复查询不重置。",
@@ -70,11 +118,11 @@ const descriptions: Record<ToolName, string> = {
   prepare_operation: "为一次新写操作生成并校验请求格式，回显参数及技术默认值；不查询作品或执行业务。保存返回的 arguments 后调用目标工具，原样重试沿用原 operationId。",
   get_operation: "按原编号读取操作回执，兼容旧区域。未取得最终回执时查询原任务，不换编号重新制作。",
   list_works: "按 purpose 分页查作品：默认 production，test 查测试，all 查两类。筛选只影响列表，不改变后续任务的用途。",
-  create_work: "保存原始需求，将用途绑定到新任务。用户要求测试则传 purpose=test，要求正式制作则传 production；意图不明时先询问，不根据环境或样例阶段猜用途。operationId 不随重试改变。",
+  create_work: "保存原始需求与首版 Markdown 草稿，将用途绑定到新任务；不开始设计。用户要求测试则传 purpose=test，正式制作传 production。用户明确交接后才能 design_video。operationId 不随重试改变。",
   get_work: "按作品编号定位区域，分页查看版本及已合并的追加反馈，返回文件入口和当前状态；nextOffset 不为空时继续查询。处理版本与替代关系分别返回，不把收到反馈当作已应用。",
-  produce_version: "核对前置条件后受理并冻结本轮输入，返回 executionId 和实际 selection，随后查询。feedbackIds=[] 不处理反馈，数组可选一条或多条；newDirection=true 仅创建备选样例。默认沿已确认方向接续，旧范围不明须明确选择；完整制作须真实方向确认，会使用模型额度。",
-  render_version: "提交已有完成工程的后台渲染，返回 executionId 后查询。不会再次调用模型或覆盖已就绪版本。",
-  recover_work: "提交对原任务的后台核对与补存，可继续已完成工程的渲染；返回 executionId 后查询。不会重发制作；原进程仍运行或依据不足时保留保护。",
+  produce_version: "新流程须明确 designRef，受理时冻结脚本、素材、基线和反馈。制作后自动回看、必要时内部修复与复查，通过后 delivery 返回交付版本。旧任务沿原样例确认接续。feedbackIds=[] 不处理外部反馈，newDirection=true 仅备选样例。返回 executionId 后查询，会使用模型额度。",
+  render_version: "提交已有完成工程的后台渲染或预览恢复，返回 executionId 后查询。只恢复既有工程产物，不调用模型或修改源码；需要项目回看时另用 prepare_review_materials。",
+  recover_work: "沿原任务身份核对与补存，可继续完成工程的渲染和已知内检要求的剩余修复；不重发未知原调用。返回 executionId 后查询，原进程仍运行或依据不足时保留保护。",
   submit_feedback: "保留针对已登记版本的原话，可在已知排队或制作期间先保存，供下一轮接续；未知执行先核对。可附定位或 supersedes 替代关系；近似位置不能标成 verified，新增备选不自动撤销原方向。",
   record_review: "记录实际观看或检查过的明确版本及覆盖范围；技术检查不能代替内容审查或用户认可。",
   confirm_version: "仅转录用户对明确版本的真实确认。direction 确认样例方向；acceptance 认可完整版本，不授权发布。AI 自检不能代替用户确认。",
@@ -112,16 +160,21 @@ function workView(service: WorkService, workId: string, offset = 0, limit = 20) 
   }
   const versions = work.versions.slice(offset, end);
   const summary = service.store.summary({ ...work, versions, feedback: work.feedback.slice(offset, end),
+    assets: work.assets?.slice(offset, end), authoring: work.authoring ? { ...work.authoring,
+      drafts: work.authoring.drafts.slice(offset, end), designs: work.authoring.designs.slice(offset, end),
+      handoffs: work.authoring.handoffs.slice(offset, end), decisions: work.authoring.decisions.slice(offset, end), runs: work.authoring.runs.slice(offset, end) } : undefined,
     confirmations: work.confirmations?.slice(offset, end), learningBatches: work.learningBatches?.slice(offset, end) });
-  const more = end < Math.max(work.versions.length, work.feedback.length, work.confirmations?.length ?? 0, work.learningBatches?.length ?? 0);
-  const pending = service.learning.pending(work);
-  return { ...summary, feedbackDirectory: service.store.resolvePath("works/" + workId + "/feedback"), feedback: summary.feedback.map(f => ({ ...f,
+  const more = end < Math.max(work.versions.length, work.feedback.length, work.confirmations?.length ?? 0, work.learningBatches?.length ?? 0,
+    work.assets?.length ?? 0, ...Object.values(work.authoring ?? {}).map(items => items.length));
+  const pending = service.learning.pending(work, false);
+  return { ...summary, delivery: service.store.delivery(work), feedbackDirectory: service.store.resolvePath("works/" + workId + "/feedback"), feedback: summary.feedback.map(f => ({ ...f,
     supersededByFeedbackIds: work.feedback.filter(next => next.supersedes?.includes(f.id)).map(next => next.id),
     appliedInVersionIds: work.versions.filter(v => feedbackAppliedByVersion(v).includes(f.id)).map(v => v.id) })), storagePurpose: service.store.purpose,
     activeExecutionId: active?.operationId,
     coverage: more ? "partial" : "complete", nextOffset: more ? end : null,
-    counts: { versions: work.versions.length, feedback: work.feedback.length, confirmations: work.confirmations?.length ?? 0 },
-    learning: { ...pending, items: pending.items.map(item => ({ id: item.id, kind: item.kind, versionId: item.versionId })) } };
+    counts: { versions: work.versions.length, feedback: work.feedback.length, confirmations: work.confirmations?.length ?? 0,
+      assets: work.assets?.length ?? 0, drafts: work.authoring?.drafts.length ?? 0, designs: work.authoring?.designs.length ?? 0 },
+    learning: { ...pending, items: pending.items.map(item => ({ id: item.id, kind: item.kind, versionId: item.versionId, documentRef: item.documentRef })) } };
 }
 
 /** CLI 与 MCP 共用校验、原操作回执和业务实现。 */
@@ -184,6 +237,34 @@ async function execute(name: string, input: unknown, context: WorkRouter | WorkS
   } catch (error) { if (operationId) rejectPreflight(name, error); throw error; }
   if (!operationId) return perform(tool, parsed, service, router);
   try {
+    if (["submit_draft", "handoff_draft", "review_design"].includes(tool)) {
+      const args = z.object({ workId: id }).parse(parsed);
+      assertExecutionAccess(service.store.dataRoot, args.workId);
+      service.assertCanProduce(service.store.read(args.workId), "sample");
+    }
+    if (tool === "submit_draft") {
+      const args = inputs.submit_draft.parse(parsed); service.documents.validateSubmission(service.store.read(args.workId), args.basedOn, args.assetIds);
+    }
+    if (tool === "handoff_draft") {
+      const args = inputs.handoff_draft.parse(parsed); service.documents.validateHandoff(service.store.read(args.workId), args.draft);
+    }
+    if (tool === "review_design") {
+      const args = inputs.review_design.parse(parsed); service.documents.validateDecision(service.store.read(args.workId), args.design, args.status);
+    }
+    if (tool === "revise_draft" || tool === "design_video") {
+      const args = inputs[tool].parse(parsed);
+      service.authoring.validate(service.store.read(args.workId), tool === "design_video" ? "design" : "revise_draft", args.base);
+    }
+    if (tool === "generate_image") {
+      const args = inputs.generate_image.parse(parsed); service.assets.validate(service.store.read(args.workId), { ...args, kind: "image" });
+    }
+    if (tool === "synthesize_speech") {
+      const args = inputs.synthesize_speech.parse(parsed); service.assets.validate(service.store.read(args.workId), { ...args, kind: "speech" });
+    }
+    if (tool === "prepare_review_materials") {
+      const args = inputs.prepare_review_materials.parse(parsed), record = service.store.read(args.workId);
+      service.store.assertAvailable(service.store.version(record, args.versionId));
+    }
     if (tool === "produce_version") {
       const args = inputs.produce_version.parse(parsed), record = service.store.read(args.workId);
       const active = activeExecution(service.store.dataRoot, args.workId);
@@ -238,6 +319,9 @@ async function perform(name: ToolName, input: unknown, service: WorkService, rou
   switch (name) {
     case "read_usage_guide": { const args = inputs.read_usage_guide.parse(input); return readUsageGuide(args.document, args.section); }
     case "get_runtime_info": return { assetRoot: router.assetRoot, workRoots: router.workRoots,
+      mediaServices: { gptImageConfigured: Boolean(configuration.providers.image), doubaoSpeechConfigured: Boolean(configuration.providers.speech) },
+      assetLibraries: configuration.assetLibraries.map(item => ({ id: item.id, path: item.path, role: item.role })),
+      audioInspection: "manual",
       knowledgeRoot: service.knowledge.root, scopeIds: router.scopes(), systemFingerprint: systemFingerprint(),
       executionMode: "background", usageGuideTool: "read_usage_guide" };
     case "get_execution": return new BackgroundService(router).view(inputs.get_execution.parse(input).executionId);
@@ -255,7 +339,51 @@ async function perform(name: ToolName, input: unknown, service: WorkService, rou
       const end = args.offset + args.limit;
       return { works: works.slice(args.offset, end), nextOffset: end < works.length ? end : null, coverage: end < works.length ? "partial" : "complete" };
     }
-    case "create_work": { const args = inputs.create_work.parse(input); return store.summary(store.create(args.title, args.brief, args.operationId)); }
+    case "create_work": {
+      const args = inputs.create_work.parse(input), work = store.create(args.title, args.brief, args.operationId, undefined, true);
+      await store.withLock(work.id, () => service.documents.initialize(store.read(work.id), args.brief, args.operationId));
+      return workView(service, work.id);
+    }
+    case "submit_draft": { const args = inputs.submit_draft.parse(input); return service.documents.submit(args.workId, args.markdown, args.operationId, args.instruction, args.basedOn, args.assetIds); }
+    case "read_document": { const args = inputs.read_document.parse(input); return service.documents.read(store.read(args.workId), args.ref); }
+    case "get_asset": { const args = inputs.get_asset.parse(input); return service.assets.assets.view(store.read(args.workId), args.assetId); }
+    case "search_assets": { const args = inputs.search_assets.parse(input); return new AssetCatalog(router.service(args.purpose).store).search(args); }
+    case "import_asset": { const args = inputs.import_asset.parse(input);
+      if (args.document) service.documents.document(store.read(args.workId), args.document);
+      return service.assets.assets.import(args.workId, args.path, args.role, args.description, args.operationId, args.document, service.assets.options.signal); }
+    case "generate_image": { const args = inputs.generate_image.parse(input); return service.assets.generate(args.workId, { ...args, kind: "image" }, args.operationId); }
+    case "synthesize_speech": { const args = inputs.synthesize_speech.parse(input); return service.assets.generate(args.workId, { ...args, kind: "speech" }, args.operationId); }
+    case "read_speech_text": { const args = inputs.read_speech_text.parse(input); return { design: args.design,
+      segments: speechSegments(service.documents.read(store.read(args.workId), args.design).markdown) }; }
+    case "get_review_materials": { const args = inputs.get_review_materials.parse(input), work = store.read(args.workId); return service.reviewMaterials.view(work, store.version(work, args.versionId)); }
+    case "read_media_image": {
+      const args = inputs.read_media_image.parse(input), work = store.read(args.workId);
+      let path: string, sha256: string, mimeType: string;
+      if (args.source.kind === "asset") {
+        const asset = service.assets.assets.get(work, args.source.assetId);
+        if (!asset.mimeType.startsWith("image/")) throw new Error("该素材不是图片。");
+        path = asset.path; sha256 = asset.sha256; mimeType = asset.mimeType;
+      } else {
+        const source = args.source, version = store.version(work, source.versionId); store.assertAvailable(version);
+        const ref = version.reviewPreparation?.batches.find(item => item.path === source.indexRef);
+        if (!ref || fileHash(store.resolvePath(ref.path)) !== ref.sha256) throw new Error("审查索引不存在、已变化或不属于此版本。");
+        const batch = readReviewBatch(dirname(store.resolvePath(ref.path)), version.videoSha256!);
+        const item = [...batch.frames, ...batch.sheets].find(item => item.path === source.imagePath);
+        if (!item) throw new Error("图片不在本批审查索引中。");
+        path = join(dirname(ref.path), item.path); sha256 = item.sha256; mimeType = "image/png";
+      }
+      const bytes = readFileSync(store.resolvePath(path));
+      if (bytes.length > 8 * 1024 * 1024) throw new Error("图片超过本 MCP 图像消息上限，请通过已有本机查看能力读取原文件。");
+      return { workId: work.id, source: args.source, location: store.resolvePath(path), sha256, mimeType, data: bytes.toString("base64") };
+    }
+    case "prepare_review_materials": { const args = inputs.prepare_review_materials.parse(input);
+      return service.prepareMaterials(args.workId, args.versionId, args.ranges, args.operationId); }
+    case "handoff_draft": { const args = inputs.handoff_draft.parse(input); return service.documents.handoff(args.workId, args.draft, args.userInstruction, args.operationId); }
+    case "review_design": { const { workId, ...args } = inputs.review_design.parse(input); return service.documents.decide(workId, args); }
+    case "revise_draft": case "design_video": {
+      const args = inputs[name].parse(input);
+      return service.authoring.generate(args.workId, name === "design_video" ? "design" : "revise_draft", args.base, args.instruction, args.operationId, args.assetIds);
+    }
     case "get_work": { const args = inputs.get_work.parse(input); return workView(service, args.workId, args.offset, args.limit); }
     case "produce_version": {
       const args = inputs.produce_version.parse(input);
@@ -265,18 +393,34 @@ async function perform(name: ToolName, input: unknown, service: WorkService, rou
     case "render_version": { const args = inputs.render_version.parse(input); await service.renderExisting(args.workId, args.versionId); return workView(service, args.workId); }
     case "recover_work": {
       const args = inputs.recover_work.parse(input), recovered = await service.recover(args.workId, args.render);
-      const work = store.read(args.workId), version = work.versions.at(-1);
-      if (recovered.status === "recovered" && version?.production === "ready" && version.operationId &&
+      const work = store.read(args.workId);
+      const operationId = "operationId" in recovered && typeof recovered.operationId === "string" ? recovered.operationId : undefined;
+      const version = operationId ? work.versions.filter(item => (item.reviewPreparation?.operationId ?? item.operationId) === operationId).at(-1) : undefined;
+      let result: unknown, status: "succeeded" | "waiting_input" | "failed" | undefined;
+      if ("kind" in recovered) {
+        if (recovered.kind === "authoring") {
+          result = recovered.result;
+          status = recovered.result.status === "completed" ? "succeeded" : recovered.result.status === "needs_input" ? "waiting_input" : "failed";
+        } else if (recovered.status === "recovered") {
+          result = recovered.asset; status = "succeeded";
+        } else if (recovered.status === "failed") {
+          result = { status: "failed", error: recovered.message }; status = "failed";
+        }
+      } else if (recovered.status === "recovered" && ["idle", "waiting_input"].includes(work.execution.status) && version?.production === "ready" &&
           store.availability(version).status === "available") {
-        const original = router.operation(version.operationId, store.purpose);
-        if (!original) throw new Error("作品已恢复，但原操作回执缺失，仍需核对原编号。");
-        original.store.completeRecovery(version.operationId, work.id, workView(service, work.id));
-        new ExecutionStore(router.assetRoot).recordRecovery(version.operationId, work.id, workView(service, work.id));
+        result = workView(service, work.id);
+        status = work.execution.status === "waiting_input" ? "waiting_input" : "succeeded";
+      }
+      if (operationId && status) {
+        const original = router.operation(operationId, store.purpose);
+        if (!original) throw new Error("结果已恢复，但原操作回执缺失，仍需核对原编号。");
+        original.store.completeRecovery(operationId, work.id, result);
+        new ExecutionStore(router.assetRoot).recordRecovery(operationId, work.id, result, status, status === "failed" ? work.execution.error : undefined);
       }
       return recovered;
     }
     case "submit_feedback": { const args = inputs.submit_feedback.parse(input); await store.feedback(args.workId, args.versionId, args.text, args.source, args.changesDirection, args.location, args.operationId, args.supersedes); return workView(service, args.workId); }
-    case "record_review": { const args = inputs.record_review.parse(input); await store.review(args.workId, args.versionId, args.status, args.notes, args.source); return workView(service, args.workId); }
+    case "record_review": { const args = inputs.record_review.parse(input); await store.review(args.workId, args.versionId, args.status, args.notes, args.source, args.materialIndexes); return workView(service, args.workId); }
     case "confirm_version": { const args = inputs.confirm_version.parse(input); await store.confirm(args.workId, args.versionId, args.kind, args.userConfirmation, args.scope); return workView(service, args.workId); }
     case "search_experience": { const args = inputs.search_experience.parse(input); return service.knowledge.search(args.query, args.offset, args.limit); }
     case "read_experience": { const ref = inputs.read_experience.parse(input); return { ref, experience: service.knowledge.read(ref) }; }
@@ -302,7 +446,14 @@ export function startMcpServer(): void {
     for (const name of Object.keys(inputs) as ToolName[]) {
       server.registerTool(name, { description: descriptions[name], inputSchema: inputs[name],
         annotations: { readOnlyHint: readOnly.has(name), destructiveHint: false } }, async (args: unknown) => {
-        try { return { content: [{ type: "text" as const, text: JSON.stringify(await executeTool(name, args, router)) }] }; }
+        try {
+          const result = await executeTool(name, args, router);
+          if (name === "read_media_image") {
+            const { data, mimeType, ...metadata } = z.object({ data: z.string(), mimeType: z.string() }).passthrough().parse(result);
+            return { content: [{ type: "text" as const, text: JSON.stringify({ ...metadata, mimeType }) }, { type: "image" as const, data, mimeType }] };
+          }
+          return { content: [{ type: "text" as const, text: JSON.stringify(result) }] };
+        }
         catch (error) { return { isError: true, content: [{ type: "text" as const, text: describeError(error) }] }; }
       });
     }

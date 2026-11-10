@@ -4,6 +4,16 @@
 
 {{task}}
 
+### 本轮采用的视频设计
+
+{{design}}
+
+### 本轮可用素材
+
+{{assets}}
+
+source 是当前工程 public/ 下的相对位置，使用 remotion 的 staticFile(source) 引用。metadataSource 可读取实际音轨时长与供应商字词时间。不得把预计时间冒充实际时间，也不得读取目录外的素材原件。
+
 ### 本轮要做的内容
 
 {{feedback}}

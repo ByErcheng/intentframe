@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { documentRefSchema } from "./authoring-contracts.ts";
 
 export const recordIdSchema = z.string().regex(/^[a-z0-9][a-z0-9-]{0,79}$/);
 export const workInputLimits = { title: 200, brief: 30_000 } as const;
@@ -21,11 +22,13 @@ export const feedbackLocationSchema = z.strictObject({
 }).refine(value => value.endSeconds === undefined || (value.startSeconds !== undefined && value.endSeconds > value.startSeconds), "结束时间须晚于开始时间。");
 export type FeedbackLocation = z.infer<typeof feedbackLocationSchema>;
 
-export const experienceSourceSchema = z.strictObject({
+export const videoExperienceSourceSchema = z.strictObject({
   purpose: purposeSchema, workId: recordIdSchema, versionId: z.string().regex(/^v\d{3,}$/),
   sourceFingerprint: z.string().regex(/^[a-f0-9]{64}$/),
   feedbackIds: z.array(z.string()).max(100),
 });
+export const experienceSourceSchema = z.union([videoExperienceSourceSchema,
+  z.strictObject({ kind: z.literal("document"), purpose: purposeSchema, workId: recordIdSchema, documentRef: documentRefSchema })]);
 export type ExperienceSource = z.infer<typeof experienceSourceSchema>;
 
 export const learningProposalSchema = z.strictObject({

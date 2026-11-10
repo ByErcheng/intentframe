@@ -25,7 +25,8 @@ export function systemFingerprint(): string {
 
 export function runtimeFingerprint(): string {
   return valueHash({ assetRoot: configuration.assetRoot, node: configuration.node, codex: configuration.codex,
-    runtime: configuration.runtime, media: configuration.media });
+    runtime: configuration.runtime, media: configuration.media, providers: configuration.providers,
+    assetLibraries: configuration.assetLibraries });
 }
 
 /** 只保存影响执行的非敏感条件；配置中的版本是声明，文件摘要是本次实际依据。 */

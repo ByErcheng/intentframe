@@ -49,7 +49,8 @@ export class BackgroundService {
         if (name === "produce_version") {
           const args = z.object({ kind: z.enum(["sample", "complete"]), feedbackId: z.string().optional(),
             feedbackIds: z.array(z.string()).optional(), newDirection: z.boolean().optional(), threadMode: z.enum(["fresh", "resume"]),
-            baseVersionId: z.string().optional(), baseReason: z.string().optional() }).parse(input);
+            baseVersionId: z.string().optional(), baseReason: z.string().optional(),
+            designRef: z.object({ id: z.string(), sha256: z.string() }).optional(), assetIds: z.array(z.string()).optional() }).parse(input);
           const snapshot = store.read(input.workId);
           const chosen = selectProduction(store, snapshot, args.kind, args.feedbackId, args.threadMode, args.baseVersionId, args.baseReason, args);
           const { feedbackId: _feedbackId, ...original } = input;

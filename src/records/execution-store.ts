@@ -2,11 +2,12 @@ import { existsSync, mkdirSync, rmSync } from "node:fs";
 import { z } from "zod";
 import { setTimeout as delay } from "node:timers/promises";
 import { atomicJson, immutableJson, ownedPath, readJson, valueHash } from "./files.ts";
-import { operationIdSchema } from "./operation-store.ts";
+import { operationIdSchema, recoverableOperations } from "./operation-store.ts";
 import { purposeSchema, recordIdSchema } from "./contracts.ts";
 import { processMatches, processStartedAt } from "../runtime/process-state.ts";
 
-export const backgroundTools = ["produce_version", "render_version", "organize_experience", "recover_work"] as const;
+export const backgroundTools = ["produce_version", "render_version", "organize_experience", "recover_work", "revise_draft", "design_video",
+  "generate_image", "synthesize_speech", "prepare_review_materials", "import_asset"] as const;
 export const backgroundToolSchema = z.enum(backgroundTools);
 export type BackgroundTool = z.infer<typeof backgroundToolSchema>;
 const requestSchema = z.object({
@@ -142,13 +143,13 @@ export class ExecutionStore {
     return existsSync(path) ? this.check(request, outcomeSchema.parse(readJson(path))) : undefined;
   }
 
-  recordRecovery(id: string, workId: string, result: unknown) {
+  recordRecovery(id: string, workId: string, result: unknown, status: "succeeded" | "waiting_input" | "failed" = "succeeded", error?: string) {
     if (!this.exists(id)) return;
     const request = this.read(id);
-    if (request.name !== "produce_version" || request.workId !== workId) throw new Error("恢复结果不属于原后台制作。");
+    if (!recoverableOperations.includes(request.name) || request.workId !== workId) throw new Error("恢复结果不属于可恢复的原后台操作。");
     const path = this.path(id, "recovered.json");
     if (existsSync(path)) { this.check(request, outcomeSchema.parse(readJson(path))); return; }
-    immutableJson(path, { operationId: id, inputHash: request.inputHash, status: "succeeded", result, finishedAt: new Date().toISOString() });
+    immutableJson(path, { operationId: id, inputHash: request.inputHash, status, result, error, finishedAt: new Date().toISOString() });
   }
 
   requestStop(request: ExecutionRequest, reason: string) {
@@ -170,13 +171,13 @@ export class ExecutionStore {
   selection(request: ExecutionRequest) {
     const input = request.prepared?.input;
     return input ? { baseVersionId: input.baseVersionId, feedbackIds: input.feedbackIds,
-      newDirection: input.newDirection, baseReason: input.baseReason } : undefined;
+      newDirection: input.newDirection, baseReason: input.baseReason, designRef: input.designRef, assetIds: input.assetIds } : undefined;
   }
 
   view(id: string) {
     const request = this.read(id), outcome = this.outcome(request), owner = this.claimant(request), stop = this.stop(request);
     const state = this.check(request, stateSchema.parse(readJson(this.path(id, "state.json"))));
-    const messages = { succeeded: "执行已完成，请查看本次结果和对应版本。", waiting_input: "需要补充信息，请查看本次结果中的缺口。",
+    const messages = { succeeded: "执行已完成，请查看本次结果和对应版本。", waiting_input: "存在待确认事项或未解决问题，请查看本次结果中的缺口。",
       failed: "执行失败，请核对错误及已有成果。", cancelled: "执行已取消或停止；此前成果继续保留。", unknown: "执行结果尚未核清，保留原占用并查询恢复。" };
     let status: string = outcome?.status ?? state.status, message = outcome ? outcome.error ?? messages[outcome.status] : state.phase;
     const workerAlive = owner ? processMatches(owner.pid, owner.processStartedAt) : undefined;

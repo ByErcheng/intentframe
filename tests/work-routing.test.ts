@@ -8,11 +8,11 @@ import { WorkStore, workSchema } from "../src/records/work-store.ts";
 import type { WorkRecord } from "../src/records/work-store.ts";
 import { WorkRouter } from "../src/runtime/work-router.ts";
 import { WorkService } from "../src/runtime/work-service.ts";
-import { fakeCodex, fixtureRender, fixtureRoot } from "./helpers.ts";
+import { adoptedDesign, fakeCodex, fixtureRender, fixtureRoot } from "./helpers.ts";
 
 function fixtureRouter(root: string) {
   const executable = fakeCodex(root);
-  return new WorkRouter(root, store => new WorkService(store, { codexExecutable: executable, render: fixtureRender }));
+  return new WorkRouter(root, store => new WorkService(store, { codexExecutable: executable, render: fixtureRender, prepareReview: async () => undefined }));
 }
 
 test("一个入口按新任务选择用途，交错制作、修改和新会话接续保持原区域", async () => {
@@ -25,21 +25,23 @@ test("一个入口按新任务选择用途，交错制作、修改和新会话�
     const testing = workSchema.parse(await executeTool("create_work", { operationId: "create-test", title: "做一次测试", brief, purpose: "test" }, router));
     assert(!existsSync(join(root.path, "works")), "测试创建不写正式作品区域");
     const formal = workSchema.parse(await executeTool("create_work", { operationId: "create-formal", title: "正式制作", brief, purpose: "production" }, router));
+    const testingDesign = await adoptedDesign(router.forWork(testing.id).store, testing.id);
+    const formalDesign = await adoptedDesign(router.forWork(formal.id).store, formal.id);
     const before = readFileSync(join(root.path, "works", formal.id, "task.json"), "utf8");
-    const made = workSchema.parse(await executeTool("produce_version", { operationId: "make-test", workId: testing.id, kind: "sample" }, router));
+    const made = workSchema.parse(await executeTool("produce_version", { operationId: "make-test", workId: testing.id, kind: "sample", designRef: testingDesign }, router));
     assert.equal(made.purpose, "test"); assert.equal(made.versions[0]!.production, "ready");
     assert.equal(router.operations.read("make-test").purpose, "test");
     assert.equal(readFileSync(join(root.path, "works", formal.id, "task.json"), "utf8"), before);
     await executeTool("submit_feedback", { operationId: "feedback-test", workId: testing.id, versionId: "v001", text: "标题放大一些", source: "user" }, fixtureRouter(root.path));
-    await executeTool("produce_version", { operationId: "make-formal", workId: formal.id, kind: "sample" }, router);
-    const continued = workSchema.parse(await executeTool("produce_version", { operationId: "continue-test", workId: testing.id, kind: "sample" }, fixtureRouter(root.path)));
+    await executeTool("produce_version", { operationId: "make-formal", workId: formal.id, kind: "sample", designRef: formalDesign }, router);
+    const continued = workSchema.parse(await executeTool("produce_version", { operationId: "continue-test", workId: testing.id, kind: "sample", designRef: testingDesign }, fixtureRouter(root.path)));
     assert.equal(continued.purpose, "test"); assert.equal(continued.versions.length, 2);
     assert.equal(continued.versions[1]!.basedOnVersionId, "v001");
     assert.deepEqual(continued.versions[1]!.appliedFeedbackIds, [continued.feedback[0]!.id]);
     assert(existsSync(join(root.path, "testing", continued.versions[1]!.mediaPath)));
     assert(!existsSync(join(root.path, continued.versions[1]!.mediaPath)));
     await assert.rejects(executeTool("produce_version", { operationId: "illicit-switch", workId: testing.id, kind: "sample", purpose: "production" }, router), /purpose/);
-    await assert.rejects(executeTool("produce_version", { operationId: "complete-without-direction", workId: formal.id, kind: "complete" }, router), /方向/);
+    await assert.rejects(executeTool("produce_version", { operationId: "complete-without-design", workId: formal.id, kind: "complete" }, router), /designRef/);
     const listing = await executeTool("list_works", { purpose: "all", limit: 1 }, router) as { works: unknown[]; nextOffset: number };
     assert.equal(listing.works.length, 1); assert.equal(listing.nextOffset, 1);
     assert.equal(router.service("production").store.list().length, 1);

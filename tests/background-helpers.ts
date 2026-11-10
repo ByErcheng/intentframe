@@ -6,6 +6,7 @@ import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
 import { repositoryRoot } from "../src/config.ts";
 import { ExecutionStore } from "../src/records/execution-store.ts";
 import { fakeCodex, fixtureRoot } from "./helpers.ts";
+import { WorkStore } from "../src/records/work-store.ts";
 
 export function backgroundFixture(mode = "slow_completed", runtime: Record<string, number> = {}) {
   const root = fixtureRoot(), project = join(root.path, "project"), data = join(root.path, "data");
@@ -46,6 +47,14 @@ export function backgroundFixture(mode = "slow_completed", runtime: Record<strin
     do { state = await call(client, "get_execution", { executionId: id }); if (predicate(state)) return state; await delay(80); } while (Date.now() < deadline);
     throw new Error("后台测试等待未结束：" + JSON.stringify(state));
   };
+  // 明确构造升级前的记录；旧后台故障回归继续覆盖历史任务，新流程使用原始 call(create_work)。
+  const createLegacyWork = async (client: Client, args: Record<string, unknown>) => {
+    const work = await call(client, "create_work", args);
+    const store = new WorkStore(args.purpose === "test" ? join(data, "testing") : data,
+      args.purpose === "test" ? "test" : "production", data);
+    const record = store.read(work.id); delete record.authoring; store.save(record);
+    return store.summary(record);
+  };
   const countTurns = () => {
     const path = join(root.path, "native-fixture/calls.jsonl");
     return existsSync(path) ? readFileSync(path, "utf8").split("\n").filter(line => line.includes('"method":"turn/start"')).length : 0;
@@ -72,7 +81,8 @@ export function backgroundFixture(mode = "slow_completed", runtime: Record<strin
       for (const id of existsSync(directory) ? readdirSync(directory) : []) {
         try {
           const work = JSON.parse(readFileSync(join(directory, id, "task.json"), "utf8"));
-          for (const run of [...work.versions, work.learningRun].filter(Boolean)) if (run.runnerPid) processes.add(run.runnerPid);
+          for (const run of [...work.versions, work.learningRun, ...(work.authoring?.runs ?? []),
+            ...work.versions.flatMap((version: { reviewPreparation?: { inspections: unknown[] } }) => version.reviewPreparation?.inspections ?? [])].filter(Boolean)) if (run.runnerPid) processes.add(run.runnerPid);
         } catch { /* 只清理本用例已登记的进程。 */ }
       }
     }
@@ -83,5 +93,5 @@ export function backgroundFixture(mode = "slow_completed", runtime: Record<strin
     for (const pid of processes) { try { process.kill(-pid, "SIGKILL"); } catch { /* 已退出。 */ } }
     root.cleanup();
   };
-  return { path: root.path, project, data, settings, configPath, executions, connect, call, wait, countTurns, delayWorkerStart, cleanup };
+  return { path: root.path, project, data, settings, configPath, executions, connect, call, createLegacyWork, wait, countTurns, delayWorkerStart, cleanup };
 }

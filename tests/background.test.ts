@@ -20,7 +20,7 @@ test("MCP 提供实际指南，短调用受理制作，断开后继续并由新�
     const rules = await fixture.call(first, "read_usage_guide", { document: "workflow", section: "反馈处理" });
     assert(rules.content.startsWith("## 反馈处理")); assert(rules.content.includes("原始反馈"));
     await assert.rejects(fixture.call(first, "read_usage_guide", { document: "../../config/local.json" }));
-    const work = await fixture.call(first, "create_work", { operationId: "create", title: "后台交接", brief: "合成任务，验证调用与产物。", purpose: "test" });
+    const work = await fixture.createLegacyWork(first, { operationId: "create", title: "后台交接", brief: "合成任务，验证调用与产物。", purpose: "test" });
     const request = { operationId: "produce", workId: work.id, kind: "sample" };
     const submitted = await fixture.call(first, "produce_version", request, 500);
     assert.equal(submitted.status, "accepted"); assert.equal(submitted.executionId, request.operationId);
@@ -48,7 +48,7 @@ test("未领取的后台请求可取消，迟到的工作进程不会开始制�
   try {
     fixture.delayWorkerStart();
     const client = await fixture.connect();
-    const work = await fixture.call(client, "create_work", { operationId: "create", title: "尚未开始", brief: "合成排队阶段。", purpose: "test" });
+    const work = await fixture.createLegacyWork(client, { operationId: "create", title: "尚未开始", brief: "合成排队阶段。", purpose: "test" });
     await fixture.call(client, "produce_version", { operationId: "queued", workId: work.id, kind: "sample" });
     // 首次任务尚无任何版本；可以追加反馈不等于允许虚构反馈目标。
     await assert.rejects(fixture.call(client, "submit_feedback", { operationId: "during-queue", workId: work.id, versionId: "v001", text: "不能引用尚未创建的版本", source: "user" }), /版本/);
@@ -71,7 +71,7 @@ test("工作进程崩溃不伪装成完成或安全失败，原执行身份与�
   const fixture = backgroundFixture("interruptible");
   try {
     const client = await fixture.connect();
-    const work = await fixture.call(client, "create_work", { operationId: "create", title: "进程崩溃", brief: "合成模型已经开始。", purpose: "test" });
+    const work = await fixture.createLegacyWork(client, { operationId: "create", title: "进程崩溃", brief: "合成模型已经开始。", purpose: "test" });
     const original = await fixture.call(client, "produce_version", { operationId: "produce", workId: work.id, kind: "sample" });
     await fixture.wait(client, "produce", () => fixture.countTurns() === 1);
     const owner = fixture.executions.claimant(fixture.executions.read("produce"))!;
@@ -89,7 +89,7 @@ test("后台总执行预算独立生效，超时不会被报告为用户取消�
   const fixture = backgroundFixture("interruptible", { jobTimeoutMs: 800, stopTimeoutMs: 1_000 });
   try {
     const client = await fixture.connect();
-    const work = await fixture.call(client, "create_work", { operationId: "create", title: "总预算", brief: "合成慢任务。", purpose: "test" });
+    const work = await fixture.createLegacyWork(client, { operationId: "create", title: "总预算", brief: "合成慢任务。", purpose: "test" });
     await fixture.call(client, "produce_version", { operationId: "produce", workId: work.id, kind: "sample" });
     const state = await fixture.wait(client, "produce");
     assert.equal(state.status, "failed", JSON.stringify(state)); assert.match(state.error, /总等待上限/);
@@ -103,7 +103,7 @@ test("渲染停止后保留完成工程，后台恢复只继续渲染并补齐�
   const fixture = backgroundFixture("slow_render");
   try {
     const client = await fixture.connect();
-    const work = await fixture.call(client, "create_work", { operationId: "create", title: "渲染停止与恢复", brief: "合成已完成源码。", purpose: "test" });
+    const work = await fixture.createLegacyWork(client, { operationId: "create", title: "渲染停止与恢复", brief: "合成已完成源码。", purpose: "test" });
     await fixture.call(client, "produce_version", { operationId: "produce", workId: work.id, kind: "sample" });
     await fixture.wait(client, "produce", state => state.status === "running" && state.message.includes("渲染"));
     await fixture.call(client, "cancel_execution", { operationId: "cancel", executionId: "produce" });
@@ -127,7 +127,7 @@ test("停止请求经原生中断取得终态后才报告取消，随后可继�
   const fixture = backgroundFixture("interruptible");
   try {
     const client = await fixture.connect();
-    const work = await fixture.call(client, "create_work", { operationId: "create", title: "停止核对", brief: "合成慢任务。", purpose: "test" });
+    const work = await fixture.createLegacyWork(client, { operationId: "create", title: "停止核对", brief: "合成慢任务。", purpose: "test" });
     await fixture.call(client, "produce_version", { operationId: "produce", workId: work.id, kind: "sample" });
     await fixture.wait(client, "produce", () => fixture.countTurns() === 1);
     await fixture.call(client, "cancel_execution", { operationId: "cancel", executionId: "produce", reason: "合成用户要求停止" });
@@ -146,7 +146,7 @@ test("未取得停止终态时保留未知与占用，不能用新操作再次�
   const fixture = backgroundFixture("ignore_interrupt");
   try {
     const client = await fixture.connect();
-    const work = await fixture.call(client, "create_work", { operationId: "create", title: "停止未核实", brief: "合成中断未响应。", purpose: "production" });
+    const work = await fixture.createLegacyWork(client, { operationId: "create", title: "停止未核实", brief: "合成中断未响应。", purpose: "production" });
     await fixture.call(client, "produce_version", { operationId: "produce", workId: work.id, kind: "sample" });
     await fixture.wait(client, "produce", () => fixture.countTurns() === 1);
     await fixture.call(client, "cancel_execution", { operationId: "cancel", executionId: "produce" });
@@ -163,7 +163,7 @@ test("未知后台执行可交给恢复核对，原工程依据缺失时仍不�
   const fixture = backgroundFixture("disconnect_after_result");
   try {
     const client = await fixture.connect();
-    const work = await fixture.call(client, "create_work", { operationId: "create", title: "未知后核对", brief: "合成原调用断线。", purpose: "test" });
+    const work = await fixture.createLegacyWork(client, { operationId: "create", title: "未知后核对", brief: "合成原调用断线。", purpose: "test" });
     await fixture.call(client, "produce_version", { operationId: "produce", workId: work.id, kind: "sample" });
     assert.equal((await fixture.wait(client, "produce")).status, "unknown");
     await fixture.call(client, "recover_work", { operationId: "recover", workId: work.id });
@@ -200,7 +200,7 @@ test("已开始的执行丢失领取身份时，不补认未开始、取消成�
   const fixture = backgroundFixture();
   try {
     const client = await fixture.connect();
-    const work = await fixture.call(client, "create_work", { operationId: "create", title: "身份缺失", brief: "合成损坏记录。", purpose: "test" });
+    const work = await fixture.createLegacyWork(client, { operationId: "create", title: "身份缺失", brief: "合成损坏记录。", purpose: "test" });
     const input = { operationId: "lost-owner", workId: work.id, kind: "sample", threadMode: "fresh" };
     const request = { operationId: input.operationId, workId: work.id, purpose: "test" as const, name: "produce_version" as const,
       input, inputHash: valueHash(input), createdAt: new Date().toISOString(), systemFingerprint: "synthetic", configurationFingerprint: "synthetic" };

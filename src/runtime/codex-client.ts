@@ -26,6 +26,10 @@ const rpcMessageSchema = z.object({
 });
 export class UnknownExecutionOutcome extends Error {}
 export class RpcRequestRejected extends Error {}
+export class NativeToolOutput {
+  readonly contentItems: ({ type: "inputText"; text: string } | { type: "inputImage"; imageUrl: string })[];
+  constructor(contentItems: NativeToolOutput["contentItems"]) { this.contentItems = contentItems; }
+}
 
 /** 只有制作可能已开始且未取得终态，才需要阻止重发；握手失败不等于制作结果未知。 */
 export function executionFailureStatus(
@@ -170,7 +174,7 @@ export class CodexAppServerClient {
     let result;
     try {
       const output = await this.onToolCall!(call.tool, call.arguments, call);
-      result = { success: true, contentItems: [{ type: "inputText", text: JSON.stringify(output) }] };
+      result = { success: true, contentItems: output instanceof NativeToolOutput ? output.contentItems : [{ type: "inputText", text: JSON.stringify(output) }] };
     } catch (error) {
       result = { success: false, contentItems: [{ type: "inputText", text: describeError(error) }] };
     }

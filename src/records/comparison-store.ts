@@ -1,7 +1,7 @@
 import { cpSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { z } from "zod";
-import { experienceRefSchema, experienceSourceSchema, recordIdSchema, workInputLimits, workInputSchema } from "./contracts.ts";
+import { experienceRefSchema, videoExperienceSourceSchema, recordIdSchema, workInputLimits, workInputSchema } from "./contracts.ts";
 import { atomicJson, readJson, valueHash } from "./files.ts";
 import { KnowledgeStore } from "./knowledge-store.ts";
 import type { ExperienceIndex } from "./knowledge-store.ts";
@@ -19,7 +19,7 @@ const recordedInputSchema = z.strictObject({
   kind: z.enum(["creation", "revision", "retrieval"]),
   change: z.string().trim().min(1).max(2_000),
   revisionRequest: z.string().trim().min(1).max(10_000).optional(),
-  base: experienceSourceSchema.optional(),
+  base: videoExperienceSourceSchema.optional(),
   knowledgeRefs: z.array(experienceRefSchema).max(100),
 }).refine(value => value.kind !== "revision" || Boolean(value.base && value.revisionRequest), "反馈修改比较须提供共同工程基线和同一修改要求。");
 // 新建时预留两侧名称标记，并校验拼接后的需求；历史记录仍按原格式读取。

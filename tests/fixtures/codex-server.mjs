@@ -89,6 +89,10 @@ export function run(mode = "completed", home, completionDelayMs = 1_000) {
     send({ id: request.id, result: { turn: { id: turnId, status: "inProgress" } } });
     if (mode === "disconnect") process.exit(0);
     const organizing = Boolean(request.params.outputSchema?.properties?.checkedSourceIds);
+    const authoring = Boolean(request.params.outputSchema?.properties?.markdown);
+    const inspecting = Boolean(request.params.outputSchema?.properties?.sufficient);
+    const inspectionInput = inspecting ? JSON.parse(readFileSync("input.json", "utf8")) : undefined;
+    const repairNeeded = mode === "quality_persistent" || (["quality_repair", "disconnect_quality"].includes(mode) && (inspectionInput?.internalRepair?.attempt ?? 0) === 0);
     const context = existsSync("context.md") ? readFileSync("context.md", "utf8") : "";
     const readList = pattern => { const match = context.match(pattern); return match ? JSON.parse(match[1]) : []; };
     const requested = readList(/本次需要处理的反馈编号：([^\n]+)/);
@@ -101,8 +105,18 @@ export function run(mode = "completed", home, completionDelayMs = 1_000) {
         notes: "合成协议测试的来源检查，不代表真实经验效果。",
         proposals: (mode === "learn_method" || mode === "partial_learning") && sourceIds.length ? [proposal(sourceIds)] : [],
       };
-      const needsInput = mode === "needs_input" || mode === "partial_input";
-      const result = organizing ? learning : {
+      const needsInput = ["needs_input", "partial_input", "disconnect_needs_input"].includes(mode);
+      const result = inspecting ? {
+        sufficient: mode !== "coverage_more", notes: "合成材料核对，不代表真实视频审查。", limitations: ["仅测试协议与材料流程。"],
+        ...(mode === "quality_repair" ? { sound: { status: "checked", notes: "模拟未经依据的听音声明", ranges: [] } } : {}),
+        additionalRanges: mode === "coverage_more" ? [{ startSeconds: 0.1, endSeconds: 0.8, fps: 10, reason: "合成请求：需要动作中间帧。" }] : [],
+        quality: { status: mode === "coverage_more" ? "not_checked" : mode === "quality_change" ? "needs_confirmation" : repairNeeded ? "needs_repair" : "passed",
+          issues: repairNeeded || mode === "quality_change" ? [{ description: "合成检查：角色部件在中间动作断开。", correction: mode === "quality_change" ? "需要确认是否改变角色构造设计。" : "保持采用设计，修复部件连接并复查动作。" }] : [] },
+      } : authoring ? {
+        status: needsInput ? "needs_input" : ["failed", "disconnect_failed"].includes(mode) ? "failed" : "completed",
+        markdown: needsInput || ["failed", "disconnect_failed"].includes(mode) ? "" : "# 合成视频设计\n\n角色递出道具，保持脚底支撑；静音测试素材。\n",
+        summary: "合成稿件结果。", blockers: needsInput ? ["请补充参考。"] : [],
+      } : organizing ? learning : {
         status: needsInput ? "needs_input" : mode === "failed" || mode === "partial_failed" ? "failed" : "completed",
         summary: needsInput ? "缺少参考素材，没有完成制作。" : "完成测试源码。",
         appliedFeedbackIds: mode === "partial_input" ? requested.slice(0, 1) : needsInput ? [] : requested,
@@ -110,7 +124,7 @@ export function run(mode = "completed", home, completionDelayMs = 1_000) {
         blockers: needsInput || mode === "false_completed" ? ["请提供参考素材。"] : [],
         usedExperienceRefs: used, learning,
       };
-      if (!organizing && ["completed", "completed_exit", "partial_input", "partial_failed", "learn_method", "use_experience", "read_feedback", "disconnect_after_result", "slow_completed", "slow_render"].includes(mode)) {
+      if (!organizing && !authoring && !inspecting && ["media_tools", "completed", "completed_exit", "partial_input", "partial_failed", "learn_method", "use_experience", "read_feedback", "disconnect_after_result", "slow_completed", "slow_render", "quality_repair", "quality_persistent", "quality_change", "disconnect_quality"].includes(mode)) {
         const source = existsSync("entry.tsx") ? readFileSync("entry.tsx", "utf8") :
           'import React from "react";import {Composition,registerRoot,AbsoluteFill} from "remotion";const Scene=()=> <AbsoluteFill style={{backgroundColor:"red"}}/>;registerRoot(()=> <Composition id="Video" component={Scene} durationInFrames={10} fps={10} width={160} height={90}/>);\n';
         writeFileSync("entry.tsx", source + (mode === "slow_render" ? '\nimport {delayRender,continueRender} from "remotion";const pending=delayRender("合成停止窗口");setTimeout(()=>continueRender(pending),3000);\n' : "") + "// 本次处理：" + JSON.stringify(result.appliedFeedbackIds) + "\n" +
@@ -128,11 +142,18 @@ export function run(mode = "completed", home, completionDelayMs = 1_000) {
         send({ method: "item/completed", params: { threadId: thread.id, turnId, item: answer } });
       }
       turn.status = "completed"; save();
-      if (mode === "disconnect_after_result") process.exit(0);
+      if (["disconnect_after_result", "disconnect_needs_input", "disconnect_failed"].includes(mode) || (mode === "disconnect_quality" && inspecting)) process.exit(0);
       send({ method: "turn/completed", params: { threadId: thread.id, turn: { id: turnId, status: "completed" } } });
       if (mode === "completed_exit") setImmediate(() => process.exit(0));
     };
-    if (["slow_completed", "interruptible", "ignore_interrupt"].includes(mode)) {
+    if (mode === "media_tools" && !organizing && !authoring && !inspecting) {
+      const args = { operationKey: "fixture-image", prompt: "合成测试图片", description: "合成内部制作素材" };
+      callTool(thread.id, turnId, "intentframe_generate_image", args, first => {
+        callTool(thread.id, turnId, "intentframe_generate_image", args, second => {
+          writeFileSync("media-tool-results.json", JSON.stringify({ first, second })); finish();
+        });
+      });
+    } else if (["slow_completed", "interruptible", "ignore_interrupt"].includes(mode)) {
       const timer = setTimeout(() => finish(), mode === "slow_completed" ? completionDelayMs : 30_000);
       runningTurns.set(turnId, { timer, thread, turn });
     } else if (mode === "read_feedback") {

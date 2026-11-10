@@ -7,6 +7,8 @@ import type { ExperienceRef, ExperienceSource } from "./contracts.ts";
 import { WorkStore } from "./work-store.ts";
 import type { WorkRecord } from "./work-store.ts";
 import { sourceFingerprint } from "./source-snapshot.ts";
+import { DocumentStore } from "./document-store.ts";
+import type { DocumentRef } from "./authoring-contracts.ts";
 
 export const experienceInputSchema = learningProposalSchema.omit({ sourceIds: true }).extend({
   status: z.enum(["candidate", "verified", "withdrawn"]),
@@ -39,13 +41,18 @@ export class KnowledgeStore {
   }
 
   validateSources(sources: ExperienceSource[], status = "candidate"): void {
+    if (status === "verified" && sources.every(source => "documentRef" in source)) throw new Error("仅有草稿或脚本依据的经验保持候选；画面效果验证须关联实际作品。");
     for (const source of sources) {
-      const store = this.sourceStore(source), work = store.read(source.workId), version = store.version(work, source.versionId);
-      if (!version.sourceSnapshot || sourceFingerprint(version.sourceSnapshot) !== source.sourceFingerprint) throw new Error("经验来源版本与工程依据不一致。");
-      store.verifySource(version);
-      if (source.feedbackIds.some(id => !work.feedback.some(feedback => feedback.id === id && feedback.versionId === source.versionId))) throw new Error("经验包含不属于来源版本的反馈。");
-      if (status === "verified" && (version.review.status !== "passed" || store.availability(version).status !== "available")) {
-        throw new Error("已验证经验须关联实际可用并已复查通过的作品版本。");
+      const store = this.sourceStore(source), work = store.read(source.workId);
+      if ("documentRef" in source) new DocumentStore(store).document(work, source.documentRef);
+      else {
+        const version = store.version(work, source.versionId);
+        if (!version.sourceSnapshot || sourceFingerprint(version.sourceSnapshot) !== source.sourceFingerprint) throw new Error("经验来源版本与工程依据不一致。");
+        store.verifySource(version);
+        if (source.feedbackIds.some(id => !work.feedback.some(feedback => feedback.id === id && feedback.versionId === source.versionId))) throw new Error("经验包含不属于来源版本的反馈。");
+        if (status === "verified" && (version.review.status !== "passed" || store.availability(version).status !== "available")) {
+          throw new Error("已验证经验须关联实际可用并已复查通过的作品版本。");
+        }
       }
       if (work.comparison) {
         const comparison = z.object({ state: z.enum(["open", "completed"])}).parse(readJson(store.resolvePath("comparisons/" + work.comparison.id + "/record.json")));
@@ -141,11 +148,16 @@ export class KnowledgeStore {
   }
 }
 
-export type LearningSource = { id: string; kind: "feedback" | "review" | "failure" | "comparison"; versionId?: string; content: unknown };
+export type LearningSource = { id: string; kind: "feedback" | "review" | "failure" | "comparison" | "document"; versionId?: string; documentRef?: DocumentRef; content: unknown };
 /** 按原记录身份增量核对；后续复查/错误变化会产生新来源，不能被旧进度掩盖。 */
 export function pendingLearningSources(work: WorkRecord, limit = 50, comparisonReview?: { id: string; content: unknown }) {
   const checked = new Set(work.learningBatches?.flatMap(batch => batch.checkedSourceIds) ?? []);
   const all: LearningSource[] = work.feedback.map(feedback => ({ id: "feedback:" + feedback.id, kind: "feedback", versionId: feedback.versionId, content: feedback }));
+  for (const document of [...work.authoring?.drafts ?? [], ...work.authoring?.designs ?? []]) {
+    if (document.basedOn) all.push({ id: "document:" + document.id + ":" + document.sha256, kind: "document",
+      documentRef: { id: document.id, sha256: document.sha256 }, content: document });
+  }
+  for (const decision of work.authoring?.decisions ?? []) all.push({ id: "design-review:" + decision.design.id + ":" + valueHash(decision), kind: "document", documentRef: decision.design, content: decision });
   for (const version of work.versions) {
     for (const review of version.reviews ?? (version.review.status === "not_reviewed" ? [] : [version.review])) {
       all.push({ id: "review:" + version.id + ":" + valueHash(review), kind: "review", versionId: version.id, content: review });

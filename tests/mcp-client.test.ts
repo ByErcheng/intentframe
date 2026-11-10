@@ -55,7 +55,8 @@ test("同一个真实 MCP 连接交错处理两种用途，换连接后仅凭任
     const testing = await call(first, prepared.name, prepared.arguments);
     const formal = await call(first, "create_work", { operationId: "formal-create", title: "正式字幕", brief: "正式用途也可以做样例。", purpose: "production" });
     const savedFormal = readFileSync(formal.taskPath, "utf8");
-    const accepted = await call(first, "produce_version", { operationId: "test-produce", workId: testing.id, kind: "sample" });
+    const draft = testing.authoring.drafts[0], base = { id: draft.id, sha256: draft.sha256 };
+    const accepted = await call(first, "revise_draft", { operationId: "test-produce", workId: testing.id, base, instruction: "合成：继续修改草稿。" });
     assert.equal(accepted.purpose, "test"); assert.equal(accepted.status, "accepted");
     let execution;
     for (let attempt = 0; attempt < 50; attempt++) {
@@ -64,7 +65,7 @@ test("同一个真实 MCP 连接交错处理两种用途，换连接后仅凭任
       await delay(80);
     }
     assert.equal(execution.status, "waiting_input");
-    assert.equal(execution.result.versions[0].production, "blocked");
+    assert.equal(execution.result.status, "needs_input");
     assert.equal(readFileSync(formal.taskPath, "utf8"), savedFormal);
     assert.equal((await call(first, "list_works", {})).works[0].id, formal.id);
     assert.equal((await call(first, "list_works", { purpose: "test" })).works[0].id, testing.id);
@@ -72,8 +73,9 @@ test("同一个真实 MCP 连接交错处理两种用途，换连接后仅凭任
     const next = await connect();
     assert.equal((await call(next, "get_work", { workId: testing.id })).purpose, "test");
     assert.deepEqual(await call(next, prepared.name, prepared.arguments), testing);
-    const updated = await call(next, "submit_feedback", { operationId: "test-feedback", workId: testing.id, versionId: "v001", source: "user", text: "后续修改仍属于这次测试。" });
-    assert.equal(updated.feedback.length, 1); assert.equal(updated.storagePurpose, "test");
+    const updated = await call(next, "submit_draft", { operationId: "test-feedback", workId: testing.id,
+      basedOn: base, markdown: "后续修改仍属于这次测试。", instruction: "合成用户补充。" });
+    assert.equal(updated.id, "d002"); assert(updated.location.includes("/testing/works/"));
     assert.equal((await call(next, "get_operation", { operationId: "test-produce" })).purpose, "test");
     assert.equal((await call(next, "get_work", { workId: formal.id })).purpose, "production");
     assert.equal(readFileSync(formal.taskPath, "utf8"), savedFormal);

@@ -6,6 +6,23 @@ import { WorkStore } from "../src/records/work-store.ts";
 import type { WorkVersion } from "../src/records/work-store.ts";
 import { captureSourceSnapshot, fileHash, verifySourceSnapshot } from "../src/records/source-snapshot.ts";
 import type { renderVersion } from "../src/media/render.ts";
+import { DocumentStore } from "../src/records/document-store.ts";
+
+/** 合成已交接、已采用设计，供非模型设计能力测试复用；真实接入另测完整交接。 */
+export async function adoptedDesign(store: WorkStore, workId: string, markdown = "# 合成设计\n显示测试色块，检查交接。\n") {
+  const documents = new DocumentStore(store), record = store.read(workId);
+  if (!record.authoring) documents.initialize(record, "合成草稿，只验证系统行为。", "fixture-draft");
+  const draft = store.read(workId).authoring!.drafts.at(-1)!;
+  await documents.handoff(workId, draft, "合成用户指令：按本稿开始设计。", "fixture-handoff");
+  const current = store.read(workId);
+  const design = documents.append(current, "design", markdown, {
+    operationId: "fixture-design", source: "project_ai", instruction: "合成设计夹具。", assetIds: [], draft,
+  });
+  store.save(current);
+  const ref = { id: design.id, sha256: design.sha256 };
+  await documents.decide(workId, { operationId: "fixture-decision", design: ref, status: "adopted", source: "external_ai", notes: "合成采用，不代表真实用户评价。" });
+  return ref;
+}
 
 export function fixtureRoot() {
   const path = mkdtempSync(join(realpathSync(tmpdir()), "intentframe-test-"));

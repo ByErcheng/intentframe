@@ -38,15 +38,29 @@ export function atomicJson(path: string, value: unknown): void {
 }
 
 export function immutableJson(path: string, value: unknown): void {
-  const text = jsonText(value);
+  immutableText(path, jsonText(value));
+}
+
+/** 原文逐字保存；发布后的正文不原地修改。 */
+export function immutableText(path: string, text: string): void {
+  immutableBytes(path, Buffer.from(text, "utf8"));
+}
+
+/** 大小已在调用边界核对的文件字节，完整落盘后才发布正式名称。 */
+export function immutableBytes(path: string, bytes: Buffer): void {
   mkdirSync(dirname(path), { recursive: true });
   const temporary = path + "." + randomUUID() + ".tmp";
   const fd = openSync(temporary, "wx", 0o600);
   try {
-    writeFileSync(fd, text); fsyncSync(fd);
+    writeFileSync(fd, bytes); fsyncSync(fd);
     // 完整写入后才让正式名称可见；硬链接不会覆盖并发保存的已有回执。
     try { linkSync(temporary, path); }
-    catch (error) { if (!existsSync(path) || recordText(path) !== text) throw error; }
+    catch (error) {
+      if (!existsSync(path)) throw error;
+      const existing = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+      try { if (!fstatSync(existing).isFile() || !readFileSync(existing).equals(bytes)) throw error; }
+      finally { closeSync(existing); }
+    }
   } finally { closeSync(fd); rmSync(temporary, { force: true }); }
 }
 

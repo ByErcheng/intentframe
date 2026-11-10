@@ -13,8 +13,8 @@ MCP 连接时提供阅读指引；调用 `read_usage_guide` 即可取得本页�
 - 常用制作交接按本页[固定请求模板](#固定请求模板)填写，使用当前工具支持的字段；将用户原话与执行解释区分，不凭自由文本另造请求格式。工具定义或模板与实际能力不一致时先核对，不能猜测字段继续发送。
 - 首次提交本轮需求或反馈前，使用下方[发送前任务展示模板](#发送前任务展示模板)向用户展示实际任务。展示与自动发送的边界按[请求准备与内容确认](../docs/workflow.md#请求准备与内容确认)执行；实质改参时更新说明，取得回执后及时告知保存或受理结果。参数返回给 AI 不等于已向用户展示。
 - 使用项目工具交接制作要求，由项目主 AI 制作与修改。先查已有任务和反馈，再决定新建还是接续；以原始需求、仍有效的反馈及已保存状态为依据，不能只靠当前聊天记忆。
-- 先交付代表性样例并取得适用的方向确认，再展开完整制作。制作完成、审查结果和用户认可分别说明；只有实际取得并检查过的内容才能记为已审查，记录确认时保留用户原话与明确版本。
-- 制作、渲染、经验整理和恢复工具受理后返回执行编号，由本机工作进程继续处理；随后按编号查询。已受理不等于已经完成；断线或超时后沿原编号核对，结果未知时保留保护。
+- 新任务先保存外部准备的 Markdown 草稿，用户明确交接后设计，外部 AI 实际读取稿件及附件后记录采用，再制作代码。AI 采用设计不表示用户认可成片；旧任务保留原样例确认规则。
+- 稿件生成、素材导入/生成、制作、材料准备、渲染、经验整理和恢复工具受理后返回执行编号，由本机工作进程继续处理；随后按编号查询。已受理不等于已经完成；断线或超时后沿原编号核对，结果未知时保留保护。
 - 交付时返回真实文件入口、任务与版本、完成范围和未解决事项。面向用户解释创作结果与需要决定的问题；技术细节仅在排查或影响决定时展开。不能实际观看视频时，明确审查范围。
 
 以下各节供准备参数和处理对应情况时查阅。MCP 已连接时直接使用其工具；需要命令行调用时，先完成[本机配置](../config/README.md)，并在仓库根目录执行。示例中的 JSON 文件位置须替换为任务实际路径，真实需求与请求保存在本机数据目录。CLI 与 MCP 共用业务实现。
@@ -26,7 +26,7 @@ MCP 连接时提供阅读指引；调用 `read_usage_guide` 即可取得本页�
 ```text
 本轮任务：<作品名称与本轮目标>
 用途：<测试 / 正式，必须明确填写其中一个>
-本轮阶段：<样例制作 / 完整制作 / 仅保存需求或反馈，按实际操作填写>
+本轮阶段：<草稿保存或修订 / 设计 / 素材准备 / 样例或完整制作 / 材料准备 / 反馈，按实际操作填写>
 修改基线：<版本与方向；首次制作写“首次制作，无基线”>
 你的要求：<准确保留用户本轮要求，不混入 AI 自行决定的内容>
 我的执行解释：<具体做法及由 AI 自行作出的选择；无额外解释则写“无”>
@@ -41,19 +41,23 @@ MCP 连接时提供阅读指引；调用 `read_usage_guide` 即可取得本页�
 
 ## 一次制作的调用顺序
 
-先按下表判断现在处于哪一步；继续已有作品时，从实际状态接续。表中写操作均须先按[请求准备与重试](#请求准备与重试)准备和保存请求，只读查询不需要准备操作编号。
+外部 AI 负责沟通、调用与审查，项目负责设计、制作、文件落盘及检查材料准备。用户可在任何客户端整理草稿；发送给项目的内容必须保存。写操作均先准备稳定 operationId，耗时操作受理后用 get_execution 查询。
 
-| 步骤 | 调用与必要输入 | 取得什么后继续 |
+| 阶段 | 调用 | 继续条件 |
 | --- | --- | --- |
-| 了解入口 | `read_usage_guide`，然后 `get_runtime_info` | 确认当前使用约定和数据区域；连接或访问异常先处理，不能猜测目标 |
-| 找到或创建作品 | 已有作品用 `list_works`、`get_work`；新作品用 `create_work`，明确标题、需求与 `purpose` | 保存真实 `workId`；创建成功只表示需求已保存 |
-| 准备本轮制作 | 已有版本先核对[基线与反馈范围](#制作前核对基线与反馈)；有新意见先 `submit_feedback` 并取得实际反馈编号 | 确定本轮范围、实际基线及本轮要处理的反馈；尚无历史版本才使用首次样例模板 |
-| 试做或修改样例 | 按对应模板调用 `produce_version`，`kind:"sample"` | 保存受理回执中的 `executionId`，不能把受理当作制作完成 |
-| 等待和检查 | `get_execution` 查询原执行；结束后 `get_work` 核对实际版本与文件，实际审查后用 `record_review` 保存范围与结论 | 缺输入就补齐，明确错误按[纠正说明](#请求错误与纠正)处理，未知先核对；取得可用样例后交用户判断方向 |
-| 确认方向并完整制作 | 用户真实确认后用 `confirm_version` 记录；已有适用确认直接沿用。核对[完整制作条件](#完整制作)后提交 `kind:"complete"` | 方向确认必须对应本次基线；反馈范围能够准确表达才发送制作请求，之后仍按原执行编号查询 |
-| 交付和继续修改 | 核对本机文件后返回路径、版本、完成及检查范围；用户有新反馈时沿原作品接续 | 用户认可完整成片后才记录 `kind:"acceptance"`；认可不等于发布授权 |
+| 查入口与任务 | read_usage_guide、get_runtime_info、list_works/get_work | 核准用途与已有任务；不得猜路径 |
+| 保存草稿 | create_work 的 brief 保存为首版原文和 d001；后续 submit_draft 提交完整 Markdown | 只保存，不自动开始设计 |
+| 按意见改稿 | revise_draft 交给项目 AI，或 submit_draft 保存外部改好的正文；都指定基线 | 返回新稿供用户与外部 AI 讨论，旧稿保留 |
+| 用户交接 | handoff_draft，填写用户明确开始设计的原话与草稿引用 | 草稿的默认保存或一般好评不代替交接 |
+| 项目设计 | design_video，基线为已交接草稿或其设计稿 | 只形成脚本，不生成视频源码 |
+| 外部审查设计 | read_document 读正文与附件，review_design 记录 adopted 或 needs_changes | 范围内 AI 可采用；关键用户意图缺口才回问 |
+| 准备素材 | import_asset、generate_image、read_speech_text/synthesize_speech | 保存真实文件与来源；未配置服务不假装生成成功 |
+| 代码制作 | produce_version，明确 designRef、assetIds、基线与反馈 | 样例/完整制作都按本轮采用脚本；主 AI 可在已定范围内自主实现 |
+| 项目准备材料 | 新流程制作后自动抽帧与覆盖核对；必要时 prepare_review_materials | 项目保存帧图、拼图、时间索引、混音及补帧批次 |
+| 外部审查 | get_review_materials，实际读取后 record_review | 关联实际用到的 materialIndexes，不能用材料可用代替审查通过 |
+| 修改与交付 | 按原任务提交反馈、更新必要设计并制作新版本；返回实际文件 | 用户对完整成片明确认可后才记录 acceptance；发布授权另行处理 |
 
-已有完整版本的同方向常规修改，可以沿适用的方向确认继续提交 `kind:"complete"`；不因新反馈而一律退回样例或重复确认。关键方向改变时才重新试做并确认。
+有 authoring 的任务使用新流程。没有 authoring 的历史任务沿原样例与确认规则接续，不批量补造稿件；提交草稿可显式启用新流程。现有比较入口保留旧的一次首稿比较方式；测试新交接流程请创建独立 test 任务，不把旧比较入口当作已验证的新流程效果比较。
 
 ## 交接内容与进度说明
 
@@ -136,6 +140,8 @@ CLI 的 `prepare` 生成操作编号并将完整调用参数保存到指定文�
 
 ## 制作前核对基线与反馈
 
+新流程另须先读取并核对 designRef 对应的采用脚本。设计与工程基线是不同引用，素材来自稿件附件和本次显式选择；用户重新交接草稿或新增方向变更意见后须重新核对设计采用。
+
 本节适用于 `produce_version` 的样例、修改和完整制作。**反馈指向哪个版本、从哪个工程继续、这轮处理哪些反馈，是三个不同选择。**
 
 | 请求内容 | 当前实际行为 |
@@ -163,7 +169,92 @@ CLI 的 `prepare` 生成操作编号并将完整调用参数保存到指定文�
 | 按该方向全部有效的待处理意见继续 | 可以省略两个反馈参数，核对受理结果中的实际选择；希望完全控制范围时仍应显式列出 |
 | 无法可靠确定基线、继承关系或适用范围 | 继续查询或澄清关键选择，不能把不确定当作空集合 |
 
-**两种方向的例子**：`v001` 是已确认的 A，以它为基线用 `newDirection:true` 制作 `v002` 作为 B，保留 A 的确认。用户选回 A 且不需处理新反馈时，完整制作明确传 `baseVersionId:"v001"`、真实 `baseReason` 和 `feedbackIds:[]`。已记录的新方向不会改变 A 的默认选择，已完成的 B 创建要求也不会自动再执行。旧数据缺少方向标记时同样可以显式选择有依据的 A 与空集合，不批量猜测历史方向。设计依据见[方向与反馈的适用范围](../docs/data.md#方向与反馈的适用范围)。
+**旧任务两种方向的例子**：`v001` 是已确认的 A，以它为基线用 `newDirection:true` 制作 `v002` 作为 B，保留 A 的确认。用户选回 A 且不需处理新反馈时，完整制作明确传 `baseVersionId:"v001"`、真实 `baseReason` 和 `feedbackIds:[]`。已记录的新方向不会改变 A 的默认选择，已完成的 B 创建要求也不会自动再执行。旧数据缺少方向标记时同样可以显式选择有依据的 A 与空集合，不批量猜测历史方向。设计依据见[方向与反馈的适用范围](../docs/data.md#方向与反馈的适用范围)。
+
+## 草稿与设计调用
+
+create_work 只接收正文，不要求用户先在本机建立文件。read_document 参数为 workId 和 ref（id、sha256），返回正文、本机位置、附件与来源。sha256 来自工具回执，覆盖正文和实际附件，不自行计算或从文件名猜测。
+
+| 工具 | 关键参数与含义 |
+| --- | --- |
+| submit_draft | workId、markdown、instruction；已有草稿必须 basedOn 最新引用。assetIds 省略继承基线附件，[] 明确不采用附件 |
+| revise_draft | workId、base、instruction，可选 assetIds；项目模型只改稿，结束后返回新正文 |
+| handoff_draft | workId、draft、userInstruction；仅转录用户明确交接原话 |
+| design_video | workId、base、instruction，可选 assetIds；base 可为交接草稿或该草稿的设计版本 |
+| review_design | workId、design、status（adopted/needs_changes）、source（external_ai/user）、notes；须先实际读过内容 |
+
+三个稿件工具的 assetIds 都表示本轮完整附件选择，省略继承，空数组清空；最多 20 个。附图来源与用途由素材的 description 和 origin 表达。项目只把图像附件送入模型视觉输入，音轨仍通过原文件与元数据说明，不虚构听音结果。
+
+例如，以下对象交给 prepare_operation，编号与摘要替换为真实回执值：
+
+```json
+{
+  "name": "design_video",
+  "arguments": {
+    "workId": "work-example",
+    "base": {"id": "d001", "sha256": "<回执中的草稿摘要>"},
+    "instruction": "根据用户交接的内容设计画面、动作、文字和声音。"
+  }
+}
+```
+
+本次结果返回 document 后读取并审查，再以相同引用调用 review_design。needs_input/failed 留下的草稿可查阅，但未完成设计不能标为 adopted。新稿未交接不改变旧制作依据；重新交接后，原设计须更新后才能用于新制作。
+
+## 图片配音与本机音乐
+
+普通视频制作中，设计采用后由项目 AI 在任务内完成素材与配音决策，外部 AI 传达要求、审查结果。下面的独立生成入口继续用于用户明确要求的素材任务和诊断，不要求外部 AI 逐项准备后再交制作。
+
+`search_assets` 按 query、role、offset/limit 检索配置目录及所选 purpose 区域的既有作品素材。候选携带 source 引用、用途和使用状态；名称检索不证明内容合适。项目内工具按明确 source 检查并复用，复制原字节并保存来源，旧版本不变。
+
+项目制作 AI 在现有 Agent 中获得以下动态工具，属于当前制作的内部操作，不创建另一轮外部制作任务：
+
+| 工具 | 作用 |
+| --- | --- |
+| intentframe_media_capabilities | 查看本轮生成配置、素材库和实际检查边界 |
+| intentframe_search_assets / intentframe_inspect_asset | 检索候选、查看真实图片、核对音频信息；prepareAudioPreview=true 保存试听片段供用户播放，不向模型传音频 |
+| intentframe_reuse_asset | 校验所选来源并复制进作品和当前工程 |
+| intentframe_generate_image / intentframe_synthesize_speech | 内部生成图片或精确脚本台词，记录父任务身份和独立请求；图片可指定 background 为 transparent |
+| intentframe_download_image | 保存原生网上搜索找到的公开图片及来源页面、使用说明 |
+| intentframe_set_audio_playback | 保存全量声音播放安排及命名事件，生成工程可直接引用的播放组件和时间数据 |
+| intentframe_preview_video | 渲染当前源码快照的全片或 frameRange 指定范围并返回实际图片；预览不是最终成片 |
+
+设计阶段仅开放前三项只读能力（能力查询、检索、检查）及原生搜索。内部写工具使用稳定 operationKey，相同编号不能换输入；结果未知不能换编号重发。项目保持父制作状态，工具写操作当前串行。生成、导入和预览都保存本机证据，任务结束后仍可读取。
+
+声音编排的每个 clip 指定 id、assetId、startMs，可选 trimStartMs/trimEndMs、playbackRate、volume、fadeInMs/fadeOutMs 和 cues。cue 给出 name、quote、edge（start/end），重复文本还须指定 occurrence。只取供应商提供的字词边界，不能在词内插值或按字数均分。工程导入工具返回的 `ProjectAudio`、`playback`、`cueFrame`；字幕读取同一数据，事件名为“clip.id.cue.name”。修改配音后重新调用工具，保留旧音轨与历史编排记录。生成文件不可手改，时序索引是派生依据而非对成片重新转写。
+
+本机文件通过 import_asset 提交绝对路径，指定 role 为 reference/image/narration/music 及 description，可关联 document。项目复制并验证，不移动或覆盖原文件。get_asset 按素材编号取得固定本机位置和媒体元信息。
+
+GPT 图片通过 generate_image 调用项目 API 适配，必须传 workId、document、prompt、description；referenceAssetIds 可选已有图像，用于参考编辑。只有配置就绪后实际调用，当前每次生成一张图。生成图需作为设计依据时，用 design_video 形成引用该素材的新脚本，再审查采用；不会偷偷替换已采用脚本的附件。
+
+人声文本在脚本中这样标识（以下为格式示意）：
+
+```speech:line1
+实际要朗读的原文。
+```
+
+声音语气、表演动作和制作指令写在围栏外，关联适用的片段编号。read_speech_text(workId, design) 返回准确片段；synthesize_speech 必须给出已采用脚本 document、明确的 segmentIds、description，可选 speechRate 和 voiceInstruction。项目只提交所选原文，保存音轨、声音指令和字词时间。用户自录音通过 import_asset 的 narration 导入。
+
+`voiceInstruction` 是独立的自然语言声音要求，项目限制为 1–2000 字符；调用方 AI 依据已采用脚本填写，例如“轻声、温柔，开头带一点犹豫，最后真诚坚定”。`description` 只说明素材用途，不能代替此字段。指令作用于本次合成的全部片段；要求不同的片段须分开调用。项目将指令放入豆包 `req_params.additions` 的 `context_texts`，按接口要求将 additions 序列化为 JSON 字符串，台词不混入指令或标签。未提供指令时保持普通配音；空白指令或不支持的模型在发送前拒绝，不登记生成请求，也不静默换模型。
+
+当前支持声音复刻 2.0 的表现力增强模型，以及语音合成 2.0 公版音色；复刻音色须同时配置 `resourceId: "seed-icl-2.0"` 与 `model: "seed-tts-2.0-expressive"`。模型名不能填到 resourceId。这里只接入自然语言声音指令，未接入局部语音标签；指令被发送、服务返回音频和声音听感符合要求是不同的验证结果。
+
+背景音乐使用用户提供或指定的本机文件，以 music 导入。本轮明确的素材用 assetIds 传给 produce_version，脚本附件也会加入制作输入。代码只引用工程内的 public/assets 副本，不引用外部原路径。实际声音仍须由具备听音能力的外部 AI 或用户检查。
+
+服务未配置时 get_runtime_info.mediaServices 返回 false，生成工具明确拒绝；不为了让流程继续而伪造图片/音轨。接入条件和权限见[本机生成服务配置](../config/README.md#图片与豆包语音)。
+
+## 项目准备与外部审查
+
+新流程先看制作结果的 delivery。status=ready_for_external_review 时，versionId 和 videoLocation 指向已通过项目内检的本次交付；内部修复可能让最终版本号不同于首次生成版本。not_ready 时说明未解决问题，不能把历史诊断版本当作合格结果交用户。
+
+get_review_materials(workId, versionId) 返回实际视频位置、采用脚本、批次 indexRef/indexLocation、帧图和拼图的 location、原视频时间、混音位置、项目检查记录及 readyForExternalReview。外部 AI 应实际读取交付版本的材料独立审查，不以项目通过代替自己的判断，也不在外部临时目录自行抽帧。
+
+支持图像工具结果的客户端可直接调用 read_media_image：素材使用 source={kind:"asset",assetId}；审查帧或拼图使用 source={kind:"review",versionId,indexRef,imagePath}，imagePath 取索引里的 path。工具返回 MCP 图像内容和来源说明，文件仍由项目保存；单图消息上限 8 MiB。CLI 文本客户端只打印来源元信息，实际查看须由能接收图像的外部 AI 客户端完成。声音仍通过实际音轨文件交给具有听音能力的客户端。
+
+prepare_review_materials 是后台工具。外部 AI 发现材料不足时，先按版本保存问题，再调用该工具；不传 ranges 时，由项目 AI 结合脚本、材料和已有反馈判断补充范围。明确需要定位时也可传 ranges：startSeconds、endSeconds、fps、reason；项目保存新批次并检查。新流程若发现明确实现问题，会自动修复并复查，因此须使用返回的 versionId 和 delivery 接续审查；requestedVersionId 保留起始版本。轮数上限与覆盖限制见[项目回看规则](../docs/workflow.md#主-ai-回看与修正)。
+
+新流程 record_review 须包含 materialIndexes，值使用实际读取批次的 indexRef（数据根目录内相对路径）；notes 说明查看过哪些材料、问题位置、连续播放与听音是否完成。status=passed 只在声明的检查范围内成立；用户认可另存。文件缺失或变化时不能继续登记为原材料的审查。
+
+available 只表示材料覆盖充分，还须检查 quality 与 readyForExternalReview；needs_attention 表示材料仍有疑问。项目内检的 quality.status 区分 passed、needs_repair、needs_confirmation、not_checked；已知问题会内部修复或返回具体阻塞。后台 waiting_input 可能表示待确认或修复达到上限，不能当作完成。failed/unknown 沿原执行核对恢复。旧任务未启用设计流程时，legacy_unchecked 不代表内检通过。
 
 ## 固定请求模板
 
@@ -179,7 +270,7 @@ CLI 的 `prepare` 生成操作编号并将完整调用参数保存到指定文�
 
 ### 创建作品
 
-创建任务只保存需求，不开始制作。根据用户明确用途选择 `test` 或 `production`；下例的 `test` 仅为示例。需求正文按同一文字结构说明原话、执行要求、保留内容和未定事项，真实没有的事项写明“无”，不编造内容。
+创建任务保存原始需求及首版 Markdown 草稿，不开始设计或制作。根据用户明确用途选择 `test` 或 `production`；下例的 `test` 仅为示例。需求正文按同一文字结构说明原话、执行要求、保留内容和未定事项，真实没有的事项写明“无”，不编造内容。
 
 ```json
 {
@@ -204,6 +295,8 @@ CLI 的 `prepare` 生成操作编号并将完整调用参数保存到指定文�
   "arguments": {
     "workId": "work-example",
     "kind": "sample",
+    "designRef": {"id": "s001", "sha256": "<实际采用脚本摘要>"},
+    "assetIds": [],
     "feedbackIds": [],
     "threadMode": "fresh"
   }
@@ -241,6 +334,8 @@ CLI 的 `prepare` 生成操作编号并将完整调用参数保存到指定文�
   "arguments": {
     "workId": "work-example",
     "kind": "sample",
+    "designRef": {"id": "s001", "sha256": "<实际采用脚本摘要>"},
+    "assetIds": [],
     "feedbackIds": ["feedback-example"],
     "threadMode": "fresh",
     "baseVersionId": "v001",
@@ -253,7 +348,7 @@ CLI 的 `prepare` 生成操作编号并将完整调用参数保存到指定文�
 
 ### 创建备选方向
 
-先把“新增备选”的真实要求保存为反馈；如果原方向仍有效，不将它标为撤销原方向。下例从 A 的工程创建另一方向样例，保留 A 的源码与确认，明确指定创建备选的反馈。新方向完成后仍须用户确认，才能依它完整制作。
+先把“新增备选”的真实要求保存为反馈；如果原方向仍有效，不将它标为撤销原方向。下例从 A 的工程创建另一方向样例，保留 A 的源码与确认，明确指定创建备选的反馈。新流程先审查采用新方向脚本；历史任务仍须用户确认对应样例后才能完整制作。
 
 ```json
 {
@@ -261,6 +356,8 @@ CLI 的 `prepare` 生成操作编号并将完整调用参数保存到指定文�
   "arguments": {
     "workId": "work-example",
     "kind": "sample",
+    "designRef": {"id": "s001", "sha256": "<实际采用脚本摘要>"},
+    "assetIds": [],
     "baseVersionId": "v001",
     "baseReason": "以已核对的 A 工程探索另一方向，原方向与历史结果保留。",
     "feedbackIds": ["feedback-example"],
@@ -289,13 +386,7 @@ CLI 的 `prepare` 生成操作编号并将完整调用参数保存到指定文�
 
 ### 完整制作
 
-使用本节前，须确认以下条件：
-
-- 用户已真实确认明确样例及范围，实际基线为该样例或延续它的工程，内容仍符合确认范围；`baseReason` 不能代替方向确认。
-- 原操作已经核清，工程和必要版本记录可用，本轮完整制作的目标与未定事项明确。
-- 已按[制作前核对基线与反馈](#制作前核对基线与反馈)核对程序实际会选入的反馈，并确认当前接口能够准确表达本轮范围。
-
-**下例明确使用空集合，表示本轮不处理反馈。** 要处理意见时，将 `feedbackIds` 改为对应的实际编号数组，不能在已有数组时再添加 `feedbackId`。基线、确认与反馈含义无法核实时先澄清，不用模板试发。
+新流程须有用户草稿交接和已采用设计，明确传入 designRef；不把 AI 采用记为用户成片认可。旧任务必须已有用户对明确样例方向的确认，且基线延续该方向。未处理反馈明确传 []；关键方向变化先更新适用设计或旧任务样例。
 
 ```json
 {
@@ -303,6 +394,8 @@ CLI 的 `prepare` 生成操作编号并将完整调用参数保存到指定文�
   "arguments": {
     "workId": "work-example",
     "kind": "complete",
+    "designRef": {"id": "s001", "sha256": "<实际采用脚本摘要>"},
+    "assetIds": [],
     "feedbackIds": [],
     "threadMode": "fresh",
     "baseVersionId": "v001",
@@ -319,6 +412,7 @@ CLI 的 `prepare` 生成操作编号并将完整调用参数保存到指定文�
 {
   "name": "record_review",
   "arguments": {
+    "materialIndexes": ["<实际检查批次的 indexRef>"],
     "workId": "work-example",
     "versionId": "v001",
     "status": "needs_changes",
@@ -344,6 +438,8 @@ CLI 的 `prepare` 生成操作编号并将完整调用参数保存到指定文�
 
 ## 后台执行、查询与停止
 
+后台工具包括 revise_draft、design_video、import_asset、generate_image、synthesize_speech、prepare_review_materials，以及原有制作、渲染、整理和恢复。新稿件结果查看 result.document；素材结果查看本机 location；材料结果查看 batches。不要对所有结果都假定存在视频版本。
+
 `produce_version`、`render_version`、`organize_experience`、`recover_work` 返回 `status:"accepted"` 和 `executionId`。执行编号沿用本次操作编号；受理、实际执行和作品状态分别记录。其他工具仍在本次调用内返回结果。重放旧的同步操作时沿用其原回执，不补造后台编号。
 
 使用 `get_execution` 查询 `executionId`，按返回的 `pollAfterMs` 安排后续查询，不以不断重发制作代替等待。查询反映实际阶段与结果；进程存在不证明工作正在推进，也不构成完成依据。
@@ -367,9 +463,9 @@ CLI 的 `prepare` 生成操作编号并将完整调用参数保存到指定文�
 
 准备 `produce_version` 请求时提供 `workId` 和 `kind`（`sample` 或 `complete`），基线与反馈参数按[制作前核对基线与反馈](#制作前核对基线与反馈)选择。`threadMode` 默认为新会话，也可使用 `resume` 接续原生线程；两者都要读取当前任务事实，`resume` 还须有该基线的原生线程。调用会使用现有模型额度。
 
-`purpose` 是任务用途，`kind` 是制作阶段。正式任务也可以先做 `sample`，测试任务也不能绕过完整制作所需的方向确认。
+`purpose` 是任务用途，`kind` 是制作阶段。正式任务也可以先做 `sample`；测试任务同样须满足适用的草稿交接和设计采用条件，旧任务仍须方向确认。
 
-完整制作仍要求用户真实的样例方向确认。`confirm_version` 只转录用户对明确版本的确认原话，不能把样例确认、AI 自检或测试目的当作成片认可。审查用 `record_review` 单独记录观看范围、问题与来源；文件存在不证明审查通过。
+新流程完整制作依据明确的已采用设计，旧任务仍要求用户真实的样例方向确认。`confirm_version` 只转录用户对明确版本的确认原话，不能把设计采用、样例确认、AI 自检或测试目的当作成片认可。审查用 `record_review` 单独记录观看范围、问题与来源；文件存在不证明审查通过。
 
 整片反馈用 `submit_feedback` 保存 `workId`、`versionId`、`text` 和 `source`，无需位置。局部反馈可附：
 
@@ -390,7 +486,9 @@ CLI 的 `prepare` 生成操作编号并将完整调用参数保存到指定文�
 
 ## 原调用恢复
 
-新建 `recover_work` 请求，提供原 `workId`，受理后通过 `get_execution` 查询恢复结果；默认可以继续已核实完成工程的渲染，`render:false` 只核对及补存。该操作不发送新制作。原工作进程仍运行或身份无法核对时拒绝另行恢复；原进程退出也须核对原生调用及工程证据。重复核对不创建新版本，新的核对动作与原请求重试须区分。
+recover_work 也核对草稿/设计和素材的原执行。稿件沿原只读线程与输入补存正文，不重发模型；素材只有本机保存了可校验原字节时才能补登记，没有输出且服务结果仍不明时保持 unknown，明确拒绝保留 failed。恢复后查询原 executionId 可取得实际完成、待输入或失败结果；原受理回执、失联记录及已存在的首次返回计时继续保留。核对原恢复结果后再继续，不能改编号重做可能已收费的请求。
+
+新建 `recover_work` 请求，提供原 `workId`，受理后通过 `get_execution` 查询恢复结果；默认可以继续已核实完成工程的渲染、项目内检及尚未开始的必要修复，`render:false` 只核对及补存。原工作进程仍运行或身份无法核对时拒绝另行恢复；原进程退出也须核对原生调用及工程证据。不会重发未知原调用；已核回内检结论且仍需修复时，会沿原操作继续创建修正版，不重置修复轮数。单纯补存不创建新版本。
 
 | 恢复结果中的情况 | 后续动作 |
 | --- | --- |
@@ -403,6 +501,8 @@ CLI 的 `prepare` 生成操作编号并将完整调用参数保存到指定文�
 `render_version` 用于已有完成工程的产物恢复，不调用模型；须先解决未知执行或未完成草稿。它也会识别预览缺口，仅缺预览时从原视频抽帧；补图失败可沿原编号核对，`recover_work` 的 `render:false` 只检查、不补图。补存成功且视频就绪后，后台制作的执行记录补充恢复结果，原停止或未知记录仍保留，原受理回执保持不变；旧同步操作仍按原规则补齐回执。其他本地写操作若在回执保存前中断，须按原编号和现场核对，不自动重放。
 
 ## 经验整理与查阅
+
+草稿修改、设计修订和设计审查也会进入待整理来源。organize_experience 可在尚无视频时整理稿件候选，保存经验的来源可使用 kind:document、purpose、workId、documentRef。仅有稿件来源不能宣称画面效果已验证；评价保留新旧正文、修改指令与采用依据。
 
 1. `learning_status` 返回本任务待整理的原始来源、剩余数量、已保存批次及保存错误。来源较多时先处理当前批次，再重新查询；原文未检查的部分保持待处理。
 2. `organize_experience` 受理后由现有项目主 AI 只读分析当前批次，用 `get_execution` 取得结果，会使用模型额度；存在待保存结果时先接续保存，不再调用模型。没有可推广发现时允许没有候选。

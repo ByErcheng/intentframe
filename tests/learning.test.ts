@@ -133,7 +133,9 @@ test("经验保存中断保留原批次，接续不再调用模型且不重复�
     assert.equal(service.learning.pending(recovered).pendingCount, 0);
     await service.organize(work.id); assert.equal(turnCount(root.path), 1);
     const record = knowledge.read(recovered.learningBatches![0]!.experienceRefs[0]!);
-    assert.equal(record.status, "candidate"); assert.equal(record.sources[0]!.feedbackIds.length, 1);
+    assert.equal(record.status, "candidate");
+    const source = record.sources[0]!;
+    assert("feedbackIds" in source); assert.equal(source.feedbackIds.length, 1);
     await store.feedback(work.id, "v001", "这次试验使用蓝色，不是长期偏好", "system_test");
     const unchanged = await new WorkService(store, { knowledge, codexExecutable: fakeCodex(root.path) }).organize(work.id);
     assert.equal(knowledge.latest().length, 1, "允许检查后没有可复用发现");

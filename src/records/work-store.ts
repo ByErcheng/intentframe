@@ -13,6 +13,10 @@ import type { FeedbackLocation, WorkPurpose } from "./contracts.ts";
 import { processExists } from "../runtime/process-state.ts";
 import { activeExecution, assertExecutionAccess, ExecutionStore, withExecutionDispatch } from "./execution-store.ts";
 import { inspectPreviews } from "../media/previews.ts";
+import { authoringSchema, documentRefSchema } from "./authoring-contracts.ts";
+import { assetSchema, reviewPreparationSchema, internalReviewPassed } from "./media-contracts.ts";
+import { readReviewBatch } from "../media/review-materials.ts";
+import { dirname } from "node:path";
 
 const idSchema = z.string().regex(/^[a-z0-9][a-z0-9-]{0,79}$/);
 const versionIdSchema = z.string().regex(/^v\d{3,}$/);
@@ -31,6 +35,7 @@ const reviewSchema = z.object({
   notes: z.string().optional(),
   source: z.enum(["user", "external_ai", "internal_check"]).optional(),
   checkedAt: z.string().optional(),
+  materialIndexes: z.array(z.string()).optional(),
 });
 const confirmationSchema = z.object({
   versionId: versionIdSchema, kind: z.enum(["direction", "acceptance"]),
@@ -55,6 +60,13 @@ export const versionSchema = z.object({
   acceptance: z.enum(["pending", "accepted"]),
   userConfirmation: z.string().optional(), error: z.string().optional(),
   operationId: z.string().optional(), contextSha256: z.string().optional(),
+  designRef: documentRefSchema.optional(), designDecisionId: z.string().optional(),
+  assets: z.array(assetSchema).optional(), reviewPreparation: reviewPreparationSchema.optional(),
+  assetRequestIds: z.array(z.string()).optional(),
+  mediaToolsVersion: z.literal(1).optional(),
+  audioPlan: z.object({ sha256: z.string(), dataSha256: z.string(), runtimeSha256: z.string() }).optional(),
+  internalRepair: z.object({ rootVersionId: versionIdSchema, attempt: z.number().int().nonnegative(),
+    inspectionId: z.string().optional() }).optional(),
   inputManifestPath: z.string().optional(), inputManifestSha256: z.string().optional(),
   systemFingerprint: z.string().optional(),
   executionConditions: z.object({
@@ -78,6 +90,8 @@ export const workSchema = z.object({
   creationOperationId: z.string().optional(),
   comparison: z.object({ id: idSchema, side: z.enum(["before", "after"]), inputHash: z.string() }).optional(),
   id: idSchema, title: z.string(), briefPath: z.string(), createdAt: z.string(),
+  authoring: authoringSchema.optional(),
+  assets: z.array(assetSchema).optional(),
   execution: executionSchema,
   directionApproval: z.object({
     sampleVersionId: versionIdSchema, scope: z.string(), userConfirmation: z.string(), confirmedAt: z.string(),
@@ -102,10 +116,18 @@ function validateRecord(input: unknown): WorkRecord {
   const record = workSchema.parse(input), workPath = "works/" + record.id;
   if (record.briefPath !== workPath + "/brief.md") throw new Error("需求路径与所属作品不一致。");
   const ids = new Set<string>();
+  for (const document of [...record.authoring?.drafts ?? [], ...record.authoring?.designs ?? []]) {
+    if (ids.has(document.id) || document.path !== join(workPath, "documents", document.id + ".md") ||
+      !document.id.startsWith(document.kind === "draft" ? "d" : "s")) throw new Error("稿件身份、种类或位置不一致。");
+    ids.add(document.id);
+  }
   for (const version of record.versions) {
     if (ids.has(version.id)) throw new Error("作品版本编号重复。");
     ids.add(version.id);
     if (version.inputManifestPath && version.inputManifestPath !== workPath + "/runs/" + idSchema.parse(version.runId) + "/input.json") throw new Error("制作输入依据路径与版本执行不一致。");
+    for (const ref of version.reviewPreparation?.batches ?? []) {
+      if (!ref.path.startsWith("media/" + record.id + "/" + version.id + "/review/") || !ref.path.endsWith("/index.json")) throw new Error("审查材料路径与版本不符。");
+    }
     if (version.sourcePath !== workPath + "/versions/" + version.id + "/source/entry.tsx" ||
         version.mediaPath !== "media/" + record.id + "/" + version.id + "/video.mp4") {
       throw new Error("源码或媒体路径与所属作品版本不一致。");
@@ -223,7 +245,7 @@ export class WorkStore {
     return "work-" + valueHash({ scopeId: this.scope(true)!.id, operationId }).slice(0, 32);
   }
 
-  create(title: string, brief: string, operationId?: string, comparison?: WorkRecord["comparison"]): WorkRecord {
+  create(title: string, brief: string, operationId?: string, comparison?: WorkRecord["comparison"], designFirst = false): WorkRecord {
     workInputSchema.parse({ title, brief });
     const scope = this.scope(true)!;
     const id = operationId ? this.plannedWorkId(operationId) : "work-" + randomUUID();
@@ -239,6 +261,8 @@ export class WorkStore {
       comparison,
       id, title, briefPath: "works/" + id + "/brief.md", createdAt: now(),
       execution: { status: "idle" }, directionApproval: null, feedback: [], versions: [],
+      // 新入口在首次写入就声明设计前置，避免后续草稿落盘失败时意外退回旧流程。
+      authoring: designFirst ? authoringSchema.parse({}) : undefined,
     };
     writeFileSync(this.resolvePath(record.briefPath), "# 原始需求\n\n" + brief + "\n", { flag: "wx" });
     this.save(record);
@@ -338,20 +362,37 @@ export class WorkStore {
       }
       const target = this.validateFeedbackLocation(record, versionId, location);
       this.validateFeedbackReferences(record, supersedes);
-      const feedbackId = operationId ? "feedback-" + valueHash({ operationId }).slice(0, 32) : randomUUID();
-      const input = { versionId, text, source, changesDirection, location: target, operationId, supersedes };
-      const previous = record.feedback.find(f => f.id === feedbackId);
-      if (previous) {
-        const { versionId, text, source, changesDirection, location, operationId, supersedes } = previous;
-        if (valueHash({ versionId, text, source, changesDirection, location, operationId, supersedes }) !== valueHash(input)) throw new Error("同一操作的反馈内容不一致。");
-        return record;
-      }
-      const item = { id: feedbackId, ...input, createdAt: now(), receivedDuringExecutionId: active?.operationId,
-        sequence: record.feedback.length,
-        receivedDuringRunId: record.execution.status === "running" ? record.execution.runId : undefined,
-        invalidatesApproval: changesDirection && record.directionApproval ? valueHash(record.directionApproval) : undefined };
-      immutableJson(this.resolvePath(join("works", id, "feedback", feedbackId + ".json")), item);
+      this.appendFeedback(record, { versionId, text, source, changesDirection, location: target, operationId, supersedes }, active?.operationId);
       return this.read(id);
+    });
+  }
+
+  private appendFeedback(record: WorkRecord, input: Pick<WorkRecord["feedback"][number], "versionId" | "text" | "source" | "changesDirection" | "location" | "operationId" | "supersedes">, executionId?: string) {
+    const feedbackId = input.operationId ? "feedback-" + valueHash({ operationId: input.operationId }).slice(0, 32) : randomUUID();
+    const previous = record.feedback.find(f => f.id === feedbackId);
+    if (previous) {
+      const { versionId, text, source, changesDirection, location, operationId, supersedes } = previous;
+      if (valueHash({ versionId, text, source, changesDirection, location, operationId, supersedes }) !== valueHash(input)) throw new Error("同一操作的反馈内容不一致。");
+      return previous;
+    }
+    const item = { id: feedbackId, ...input, createdAt: now(), receivedDuringExecutionId: executionId,
+      sequence: record.feedback.length, receivedDuringRunId: record.execution.status === "running" ? record.execution.runId : undefined,
+      invalidatesApproval: input.changesDirection && record.directionApproval ? valueHash(record.directionApproval) : undefined };
+    immutableJson(this.resolvePath(join("works", record.id, "feedback", feedbackId + ".json")), item);
+    return item;
+  }
+
+  /** 只供持有制作写锁的内检修复使用；不把执行途中外部新意见并入已固定的制作输入。 */
+  async internalFeedback(record: WorkRecord, versionId: string, text: string, inspectionId: string): Promise<string> {
+    if (this.lockOwner(record.id)?.pid !== process.pid) throw new Error("保存内检反馈须持有作品写锁。");
+    return withExecutionDispatch(this.dataRoot, record.id, () => {
+      const latest = this.read(record.id);
+      this.version(latest, versionId);
+      const item = this.appendFeedback(latest, { versionId, text, source: "internal_check", changesDirection: false,
+        operationId: "internal-" + inspectionId }, activeExecution(this.dataRoot, record.id)?.operationId);
+      if (!record.feedback.some(f => f.id === item.id)) record.feedback.push(item);
+      this.save(record);
+      return item.id;
     });
   }
 
@@ -387,7 +428,7 @@ export class WorkStore {
 
   async review(
     id: string, versionId: string, status: "needs_changes" | "passed",
-    notes: string, source: "user" | "external_ai" | "internal_check",
+    notes: string, source: "user" | "external_ai" | "internal_check", materialIndexes?: string[],
   ): Promise<WorkRecord> {
     z.string().trim().min(1).parse(notes);
     return this.withLock(id, () => {
@@ -395,8 +436,14 @@ export class WorkStore {
       const version = this.version(record, versionId);
       if (version.production !== "ready") throw new Error("须先取得实际作品再记录审查。");
       this.assertAvailable(version);
+      if (version.designRef && source === "external_ai" && !materialIndexes?.length) throw new Error("外部 AI 审查须关联实际读取的项目审查索引。");
+      for (const path of materialIndexes ?? []) {
+        const ref = version.reviewPreparation?.batches.find(item => item.path === path);
+        if (!ref || fileHash(this.resolvePath(path)) !== ref.sha256) throw new Error("审查索引不存在、已变化或属于其他视频版本。");
+        readReviewBatch(dirname(this.resolvePath(path)), version.videoSha256!);
+      }
       version.reviews ??= version.review.status === "not_reviewed" ? [] : [{ ...version.review }];
-      version.review = { status, notes, source, checkedAt: now() };
+      version.review = { status, notes, source, materialIndexes, checkedAt: now() };
       version.reviews.push(version.review);
       this.save(record);
       return record;
@@ -445,9 +492,20 @@ export class WorkStore {
     return inspectPreviews(this.resolvePath(version.mediaPath), version.technicalCheck?.previews);
   }
 
+  delivery(record: WorkRecord) {
+    const version = record.versions.at(-1);
+    if (!version) return { status: "not_produced" as const, versionId: null, videoLocation: null };
+    const available = this.availability(version).status === "available";
+    const ready = available && (!version.designRef || internalReviewPassed(version.reviewPreparation));
+    return { status: ready ? version.designRef ? "ready_for_external_review" as const : "legacy_unchecked" as const : "not_ready" as const,
+      versionId: version.id, videoLocation: ready ? this.resolvePath(version.mediaPath) : null,
+      reason: ready ? undefined : version.error ?? version.reviewPreparation?.error ?? "制作或项目内检尚未通过。" };
+  }
+
   summary(record: WorkRecord) {
     return {
       ...record,
+      delivery: this.delivery(record),
       taskPath: join(this.workDirectory(record.id), "task.json"),
       briefLocation: this.resolvePath(record.briefPath),
       versions: record.versions.map(version => {
@@ -457,7 +515,9 @@ export class WorkStore {
         return { ...version, availability, previewAvailability,
           technicalCheck: version.technicalCheck ? { ...version.technicalCheck, previews: previewAvailability.paths } : undefined,
           sourceLocation: this.resolvePath(version.sourcePath),
-          videoLocation: availability.status === "available" ? this.resolvePath(version.mediaPath) : null };
+          readyForExternalReview: version.designRef ? internalReviewPassed(version.reviewPreparation) && availability.status === "available" : false,
+          videoLocation: availability.status === "available" && (!version.designRef || internalReviewPassed(version.reviewPreparation)) ? this.resolvePath(version.mediaPath) : null,
+          diagnosticVideoLocation: availability.status === "available" ? this.resolvePath(version.mediaPath) : null };
       }),
     };
   }

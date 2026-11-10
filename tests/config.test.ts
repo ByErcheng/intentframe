@@ -32,6 +32,7 @@ test("完整配置以仓库为路径基准，临时覆盖可追溯且不改文�
     fixture.settings.runtime.requestTimeoutMs = 800;
     fixture.settings.runtime.productionTimeoutMs = 1_200;
     fixture.settings.media.concurrency = 3;
+    fixture.settings.assetLibraries = [{ id: "music", path: "../music", role: "music" }];
     fixture.save();
     const before = readFileSync(fixture.configPath, "utf8");
     const config = loadConfiguration(fixture.project, { INTENTFRAME_DATA_ROOT: "../temporary data",
@@ -48,6 +49,7 @@ test("完整配置以仓库为路径基准，临时覆盖可追溯且不改文�
     assert.equal(config.runtime.requestTimeoutMs, 800);
     assert.equal(config.runtime.productionTimeoutMs, 1_200);
     assert.equal(config.media.concurrency, 3);
+    assert.equal(config.assetLibraries[0]!.path, resolve(fixture.project, "../music"));
     const fromFile = loadConfiguration(fixture.project, {});
     assert.equal(fromFile.assetRoot, join(fixture.path, "isolated data"));
     assert.equal(fromFile.node, resolve(fixture.project, fixture.settings.tools.node.path));
@@ -71,6 +73,9 @@ test("错误配置不回退、不吞未知字段，也不在错误中输出填�
       { ...fixture.settings, [privateValue]: "unknown" },
       { ...fixture.settings, tools: { ...fixture.settings.tools, node: { ...fixture.settings.tools.node, [privateValue]: true } } },
       { ...fixture.settings, runtime: null },
+      { ...fixture.settings, audioInspection: "pretend-heard" },
+      { ...fixture.settings, assetLibraries: [{ id: "music", path: "../music", role: "music" }, { id: "music", path: "../other", role: "music" }] },
+      { ...fixture.settings, assetLibraries: [{ id: "music", path: " ", role: "music" }] },
       { ...fixture.settings, media: { ...fixture.settings.media, concurrency: 0 } },
       { ...fixture.settings, media: { ...fixture.settings.media, concurrency: 1.5 } },
       ...[0, -1, 1.5, 2_147_483_648, "3000"].map(commandTimeoutMs =>
@@ -160,8 +165,10 @@ test("启动脚本与后台进程使用本机配置，协议请求时限确实�
     assert.equal(work.taskPath, join(info.workRoots.production, "works", work.id, "task.json"));
     assert(existsSync(work.taskPath));
     assert.equal(readFileSync(marker, "utf8"), "started\nstarted\n");
-    writeFileSync(input, JSON.stringify({ operationId: "configured-produce", workId: work.id, kind: "sample" }));
-    const production = spawnSync(process.execPath, [join(fixture.project, "scripts/mcp-call.ts"), "produce_version", input], options);
+    const draft = work.authoring.drafts[0];
+    writeFileSync(input, JSON.stringify({ operationId: "configured-produce", workId: work.id,
+      base: { id: draft.id, sha256: draft.sha256 }, instruction: "仅测试稿件模型连接超时。" }));
+    const production = spawnSync(process.execPath, [join(fixture.project, "scripts/mcp-call.ts"), "revise_draft", input], options);
     assert.equal(production.error, undefined);
     assert.equal(production.status, 0);
     const accepted = JSON.parse(production.stdout);
@@ -177,7 +184,7 @@ test("启动脚本与后台进程使用本机配置，协议请求时限确实�
     assert.match(execution.error, /initialize 等待超时/);
     const record = JSON.parse(readFileSync(work.taskPath, "utf8"));
     assert.equal(record.execution.status, "failed");
-    assert.equal(record.versions[0].production, "failed");
+    assert.equal(record.authoring.runs[0].status, "failed"); assert.equal(record.versions.length, 0);
     assert.equal(existsSync(join(fixture.project, "intentframe-data")), false);
   } finally { fixture.cleanup(); }
 });

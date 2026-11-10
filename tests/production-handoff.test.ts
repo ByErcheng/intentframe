@@ -13,7 +13,7 @@ test("真实 MCP 拒绝旧方向歧义，后台允许明确沿已确认旧样例
   const fixture = backgroundFixture();
   try {
     const client = await fixture.connect();
-    const work = await fixture.call(client, "create_work", { operationId: "legacy-create", title: "旧双方向", brief: "合成需求", purpose: "test" });
+    const work = await fixture.createLegacyWork(client, { operationId: "legacy-create", title: "旧双方向", brief: "合成需求", purpose: "test" });
     const store = new WorkStore(join(fixture.data, "testing"), "test", fixture.data), record = store.read(work.id);
     const a = readyVersion(store, work.id, "v001", "sample"), b = readyVersion(store, work.id, "v002", "sample");
     b.basedOnVersionId = a.id; record.versions.push(a, b); store.save(record);
@@ -42,7 +42,7 @@ test("后台预览修复返回实际文件，保留视频且不再次调用模�
   const fixture = backgroundFixture();
   try {
     const client = await fixture.connect();
-    const work = await fixture.call(client, "create_work", { operationId: "preview-create", title: "预览修复", brief: "合成一秒视频", purpose: "test" });
+    const work = await fixture.createLegacyWork(client, { operationId: "preview-create", title: "预览修复", brief: "合成一秒视频", purpose: "test" });
     const started = await fixture.call(client, "produce_version", { operationId: "preview-produce", workId: work.id, kind: "sample" });
     assert.equal((await fixture.wait(client, started.executionId)).status, "succeeded");
     const before = await fixture.call(client, "get_work", { workId: work.id }), version = before.versions[0];
@@ -69,7 +69,7 @@ test("真实 MCP 在受理时冻结反馈，排队收到的新意见留待下一
     const invalid = await client.callTool({ name: "create_work", arguments: { operationId: "unknown-field", title: "非法字段", brief: "合成", purpose: "test", clientSentAt: "2026-01-01T00:00:00Z" } });
     assert.equal(invalid.isError, true);
     assert(!existsSync(join(fixture.data, "operations", "unknown-field")));
-    const work = await fixture.call(client, "create_work", { operationId: "create", title: "排队反馈", brief: "合成案例", purpose: "test" });
+    const work = await fixture.createLegacyWork(client, { operationId: "create", title: "排队反馈", brief: "合成案例", purpose: "test" });
     const store = new WorkStore(join(fixture.data, "testing"), "test", fixture.data);
     const record = store.read(work.id), version = readyVersion(store, work.id, "v001", "sample");
     version.directionId = version.id; record.versions.push(version); store.save(record);

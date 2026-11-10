@@ -9,6 +9,8 @@
 | [production-rules.md](./production-rules.md) | 样例制作、完整制作、反馈处理、局部定位、经验使用，分章节维护并按任务条件选取。 |
 | [learning.md](./learning.md) | 独立经验整理的“执行约束”和“启动消息”；分别传入会话与轮次，整理材料保存在本轮上下文。 |
 | [external-ai.md](./external-ai.md) | MCP 连接指引，详细调用方法仍以[使用说明](../scripts/README.md)为准。 |
+| [authoring.md](./authoring.md) | 草稿修改与视频脚本设计，按阶段选取；只读生成正文，文件由系统保存。 |
+| [review-materials.md](./review-materials.md) | 项目 AI 根据实际帧图核对设计实现、缺陷及材料覆盖，反馈内部修复与补帧要求；外部 AI 仍独立审查。 |
 
 ## 组装与修改
 

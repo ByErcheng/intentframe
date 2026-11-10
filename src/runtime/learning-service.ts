@@ -7,6 +7,8 @@ import { ComparisonStore } from "../records/comparison-store.ts";
 import { sourceFingerprint } from "../records/source-snapshot.ts";
 import { WorkStore } from "../records/work-store.ts";
 import type { WorkRecord, WorkVersion } from "../records/work-store.ts";
+import { DocumentStore } from "../records/document-store.ts";
+import type { AuthoringDocument } from "../records/authoring-contracts.ts";
 
 const searchSchema = z.strictObject({ query: z.string().max(2_000), offset: z.number().int().nonnegative().default(0), limit: z.number().int().min(1).max(50).default(20) });
 const feedbackPageSchema = z.strictObject({ offset: z.number().int().nonnegative().default(0), limit: z.number().int().min(1).max(50).default(20) });
@@ -61,7 +63,7 @@ export class LearningService {
     };
   }
 
-  accept(work: WorkRecord, version: WorkVersion, id: string, raw: LearningResult, sourceIds: string[]): void {
+  accept(work: WorkRecord, version: WorkVersion | AuthoringDocument, id: string, raw: LearningResult, sourceIds: string[]): void {
     const result = learningResultSchema.parse(raw), allowed = new Set(sourceIds);
     if (new Set(result.checkedSourceIds).size !== result.checkedSourceIds.length || result.checkedSourceIds.some(key => !allowed.has(key))) throw new Error("经验整理范围包含未交接或重复的来源。");
     if (result.proposals.some(proposal => proposal.sourceIds.some(key => !result.checkedSourceIds.includes(key)))) throw new Error("候选经验必须来自本次已检查的来源。");
@@ -73,12 +75,19 @@ export class LearningService {
     this.finishPending(work);
   }
 
-  private sources(work: WorkRecord, version: WorkVersion, sourceIds: string[]): ExperienceSource[] {
+  target(work: WorkRecord, id: string): WorkVersion | AuthoringDocument {
+    if (id.startsWith("v")) return this.store.version(work, id);
+    const document = [...work.authoring?.drafts ?? [], ...work.authoring?.designs ?? []].find(item => item.id === id);
+    if (!document) throw new Error("经验整理关联的稿件不存在。");
+    return new DocumentStore(this.store).document(work, document);
+  }
+
+  private sources(work: WorkRecord, version: WorkVersion | AuthoringDocument, sourceIds: string[]): ExperienceSource[] {
     const feedbackIds = sourceIds.filter(id => id.startsWith("feedback:")).map(id => id.slice("feedback:".length));
-    const versions = new Set([version.id, ...work.feedback.filter(feedback => feedbackIds.includes(feedback.id)).map(feedback => feedback.versionId)]);
+    const versions = new Set([...(version.id.startsWith("v") ? [version.id] : []), ...work.feedback.filter(feedback => feedbackIds.includes(feedback.id)).map(feedback => feedback.versionId)]);
     for (const key of sourceIds) if (key.startsWith("review:")) versions.add(key.split(":")[1]!);
     for (const target of work.versions) if (sourceIds.some(key => key.startsWith("failure:" + target.runId + ":"))) versions.add(target.id);
-    return [...versions].map(id => {
+    const result: ExperienceSource[] = [...versions].map(id => {
       const target = this.store.version(work, id);
       if (!target.sourceSnapshot) throw new Error("来源工程缺少完整快照，候选经验保留待核实。");
       this.store.verifySource(target);
@@ -86,12 +95,22 @@ export class LearningService {
         sourceFingerprint: sourceFingerprint(target.sourceSnapshot),
         feedbackIds: work.feedback.filter(feedback => feedback.versionId === id && feedbackIds.includes(feedback.id)).map(feedback => feedback.id) };
     });
+    const documents = new DocumentStore(this.store);
+    for (const key of sourceIds) if (key.startsWith("document:") || key.startsWith("design-review:")) {
+      const document = this.target(work, key.split(":")[1]!);
+      if (!("kind" in document) || !["draft", "design"].includes(document.kind)) throw new Error("稿件经验来源类型错误。");
+      const ref = document as AuthoringDocument;
+      for (const target of [ref, ...(ref.basedOn ? [documents.document(work, ref.basedOn)] : [])]) {
+        if (!result.some(item => "documentRef" in item && item.documentRef.id === target.id)) result.push({ kind: "document", purpose: this.store.purpose, workId: work.id, documentRef: { id: target.id, sha256: target.sha256 } });
+      }
+    }
+    return result;
   }
 
   finishPending(work: WorkRecord): void {
     const pending = work.learningPending;
     if (!pending) return;
-    const version = this.store.version(work, pending.versionId);
+    const version = this.target(work, pending.versionId);
     const draft = { workId: work.id, ...pending };
     immutableJson(this.store.resolvePath("works/" + work.id + "/learning/" + pending.id + ".json"), draft);
     const comparison = work.comparison ? new ComparisonStore(this.store, this.knowledge).context(work) : undefined;
@@ -119,7 +138,7 @@ export class LearningService {
         .parse(saved);
       if (draft.workId !== work.id || draft.id !== batch.id || draft.versionId !== batch.versionId ||
           valueHash(draft.result.checkedSourceIds) !== valueHash(batch.checkedSourceIds)) throw new Error("暂存经验与原整理批次不一致。");
-      const version = this.store.version(work, batch.versionId);
+      const version = this.target(work, batch.versionId);
       batch.experienceRefs = draft.result.proposals.map((proposal, index) => {
         const { sourceIds, ...body } = proposal;
         return this.knowledge.save({ ...body, sources: this.sources(work, version, sourceIds), status: "candidate", use: "reusable" },
@@ -130,8 +149,14 @@ export class LearningService {
     }
   }
 
-  pending(work: WorkRecord) {
+  pending(work: WorkRecord, readDocuments = true) {
     const comparison = new ComparisonStore(this.store, this.knowledge).context(work);
-    return pendingLearningSources(work, 50, comparison?.evaluation ? { id: comparison.id, content: comparison.evaluation } : undefined);
+    const pending = pendingLearningSources(work, 50, comparison?.evaluation ? { id: comparison.id, content: comparison.evaluation } : undefined);
+    const documents = new DocumentStore(this.store);
+    return { ...pending, items: pending.items.map(item => {
+      if (!readDocuments || !item.documentRef) return item;
+      const current = documents.read(work, item.documentRef);
+      return { ...item, content: { record: item.content, current, previous: current.basedOn ? documents.read(work, current.basedOn) : undefined } };
+    }) };
   }
 }
