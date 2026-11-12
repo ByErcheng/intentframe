@@ -24,7 +24,8 @@ export function toolCapability(name: string, readOnly: boolean, args?: Record<st
     initialResult: details ? 'status:"accepted", executionId' : "本次调用返回结果",
     queryTool: details ? "get_execution" : null,
     result: details?.result ?? "工具返回的当前结果",
-    effects: details?.effects ?? (readOnly ? "查询或准备请求，不启动业务执行" : "保存该工具对应的本机记录"),
+    effects: name === "acknowledge_update_notice" ? "直接保存 AI 已收到提醒的回执，noticeId 幂等；不收集用户决定、不升级" :
+      details?.effects ?? (readOnly ? "查询或准备请求，不启动业务执行" : "保存该工具对应的本机记录"),
     modelUsage: (name === "prepare_review_materials" && mode === "materials_only") || (name === "recover_work" && mode === "reconcile_only")
       ? "不发起新的模型调用" : details?.modelUsage ?? "不调用模型",
     ...(mode ? { mode } : {}) };

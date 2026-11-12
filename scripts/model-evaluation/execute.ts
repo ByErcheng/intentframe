@@ -1,10 +1,12 @@
-import { cpSync, existsSync, lstatSync, readFileSync, readdirSync, realpathSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, lstatSync, readFileSync, readdirSync, realpathSync, statSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { z } from "zod";
 import { configuration } from "../../src/config.ts";
 import { WorkStore } from "../../src/records/work-store.ts";
 import { WorkService } from "../../src/runtime/work-service.ts";
+import { ProfileStore } from "../../src/records/profile-store.ts";
+import { profileHeading } from "../../src/records/creative-profile.ts";
 import { systemFingerprint } from "../../src/runtime/context.ts";
 import { MAX_INTERNAL_REPAIRS } from "../../src/records/media-contracts.ts";
 import { mediaCommand, mediaBinaries } from "../../src/media/render.ts";
@@ -122,8 +124,13 @@ export async function executeRun(roundDirectory: string, runId: string, bindingF
       if (treeHash(dataRoot) !== binding.treeSha256) throw new Error("共同基线副本不一致");
       workId = binding.workId;
     } else {
-      const work = store.create(item.id, input, "evaluation-" + runId); workId = work.id;
-      service.documents.initialize(work, input, "evaluation-draft");
+      // 同一冻结计划中的候选采用相同档案字节；复制历史基线的分支不补造采用事实。
+      const profile = new ProfileStore(dataRoot, () => statSync(resolve(roundRoot, "plan.json")).mtime.toISOString()).save({
+        id: "profile-model-evaluation", operationId: "evaluation-profile", profile: { name: "通用模型测试", summary: "按冻结输入验证指定阶段。",
+          markdown: "# 通用模型测试\n不固定创作风格；每条案例按冻结原始输入执行。测试结果不自动成为长期偏好。", instruction: "评测计划的共同合成前提。" } });
+      const evaluatedInput = profileHeading(profile) + "\n档案方向摘要：按冻结输入验证指定阶段。\n本条视频定位：" + item.id + " 指定阶段的受控测试。\n\n" + input;
+      const work = store.create(item.id, evaluatedInput, "evaluation-" + runId, undefined, false, profile); workId = work.id;
+      service.documents.initialize(work, evaluatedInput, "evaluation-draft");
       const draft = store.read(workId).authoring!.drafts.at(-1)!;
       await service.documents.handoff(workId, draft, "合成测试前提：使用冻结输入检查指定阶段，不代表真实用户交接。", "evaluation-handoff");
       if (item.operation === "produce_version" || item.operation === "prepare_assets") {

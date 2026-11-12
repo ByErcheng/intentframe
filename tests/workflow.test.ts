@@ -1,4 +1,4 @@
-import { confirmedDraft } from "./helpers.ts";
+import { confirmedDraft, seedProfile, profiledMarkdown } from "./helpers.ts";
 import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -108,9 +108,10 @@ test("数据目录内符号链接和错绑版本的记录不能越过作品边�
 
 test("MCP 校验保留需求、反馈和确认原文，拒绝纯空白输入", async () => {
   const root = mkdtempSync(join(tmpdir(), "intentframe-verbatim-"));
+  seedProfile(root);
   try {
     const store = new WorkStore(root), service = new WorkService(store);
-    const brief = "    缩进的原始需求\n\n";
+    const brief = profiledMarkdown("    缩进的原始需求\n\n");
     await executeTool("create_work", confirmedDraft({ operationId: "create-verbatim", title: "原文", brief, purpose: "production" }), service);
     const work = store.read(store.list()[0]!.id);
     assert.equal(readFileSync(store.resolvePath(work.briefPath), "utf8"), "# 原始需求\n\n" + brief + "\n");

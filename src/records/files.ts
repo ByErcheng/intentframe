@@ -27,10 +27,15 @@ export function readJson(path: string): unknown { return JSON.parse(recordText(p
 
 /** 先保存完整内容再替换指针；失败不留下半份有效记录。 */
 export function atomicJson(path: string, value: unknown): void {
+  atomicText(path, jsonText(value));
+}
+
+/** 单个派生文件完整写入后再替换；多文件提交由所属业务保存接续依据。 */
+export function atomicText(path: string, value: string): void {
   mkdirSync(dirname(path), { recursive: true });
   const temporary = path + "." + randomUUID() + ".tmp";
   const fd = openSync(temporary, "wx", 0o600);
-  try { writeFileSync(fd, jsonText(value)); fsyncSync(fd); }
+  try { writeFileSync(fd, value); fsyncSync(fd); }
   catch (error) { rmSync(temporary, { force: true }); throw error; }
   finally { closeSync(fd); }
   try { renameSync(temporary, path); }

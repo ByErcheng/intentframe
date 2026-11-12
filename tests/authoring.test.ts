@@ -1,4 +1,4 @@
-import { confirmedDraft } from "./helpers.ts";
+import { confirmedDraft, profiledMarkdown } from "./helpers.ts";
 import assert from "node:assert/strict";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -22,14 +22,14 @@ function setup() {
 test("外部原稿逐字保存；保存和修改不启动设计，旧基线不能覆盖新稿", async () => {
   const { root, store, service } = setup();
   try {
-    const original = "  # 我的想法\n\n保留原有空白。\n";
+    const original = profiledMarkdown("  # 我的想法\n\n保留原有空白。\n");
     const work = workSchema.parse(await call("create_work", confirmedDraft({ operationId: "draft-create", title: "入口草稿", brief: original, purpose: "production" }), service));
     const first = work.authoring!.drafts[0]!;
     assert.equal(service.documents.read(work, first).markdown, original);
     assert.equal(work.authoring!.handoffs.length, 1); assert.equal(work.authoring!.runs.length, 0); assert.equal(work.versions.length, 0);
     await assert.rejects(call("design_video", { operationId: "too-early", workId: work.id, base: first, instruction: "设计" }, service), /入项检查/);
     assert.equal(store.read(work.id).authoring!.runs.length, 0);
-    const second = await service.documents.submit(work.id, "# 新想法\n改为表达感谢。", "draft-edit", "用户修改表达。", first);
+    const second = await service.documents.submit(work.id, profiledMarkdown("# 新想法\n改为表达感谢。"), "draft-edit", "用户修改表达。", first);
     assert.equal(second.id, "d002"); assert.equal(readFileSync(store.resolvePath(first.path), "utf8"), original);
     await assert.rejects(service.documents.submit(work.id, "覆盖", "stale", "旧基线", first), /草稿已变化/);
     assert.equal(store.read(work.id).authoring!.drafts.length, 2);
@@ -72,7 +72,7 @@ test("草稿生成与设计生成只返回稿件；采用确切设计后才能�
       acquisition.text.replace(/^#{1,6} /gm, "").trim());
     assert.deepEqual(input.sources.find((source: { path: string }) => source.path === acquisition.path), acquisition);
     const current = store.read(work.id);
-    const third = await service.documents.submit(work.id, "新的未交接想法。", "later-draft", "先讨论，不改变在途依据。", current.authoring!.drafts.at(-1));
+    const third = await service.documents.submit(work.id, profiledMarkdown("新的未交接想法。"), "later-draft", "先讨论，不改变在途依据。", current.authoring!.drafts.at(-1));
     assert.equal(service.documents.adopted(store.read(work.id), ref)!.document.id, ref.id);
     await service.documents.handoff(work.id, third, "采用新稿重新设计。", "new-handoff");
     assert.throws(() => service.documents.adopted(store.read(work.id), ref), /交接已被更新/);

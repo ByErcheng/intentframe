@@ -1,4 +1,4 @@
-import { confirmedDraft } from "./helpers.ts";
+import { confirmedDraft, fixtureProfile } from "./helpers.ts";
 import assert from "node:assert/strict";
 import { cpSync, existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -150,6 +150,7 @@ test("效果比较通过同一入口创建并定位测试任务，不改变正�
     const router = fixtureRouter(root.path);
     const formal = router.service("production").store.create("正式作品", "原任务保持不变。");
     const comparison = await executeTool("create_comparison", { operationId: "comparison", comparison: {
+      profileRef: fixtureProfile.ref,
       title: "比较", brief: "共同输入", kind: "creation", change: "一处改动", knowledgeRefs: [],
     } }, router) as { id: string; workIds: { before: string; after: string } };
     for (const id of Object.values(comparison.workIds)) {

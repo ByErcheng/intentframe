@@ -1,4 +1,4 @@
-import { confirmedDraft } from "./helpers.ts";
+import { confirmedDraft, seedProfile } from "./helpers.ts";
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
 import { chmodSync, cpSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
@@ -20,6 +20,7 @@ function configurationFixture() {
   const path = join(project, "config/local.json");
   mkdirSync(join(project, "config"), { recursive: true });
   const settings = JSON.parse(example);
+  settings.updates.enabled = false;
   settings.dataRoot = "../isolated data";
   settings.backupRoot = "../isolated backup";
   const save = () => writeFileSync(path, JSON.stringify(settings), { mode: 0o600 });
@@ -77,6 +78,24 @@ test("完整配置以仓库为路径基准，临时覆盖可追溯且不改文�
       for (const value of ["", "   ", "bad\npath", "bad\0path"]) {
         assert.throws(() => loadConfiguration(fixture.project, { [key]: value }), /必须为非空路径/);
       }
+    }
+  } finally { fixture.cleanup(); }
+});
+
+test("更新检查旧配置默认六点、设置校验与子进程覆盖", () => {
+  const fixture = configurationFixture();
+  try {
+    delete fixture.settings.updates; fixture.save();
+    assert.deepEqual(loadConfiguration(fixture.project, {}).updates, { enabled: true, dayStartHour: 6, timeoutMs: 4000 });
+    const disabled = loadConfiguration(fixture.project, { INTENTFRAME_UPDATE_CHECKS: "0" });
+    assert.equal(disabled.updates.enabled, false);
+    assert(disabled.environmentOverrides.includes("INTENTFRAME_UPDATE_CHECKS"));
+    fixture.settings.updates = { enabled: false, dayStartHour: 7, timeoutMs: 2000 }; fixture.save();
+    assert.deepEqual(loadConfiguration(fixture.project, { INTENTFRAME_UPDATE_CHECKS: "1" }).updates, { enabled: true, dayStartHour: 7, timeoutMs: 2000 });
+    assert.throws(() => loadConfiguration(fixture.project, { INTENTFRAME_UPDATE_CHECKS: "" }), /只接受/);
+    for (const updates of [{ dayStartHour: 24 }, { timeoutMs: 99 }, { timeoutMs: 10001 }, { unknown: true }]) {
+      fixture.settings.updates = updates; fixture.save();
+      assert.throws(() => loadConfiguration(fixture.project, {}), /updates/);
     }
   } finally { fixture.cleanup(); }
 });
@@ -205,6 +224,7 @@ test("启动脚本与后台进程使用本机配置，协议请求时限确实�
     writeFileSync(input, "{}");
     const info = JSON.parse(execFileSync("/bin/sh", [join(fixture.project, "scripts/intentframe"), "call", "get_runtime_info", input], options));
     assert.equal(info.assetRoot, join(fixture.path, "isolated data"));
+    seedProfile(info.assetRoot);
     writeFileSync(input, JSON.stringify(confirmedDraft({ operationId: "configured-create", title: "配置隔离测试", brief: "合成需求，不调用真实模型。", purpose: "production" })));
     const work = JSON.parse(execFileSync(process.execPath, [join(fixture.project, "scripts/mcp-call.ts"), "create_work", input], options));
     assert.equal(work.taskPath, join(info.workRoots.production, "works", work.id, "task.json"));
@@ -262,6 +282,7 @@ test("同一启动配置跨 MCP 进程按任务接续，旧用途变量明确停
     const testConfig = loadConfiguration(fixture.project, {});
     assert.equal(testConfig.workRoots.test, join(fixture.path, "isolated data/testing"));
     assert.equal(testConfig.assetRoot, join(fixture.path, "isolated data"));
+    seedProfile(testConfig.assetRoot);
     for (const value of ["", "test", "production"]) assert.throws(() => loadConfiguration(fixture.project, { INTENTFRAME_PURPOSE: value }), /INTENTFRAME_PURPOSE 已停用/);
     const input = join(fixture.path, "input.json"), command = join(fixture.project, "scripts/mcp-call.ts");
     const call = (name: string, args: unknown) => {

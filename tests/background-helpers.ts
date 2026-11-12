@@ -5,12 +5,13 @@ import { Client } from "@modelcontextprotocol/client";
 import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
 import { repositoryRoot } from "../src/config.ts";
 import { ExecutionStore } from "../src/records/execution-store.ts";
-import { fakeCodex, fixtureRoot, confirmedDraft } from "./helpers.ts";
+import { fakeCodex, fixtureRoot, confirmedDraft, seedProfile } from "./helpers.ts";
 import { WorkStore } from "../src/records/work-store.ts";
 
 export function backgroundFixture(mode = "slow_completed", runtime: Record<string, number> = {}) {
   const root = fixtureRoot(), project = join(root.path, "project"), data = join(root.path, "data");
   mkdirSync(project); mkdirSync(data);
+  seedProfile(data);
   for (const directory of ["src", "scripts", "docs", "prompts"]) cpSync(join(repositoryRoot, directory), join(project, directory), { recursive: true });
   for (const file of ["AGENTS.md", "package-lock.json"]) cpSync(join(repositoryRoot, file), join(project, file));
   // 复用真实依赖时也保留其配置文件真实位置，避免测试夹具让 Webpack 从另一个项目读取配置。
@@ -52,7 +53,7 @@ export function backgroundFixture(mode = "slow_completed", runtime: Record<strin
     const work = await call(client, "create_work", confirmedDraft({ ...args, brief: String(args.brief) }));
     const store = new WorkStore(args.purpose === "test" ? join(data, "testing") : data,
       args.purpose === "test" ? "test" : "production", data);
-    const record = store.read(work.id); delete record.authoring; store.save(record);
+    const record = store.read(work.id); delete record.authoring; delete record.creationProfile; delete record.profileAssignments; store.save(record);
     return store.summary(record);
   };
   const countTurns = () => {

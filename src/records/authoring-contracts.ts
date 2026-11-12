@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { modelEvidenceFields } from "./model-settings.ts";
 import { experienceRefSchema } from "./experience-ref.ts";
+import { profileSnapshotSchema, creativeBriefSchema } from "./creative-profile.ts";
 
 const explanation = z.string().trim().min(1).max(10_000);
 // 路径是外部 AI 所展示文件的来源声明；程序校验提交正文摘要，不任意读取客户端文件。
@@ -27,6 +28,12 @@ export type DraftReviewResult = z.infer<typeof draftReviewResultSchema>;
 export const documentIdSchema = z.string().regex(/^[ds][0-9]{3,}$/);
 export const documentRefSchema = z.object({ id: documentIdSchema, sha256: z.string().regex(/^[a-f0-9]{64}$/) });
 export type DocumentRef = z.infer<typeof documentRefSchema>;
+// 测试基线只携带已核验的前置事实及来源摘要，不复制原模型的评价正文。
+export const baselineDraftReviewEvidenceSchema = z.strictObject({
+  kind: z.literal("verified_baseline_draft_review"), draft: documentRefSchema,
+  sourceWorkId: z.string().min(1), sourceRunId: z.string().min(1), sourceInputSha256: z.string().min(1),
+  sourceResultSha256: z.string().regex(/^[a-f0-9]{64}$/),
+});
 export const markdownSchema = z.string().min(1).max(100_000).refine(value => value.trim().length > 0, "正文不能仅为空白。");
 export const documentSchema = documentRefSchema.extend({
   kind: z.enum(["draft", "design"]), path: z.string(), createdAt: z.string(), operationId: z.string(),
@@ -36,6 +43,7 @@ export const documentSchema = documentRefSchema.extend({
   assetIds: z.array(z.string()).default([]),
   submission: draftSubmissionSchema.optional(),
   reviewRequired: z.boolean().optional(),
+  creativeProfile: profileSnapshotSchema.optional(), creativeBrief: creativeBriefSchema.optional(),
 });
 export type AuthoringDocument = z.infer<typeof documentSchema>;
 export const designDecisionSchema = z.object({
@@ -63,6 +71,7 @@ export const authoringSchema = z.object({
     userInstruction: z.string().min(1).refine(value => value.trim().length > 0), createdAt: z.string(),
     correctionOf: z.object({ operationId: z.string(), reviewRunId: z.string(), notes: explanation }).optional() })).default([]),
   decisions: z.array(designDecisionSchema).default([]), runs: z.array(authoringRunSchema).default([]),
+  baselineDraftReviews: z.array(z.object({ draft: documentRefSchema, path: z.string(), sha256: z.string().regex(/^[a-f0-9]{64}$/) })).optional(),
 });
 export const authoringResultSchema = z.object({
   status: z.enum(["completed", "needs_input", "failed"]), markdown: z.string(),

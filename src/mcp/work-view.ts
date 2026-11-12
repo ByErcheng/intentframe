@@ -11,7 +11,7 @@ function assetUsage(asset: Asset) {
     currentLibraryUsage: currentLibraryUsage(asset.origin, configuration.assetLibraries, asset.usage) };
 }
 
-export const workSections = ["versions", "feedback", "assets", "drafts", "designs", "handoffs", "decisions", "runs", "analysisRuns", "confirmations", "learningBatches"] as const;
+export const workSections = ["versions", "feedback", "assets", "drafts", "designs", "handoffs", "decisions", "runs", "analysisRuns", "confirmations", "learningBatches", "profileAssignments"] as const;
 export type WorkSection = typeof workSections[number];
 
 export function currentExecution(service: WorkService, workId: string) {
@@ -57,6 +57,7 @@ export function workSummary(service: WorkService, workId: string) {
   const pendingCount = work.feedback.filter(item => !superseded.has(item.id) && !inherited.has(item.id)).length;
   const draft = work.authoring?.drafts.at(-1), design = work.authoring?.designs.at(-1);
   const draftReview = draft && service.documents.latestDraftReview(work, draft);
+  const baselineDraftReview = draft && !draftReview ? service.documents.baselineReviewEvidence(work, draft) : undefined;
   const handedOff = draft && work.authoring?.handoffs.at(-1)?.draft.sha256 === draft.sha256;
   const designMatchesDraft = design?.draft?.sha256 === draft?.sha256;
   const decision = design && work.authoring?.decisions.filter(item => item.design.id === design.id && item.design.sha256 === design.sha256).at(-1);
@@ -65,7 +66,7 @@ export function workSummary(service: WorkService, workId: string) {
   if (active) nextActions.push({ tool: "get_execution", arguments: { executionId: active.operationId }, reason: "先核对原执行；终态与进程收尾分别查询。" });
   else if (["unknown", "running", "failed"].includes(work.execution.status)) nextActions.push({ tool: "prepare_operation",
     arguments: { name: "recover_work", arguments: { workId, mode: "reconcile_only" } }, reason: "先核对并补存原结果，是否继续执行另行决定。" });
-  else if (draft?.reviewRequired && handedOff && draftReview?.draftReview?.status !== "passed") {
+  else if (draft?.reviewRequired && handedOff && draftReview?.draftReview?.status !== "passed" && !baselineDraftReview) {
     if (!draftReview) nextActions.push({ tool: "prepare_operation", arguments: { name: "review_draft", arguments: { workId, base: ref(draft) } }, reason: "先检查已交接的草稿与适用经验，通过后再设计。" });
     else nextActions.push({ tool: "get_work", arguments: { workId, section: "runs" }, reason: "读取草稿检查问题；外部纠错或用户澄清后提交新版并复查，不原样重复审稿。" });
   }
@@ -77,10 +78,12 @@ export function workSummary(service: WorkService, workId: string) {
     arguments: { workId, versionId: delivery.versionId }, reason: "查询材料并独立审查；若要修改则准备制作请求预检。" });
   else nextActions.push({ tool: "prepare_operation", arguments: { name: "produce_version", arguments: { workId, ...(design ? { designRef: ref(design) } : {}) } }, reason: "补充本轮 kind 与修改范围后预检；此处不是完整可提交请求。" });
   return { id: work.id, title: work.title, purpose: work.purpose, storagePurpose: service.store.purpose, view: "summary", coverage: "summary",
+    ...service.store.profileContext(work),
     execution: work.execution, activeExecutionId: active?.operationId,
     latestVersion: latest && { id: latest.id, kind: latest.kind, production: latest.production, operationId: latest.operationId,
       modelSelection: latest.modelSelection, model: latest.model, reasoningEffort: latest.reasoningEffort,
       basedOnVersionId: latest.basedOnVersionId, directionId: latest.directionId, designRef: latest.designRef,
+      creativeProfile: latest.creativeProfile?.ref,
       review: latest.review,
       internalReview: latest.reviewPreparation && { materialsStatus: latest.reviewPreparation.status, status: inspection?.status,
         quality: inspection?.result?.quality, notes: inspection?.result?.notes,
@@ -93,7 +96,8 @@ export function workSummary(service: WorkService, workId: string) {
     delivery, directionApproval: work.directionApproval && { sampleVersionId: work.directionApproval.sampleVersionId },
     authoring: work.authoring && { latestDraft: ref(draft), latestDesign: ref(design), designStatus: decision?.status ?? "not_adopted",
       draftLocation: draft && service.store.resolvePath(draft.path), draftSubmission: draft?.submission,
-      draftReview: draftReview && { runId: draftReview.id, status: draftReview.status, result: draftReview.draftReview } },
+      draftReview: draftReview && { runId: draftReview.id, status: draftReview.status, result: draftReview.draftReview },
+      baselineDraftReview },
     counts: Object.fromEntries(workSections.map(section => [section, collection(work, section).length])),
     pendingFeedback: { count: pendingCount, scope: "not_in_latest_lineage", note: "包括其他方向；本轮实际适用范围由制作预检确定。历史未展开不表示没有反馈。" },
     blockers: [...new Set([work.execution.error, delivery.reason].filter((item): item is string => Boolean(item)))], nextActions,

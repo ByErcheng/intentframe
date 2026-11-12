@@ -12,8 +12,9 @@ import type { WorkRecord, WorkVersion } from "../records/work-store.ts";
 import { KnowledgeStore, pendingLearningSources } from "../records/knowledge-store.ts";
 import { ComparisonStore } from "../records/comparison-store.ts";
 import { immutableJson, readJson, valueHash } from "../records/files.ts";
-import { learningResultSchema } from "../records/contracts.ts";
+import { learningResultSchema, learningCaseSourcesSchema } from "../records/contracts.ts";
 import { knowledgeToolDefinitions, LearningService } from "./learning-service.ts";
+import { learningCases } from "./learning-cases.ts";
 import { executionConditions, productionRuleContext, productionRules, systemFingerprint } from "./context.ts";
 import { processExists } from "./process-state.ts";
 import { checkExecution } from "./execution-control.ts";
@@ -34,6 +35,7 @@ import { MAX_INTERNAL_REPAIRS, internalReviewPassed } from "../records/media-con
 import type { AssetOptions } from "./asset-service.ts";
 import { ProductionMediaTools, mediaToolDefinitions } from "./production-media.ts";
 import { readAudioPlan } from "./audio-plan.ts";
+import { assertAudioPlanSettled } from "./audio-plan-commit.ts";
 import type { LibraryRoot } from "../records/asset-catalog.ts";
 import { ProviderRequestError, speechSegments } from "../media/providers.ts";
 import {
@@ -130,6 +132,7 @@ export class WorkService {
       while (existsSync(join(this.store.workDirectory(id), "versions", "v" + String(number).padStart(3, "0")))) number++;
       const versionId = "v" + String(number).padStart(3, "0"), runId = "run-" + randomUUID();
       const version: WorkVersion = {
+        creativeProfile: design?.document.creativeProfile ?? previous?.creativeProfile ?? record.creationProfile,
         id: versionId, kind, production: "creating",
         sourcePath: "works/" + id + "/versions/" + versionId + "/source/entry.tsx",
         mediaPath: "media/" + id + "/" + versionId + "/video.mp4",
@@ -152,7 +155,7 @@ export class WorkService {
       pendingSources.items = pendingSources.items.filter(source => source.kind === "feedback" ?
         relevantFeedback.some(f => source.id === "feedback:" + f.id) : source.versionId === previous?.id);
       const sourceIds = pendingSources.items.map(source => source.id);
-      const tools = this.learning.tools(record, runId);
+      const tools = this.learning.tools(record, runId, version.creativeProfile?.ref.id);
       const history = productionHistory(record, previous, inherited, tools.feedbackReads);
       const selectedFeedback = relevantFeedback.filter(item => requested.includes(item.id));
       const feedbackText = JSON.stringify(selectedFeedback.map(item => ({ ...item, inheritedInBase: inherited.includes(item.id), requestedThisTurn: true })), null, 2);
@@ -167,7 +170,9 @@ export class WorkService {
           metadataSource: "assets/" + asset.id + "-metadata.json" })), null, 2),
         design: design ? [JSON.stringify({ designRef: version.designRef, adoptedBy: design.decision.source,
           adoptionNotes: design.decision.notes, draftRef: { id: design.draft.id, sha256: design.draft.sha256 } }, null, 2),
-          "#### 采用的脚本正文", design.markdown, "#### 用户交接的草稿原文", design.draft.markdown].join("\n\n") : "旧任务没有独立脚本记录，按原有有效需求接续；不补造历史脚本。",
+          "#### 本次固定的创作档案", JSON.stringify(version.creativeProfile ?? null),
+          "#### 采用的脚本正文", design.markdown, "#### 用户交接的草稿原文", design.draft.markdown].join("\n\n") :
+          "旧任务没有独立脚本记录，按原有有效需求接续；不补造历史脚本。\n本次固定的创作档案：" + JSON.stringify(version.creativeProfile ?? null),
         brief: previous ? brief : "首次制作的原始需求已在上方完整提供；本轮尚无历史工程。",
         task: JSON.stringify({ purpose: record.purpose ?? "unspecified", versionId, kind, newDirection: chosen.newDirection }),
         baseline: previous ? JSON.stringify({ baseVersionId: previous.id, baseReason,
@@ -365,6 +370,7 @@ export class WorkService {
   private applyProductionReceipt(record: WorkRecord, version: WorkVersion, receipt: ProductionReceipt): boolean {
     assertAnalysesSettled(record);
     this.assets.assertSettled(record, version);
+    assertAudioPlanSettled(this.store, version);
     version.turnId = receipt.turnId;
     version.nativeResult = { threadId: receipt.threadId, turnId: receipt.turnId, status: receipt.status, reply: receipt.reply,
       ...(receipt.error ? { error: receipt.error } : {}) };
@@ -434,8 +440,11 @@ export class WorkService {
       mkdirSync(directory, { recursive: true });
       const learningPrompt = readPrompt("learning", "执行约束"), startPrompt = readPrompt("learning", "启动消息");
       const turnInput = fillPrompt(startPrompt.text, { runId });
+      const caseEvidence = learningCases(this.store, record, pending.items);
       const input = { workId: id, purpose: record.purpose ?? "unspecified", versionId: version.id, modelSelection,
         sources: pending.items, remaining: pending.remaining,
+        originalBrief: readFileSync(this.store.resolvePath(record.briefPath), "utf8"),
+        caseHistory: caseEvidence.history, caseSources: caseEvidence.caseSources,
         rule: learningPrompt.text, promptSources: [learningPrompt, startPrompt], turnInput, outputSchema: z.toJSONSchema(learningResultSchema) };
       immutableJson(join(directory, "context.json"), input);
       record.learningRun = { id: runId, versionId: version.id, sourceIds: pending.items.map(source => source.id),
@@ -502,7 +511,8 @@ export class WorkService {
     const path = this.store.resolvePath("works/" + record.id + "/learning/" + run.id + "/context.json");
     if (fileHash(path) !== run.contextSha256) throw new Error("原经验整理输入已经变化。");
     const result = learningResultSchema.parse(JSON.parse(reply));
-    this.learning.accept(record, this.learning.target(record, run.versionId), run.id, result, run.sourceIds);
+    const input = z.object({ caseSources: learningCaseSourcesSchema.optional() }).parse(readJson(path));
+    this.learning.accept(record, this.learning.target(record, run.versionId), run.id, result, run.sourceIds, input.caseSources);
     run.completed = true; record.execution = run.previousExecution; record.learningError = undefined;
     this.store.save(record);
   }

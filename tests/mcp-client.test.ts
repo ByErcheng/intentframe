@@ -1,4 +1,4 @@
-import { confirmedDraft } from "./helpers.ts";
+import { confirmedDraft, seedProfile, profiledMarkdown } from "./helpers.ts";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
@@ -15,6 +15,7 @@ test("真实 MCP 子进程继承隔离目录，写入前核对服务实际目标
   const root = fixtureRoot();
   try {
     const data = join(root.path, "isolated-data"); mkdirSync(data);
+    seedProfile(data);
     const input = join(root.path, "create.json");
     writeFileSync(input, JSON.stringify(confirmedDraft({ operationId: "create-isolated-work", title: "合成测试任务", brief: "只测试目标隔离，不调用模型。", purpose: "production" })));
     const result = JSON.parse(execFileSync(process.execPath, [join(repositoryRoot, "scripts/mcp-call.ts"), "create_work", input], {
@@ -35,7 +36,7 @@ test("同一个真实 MCP 连接交错处理两种用途，换连接后仅凭任
     const connect = async () => {
       const client = new Client({ name: "task-purpose-fixture", version: "1" }); clients.push(client);
       await client.connect(new StdioClientTransport({ command: "/bin/sh", args: [join(repositoryRoot, "scripts/intentframe"), "mcp"], cwd: repositoryRoot,
-        env: { INTENTFRAME_DATA_ROOT: root.path, INTENTFRAME_NODE_BIN: process.execPath, INTENTFRAME_CODEX_BIN: executable, INTENTFRAME_BACKUP_ROOT: join(root.path, "backup") } }));
+        env: { INTENTFRAME_DATA_ROOT: root.path, INTENTFRAME_NODE_BIN: process.execPath, INTENTFRAME_CODEX_BIN: executable, INTENTFRAME_BACKUP_ROOT: join(root.path, "backup"), INTENTFRAME_UPDATE_CHECKS: "0" } }));
       return client;
     };
     const call = async (client: Client, name: string, args: Record<string, unknown>) => {
@@ -75,7 +76,7 @@ test("同一个真实 MCP 连接交错处理两种用途，换连接后仅凭任
     assert.equal((await call(next, "get_work", { view: "detail", workId: testing.id })).purpose, "test");
     assert.deepEqual(await call(next, prepared.name, prepared.arguments), testing);
     const updated = await call(next, "submit_draft", { operationId: "test-feedback", workId: testing.id,
-      basedOn: base, markdown: "后续修改仍属于这次测试。", instruction: "合成用户补充。", submission: draftSubmission("后续修改仍属于这次测试。") });
+      basedOn: base, markdown: profiledMarkdown("后续修改仍属于这次测试。"), instruction: "合成用户补充。", submission: draftSubmission(profiledMarkdown("后续修改仍属于这次测试。")) });
     assert.equal(updated.id, "d002"); assert(updated.location.includes("/testing/works/"));
     assert.equal((await call(next, "get_operation", { operationId: "test-produce" })).purpose, "test");
     assert.equal((await call(next, "get_work", { view: "detail", workId: formal.id })).purpose, "production");

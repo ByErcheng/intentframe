@@ -29,6 +29,9 @@ import { configuration } from "../config.ts";
 import { toolCapability, capabilityTable } from "../runtime/tool-capabilities.ts";
 import { workSummary, workSection, workSections, currentExecution, feedbackView } from "./work-view.ts";
 import { prepareProduction } from "./production-preflight.ts";
+import { ProfileStore, profileSaveSchema } from "../records/profile-store.ts";
+import { profileRefSchema, profileIdSchema } from "../records/creative-profile.ts";
+import { ToolUpdateChecker, noticeIdSchema } from "../updates/checker.ts";
 
 const id = z.string().regex(/^[a-z0-9][a-z0-9-]{0,79}$/);
 const versionId = z.string().regex(/^v\d{3,}$/);
@@ -36,18 +39,25 @@ const text = z.string().min(1).max(30_000).refine(value => value.trim().length >
 const page = { offset: z.number().int().nonnegative().default(0), limit: z.number().int().min(1).max(50).default(20) };
 const write = <T extends z.ZodRawShape>(shape: T) => z.strictObject({ ...shape, operationId: operationIdSchema });
 export const inputs = {
+  list_creative_profiles: z.strictObject({ ...page, includeInactive: z.boolean().default(false) }),
+  read_creative_profile: z.strictObject({ id: profileIdSchema, ref: profileRefSchema.optional() }),
+  save_creative_profile: profileSaveSchema,
+  assign_work_profile: write({ workId: id, profileId: profileIdSchema, expectedProfileId: profileIdSchema.nullable(), reason: text.max(10_000) }),
   read_usage_guide: z.strictObject({ document: z.enum(["usage", "workflow", "data"]).default("usage"), section: z.string().trim().min(1).max(120).optional(),
     view: z.enum(["summary", "full"]).default("summary") }),
   get_runtime_info: z.strictObject({}),
+  acknowledge_update_notice: z.strictObject({ noticeId: noticeIdSchema, received: z.literal(true) }),
   get_execution: z.strictObject({ executionId: operationIdSchema }),
   cancel_execution: write({ executionId: operationIdSchema, reason: text.max(1_000).default("用户要求停止当前执行。") }),
   prepare_operation: z.strictObject({ name: z.string(), arguments: z.record(z.string(), z.unknown()) }),
   get_operation: z.strictObject({ operationId: operationIdSchema, purpose: purposeSchema.optional().describe("仅在旧区域存在相同操作编号时，用于明确查询哪一份原回执；不切换服务或任务用途。") }),
-  list_works: z.strictObject({ ...page, purpose: z.enum(["production", "test", "all"]).default("production") }),
+  list_works: z.strictObject({ ...page, purpose: z.enum(["production", "test", "all"]).default("production"), profileId: profileIdSchema.optional(), query: text.max(2_000).optional() }),
   create_work: write({ ...workInputSchema.shape, submission: draftSubmissionSchema.optional().describe("新请求必填：已向用户展示的 Markdown 文件来源、正文 SHA-256 与明确交接原话；可选仅为历史回执重放。"),
+    profileRef: profileRefSchema.optional().describe("新请求必填：已读取并在草稿中展示的创作档案确切版本；旧回执重放允许缺省。"),
     purpose: purposeSchema.describe("根据用户明确要求选择 test（测试制作）或 production（正式制作）；无法判断时先询问。与 sample/complete 制作阶段分别判断。") }),
   get_work: z.strictObject({ workId: id, ...page, view: z.enum(["summary", "detail"]).default("summary"), section: z.enum(workSections).optional() }),
   submit_draft: write({ workId: id, markdown: markdownSchema, instruction: text, basedOn: documentRefSchema.optional(), assetIds: z.array(id).max(20).optional(),
+    profileRef: profileRefSchema.optional().describe("省略沿来源草稿的固定版本；切换须明确新版本并更新草稿展示，不自动采用档案最新版。"),
     submission: draftSubmissionSchema.optional().describe("新提交必填；用户确认或针对原草稿检查的已有授权内纠错。") }),
   read_document: z.strictObject({ workId: id, ref: documentRefSchema }),
   revise_draft: write({ workId: id, base: documentRefSchema, instruction: text, assetIds: z.array(id).max(20).optional() }),
@@ -90,7 +100,7 @@ export const inputs = {
     source: z.enum(["user", "external_ai", "internal_check"]) }),
   confirm_version: write({ workId: id, versionId, kind: z.enum(["direction", "acceptance"]),
     userConfirmation: text.max(10_000), scope: text.optional() }),
-  search_experience: z.strictObject({ query: text.max(2_000), ...page }),
+  search_experience: z.strictObject({ query: text.max(2_000), ...page, profileId: profileIdSchema.optional(), scope: z.enum(["all", "same_profile"]).default("all") }),
   read_experience: experienceRefSchema,
   save_experience: write({ experience: experienceInputSchema, id: id.optional(), expectedRevision: z.number().int().nonnegative().default(0) }),
   learning_status: z.strictObject({ workId: id }),
@@ -104,11 +114,17 @@ export const inputs = {
 };
 type ToolName = keyof typeof inputs;
 const readOnly = new Set<ToolName>(["read_usage_guide", "get_runtime_info", "get_execution", "prepare_operation", "get_operation", "list_works", "get_work",
+  "list_creative_profiles", "read_creative_profile",
   "read_document",
   "get_asset", "search_assets", "read_speech_text", "get_review_materials",
   "read_media_image",
   "search_experience", "read_experience", "learning_status", "get_comparison"]);
 const descriptions: Record<ToolName, string> = {
+  list_creative_profiles: "分页查找本机创作档案的大体方向与当前版本；新作品必须明确选择，不自动默认到通用测试。",
+  read_creative_profile: "按编号读当前档案，或按 ref 读确切历史版本及 Markdown 位置；起草前读取，旧任务沿原依据。",
+  save_creative_profile: "保存长期大体方向，不存每条视频的具体定位。按明确用户要求创建或修改；expectedRevision 防止覆盖，同编号重试可接续部分保存。",
+  assign_work_profile: "调整作品管理归属并保存原因与历史，不改变实际制作依据、用途、工程或旧版本；expectedProfileId 核对原归属，null 表示历史未分类。",
+  acknowledge_update_notice: "确认外部 AI 已收到确切版本提醒；请先向用户转述。直接调用，noticeId 是幂等键，不需要 prepare_operation。只记录 AI 收到，不记录用户已读、同意或升级结果。",
   import_asset: "把用户指定的本机图片、录音、背景音乐或音效保存到作品资产目录，核对实际文件并保留来源；不修改原文件。",
   get_asset: "读取已登记素材的本机位置、用途、来源和实际媒体信息；内容变化时拒绝复用。",
   generate_music: "用户明确要求的独立音乐生成；保存描述、原始MP3和请求，不自动开始视频制作。需配置音乐服务，会使用API额度。",
@@ -166,6 +182,7 @@ function executionInput(name: string, input: Record<string, unknown>, raw: unkno
 }
 
 export function prepareOperation(name: string, input: Record<string, unknown>, router?: WorkRouter) {
+  if (name === "acknowledge_update_notice") throw new Error("版本提醒回执直接使用 noticeId 和 received:true 调用，无需准备业务操作。");
   if (!Object.hasOwn(inputs, name) || readOnly.has(name as ToolName)) throw new Error("该工具不是可准备的写操作。");
   const request = { ...input, operationId: randomUUID() };
   const normalized = validateInput(name, inputs[name as ToolName], request);
@@ -198,7 +215,7 @@ function workView(service: WorkService, workId: string, offset = 0, limit = 20) 
       handoffs: work.authoring.handoffs.slice(offset, end), decisions: work.authoring.decisions.slice(offset, end), runs: work.authoring.runs.slice(offset, end) } : undefined,
     confirmations: work.confirmations?.slice(offset, end), learningBatches: work.learningBatches?.slice(offset, end) });
   const more = end < Math.max(work.versions.length, work.feedback.length, work.confirmations?.length ?? 0, work.learningBatches?.length ?? 0,
-    work.assets?.length ?? 0, work.analysisRuns?.length ?? 0, ...Object.values(work.authoring ?? {}).map(items => items.length));
+    work.assets?.length ?? 0, work.analysisRuns?.length ?? 0, ...Object.values(work.authoring ?? {}).map(items => items?.length ?? 0));
   const pending = service.learning.pending(work, false);
   return { ...summary, delivery: service.store.delivery(work), feedbackDirectory: service.store.resolvePath("works/" + workId + "/feedback"),
     feedback: feedbackView(work, summary.feedback), storagePurpose: service.store.purpose,
@@ -212,9 +229,32 @@ function workView(service: WorkService, workId: string, offset = 0, limit = 20) 
 
 /** CLI 与 MCP 共用校验、原操作回执和业务实现。 */
 export async function executeTool(name: string, input: unknown, context?: WorkRouter | WorkService): Promise<unknown> {
+  if (!Object.hasOwn(inputs, name)) throw new Error("未知工具：" + name);
+  const target = context ?? new WorkRouter();
+  const assetRoot = target instanceof WorkRouter ? target.assetRoot : target.store.assetRoot;
+  const checker = new ToolUpdateChecker(assetRoot);
+  // 回执有自己的幂等键；确认旧提醒不能发起新检查或修改业务操作记录。
+  if (name === "acknowledge_update_notice") {
+    const args = inputs.acknowledge_update_notice.parse(input);
+    return checker.acknowledge(args.noticeId);
+  }
+  // 与业务并行，取消等操作可立即执行；检查错误只附在回复中，不改变业务成败。
+  const checking = checker.check();
+  try {
+    const result = await executeToolResult(name, input, target, checking);
+    const updateCheck = await checking;
+    if (!updateCheck) return result;
+    return result && typeof result === "object" && !Array.isArray(result)
+      ? { ...result, updateCheck } : { result, updateCheck };
+  } catch (error) { await checking; throw error; }
+}
+
+async function executeToolResult(name: string, input: unknown, context: WorkRouter | WorkService, checking: Promise<unknown>): Promise<unknown> {
   const receivedAt = new Date().toISOString();
   const target = context ?? new WorkRouter();
   const result = await execute(name, input, target, true, receivedAt);
+  // 对外返回时序包含首次更新检查的等待，不能提前记录成已返回。
+  await checking;
   if (name === "get_execution" || name === "cancel_execution") {
     const router = target instanceof WorkRouter ? target : new WorkRouter(target.store.assetRoot);
     const args = z.object({ executionId: operationIdSchema }).parse(input);
@@ -242,6 +282,10 @@ export async function executeTool(name: string, input: unknown, context?: WorkRo
 
 /** 业务回归的进程内入口；对外 MCP 和 CLI 始终通过 executeTool 受理耗时工作。 */
 export async function executeToolInline(name: string, input: unknown, context: WorkRouter | WorkService): Promise<unknown> {
+  if (name === "acknowledge_update_notice") {
+    const args = inputs.acknowledge_update_notice.parse(input);
+    return new ToolUpdateChecker(context instanceof WorkRouter ? context.assetRoot : context.store.assetRoot).acknowledge(args.noticeId);
+  }
   return execute(name, input, context, false);
 }
 
@@ -267,6 +311,10 @@ async function execute(name: string, input: unknown, context: WorkRouter | WorkS
           request = { ...args, render: true };
         }
       }
+      if (["save_creative_profile", "assign_work_profile"].includes(tool)) {
+        const service = tool === "assign_work_profile" ? router.forWork(inputs.assign_work_profile.parse(parsed).workId) : router.service("production");
+        return existing.store.resumeLocal(operationId, tool, request, () => perform(tool, parsed, service, router));
+      }
       return existing.store.replay(operationId, tool, request);
     }
   }
@@ -281,6 +329,12 @@ async function execute(name: string, input: unknown, context: WorkRouter | WorkS
   try {
     if (tool === "create_work") {
       const args = inputs.create_work.parse(parsed); service.documents.validateDraftInput(args.brief, args.submission);
+      service.documents.resolveProfile(args.brief, args.profileRef, undefined, undefined, true);
+    }
+    if (tool === "create_comparison") {
+      const args = inputs.create_comparison.parse(parsed);
+      if (!args.comparison.profileRef) throw new Error("新比较须明确选择共同创作档案版本。");
+      new ProfileStore(router.assetRoot).select(args.comparison.profileRef);
     }
     if (["submit_draft", "handoff_draft", "review_design"].includes(tool)) {
       const args = z.object({ workId: id }).parse(parsed);
@@ -291,6 +345,7 @@ async function execute(name: string, input: unknown, context: WorkRouter | WorkS
       const args = inputs.submit_draft.parse(parsed), record = service.store.read(args.workId);
       service.documents.validateSubmission(record, args.basedOn, args.assetIds);
       service.documents.validateDraftInput(args.markdown, args.submission, record, args.basedOn);
+      service.documents.resolveProfile(args.markdown, args.profileRef, record, args.basedOn, true);
     }
     if (tool === "handoff_draft") {
       const args = inputs.handoff_draft.parse(parsed); service.documents.validateHandoff(service.store.read(args.workId), args.draft);
@@ -362,7 +417,7 @@ async function execute(name: string, input: unknown, context: WorkRouter | WorkS
       () => new BackgroundService(router).submit(backgroundToolSchema.parse(tool), request, receivedAt, effective), service.store.purpose, "accepted", receivedAt);
   }
   return router.operations.execute(operationId, name, parsed, () => perform(tool, effective, service, router),
-    ["save_experience", "cancel_execution"].includes(tool) ? undefined : service.store.purpose, "succeeded", receivedAt);
+    ["save_experience", "cancel_execution", "save_creative_profile"].includes(tool) ? undefined : service.store.purpose, "succeeded", receivedAt);
 }
 
 /** 已领取的本机工作进程执行原动作，不再次受理或创建第二份操作回执。 */
@@ -374,11 +429,26 @@ export async function runBackgroundAction(name: string, input: unknown, router: 
 async function perform(name: ToolName, input: unknown, service: WorkService, router: WorkRouter): Promise<unknown> {
   const store = service.store;
   switch (name) {
+    case "list_creative_profiles": {
+      const args = inputs.list_creative_profiles.parse(input), profiles = new ProfileStore(router.assetRoot).list(args.includeInactive), end = args.offset + args.limit;
+      return { profiles: profiles.slice(args.offset, end), nextOffset: end < profiles.length ? end : null, coverage: end < profiles.length ? "partial" : "complete" };
+    }
+    case "read_creative_profile": {
+      const args = inputs.read_creative_profile.parse(input), profiles = new ProfileStore(router.assetRoot);
+      if (args.ref && args.id !== args.ref.id) throw new Error("档案编号与引用不一致。");
+      return args.ref ? profiles.read(args.ref) : profiles.current(args.id);
+    }
+    case "save_creative_profile": return new ProfileStore(router.assetRoot).save(inputs.save_creative_profile.parse(input));
+    case "assign_work_profile": {
+      const args = inputs.assign_work_profile.parse(input);
+      return store.assignProfile(args.workId, args.profileId, args.expectedProfileId, args.reason, args.operationId);
+    }
     case "read_usage_guide": { const args = inputs.read_usage_guide.parse(input);
       const capabilities = (Object.keys(inputs) as ToolName[]).map(tool => toolCapability(tool, readOnly.has(tool)));
       const guide = readUsageGuide(args.document, args.section, args.view, capabilityTable(capabilities));
       return args.document === "usage" && args.section === "工具执行契约" ? { ...guide, tools: capabilities } : guide; }
     case "get_runtime_info": return { assetRoot: router.assetRoot, workRoots: router.workRoots,
+      updateChecks: configuration.updates,
       models: configuration.models,
       mediaServices: { gptImageConfigured: Boolean(configuration.providers.image), doubaoSpeechConfigured: Boolean(configuration.providers.speech),
         musicConfigured: Boolean(configuration.providers.music), soundEffectConfigured: Boolean(configuration.providers.sound_effect) },
@@ -387,6 +457,7 @@ async function perform(name: ToolName, input: unknown, service: WorkService, rou
       assetIndexPath: join(router.assetRoot, "library", "index.json"),
       audioInspection: "manual",
       knowledgeRoot: service.knowledge.root, scopeIds: router.scopes(), systemFingerprint: systemFingerprint(),
+      creativeProfileRoot: new ProfileStore(router.assetRoot).root,
       executionMode: "background", usageGuideTool: "read_usage_guide" };
     case "get_execution": return new BackgroundService(router).view(inputs.get_execution.parse(input).executionId);
     case "cancel_execution": { const args = inputs.cancel_execution.parse(input); return new BackgroundService(router).stop(args.executionId, args.reason); }
@@ -399,16 +470,18 @@ async function perform(name: ToolName, input: unknown, service: WorkService, rou
     case "list_works": {
       const args = inputs.list_works.parse(input), selected = args.purpose === "all" ? ["production", "test"] as const : [args.purpose];
       const works = selected.flatMap(purpose => router.service(purpose).store.list().map(work => ({ ...work, storagePurpose: purpose })))
+        .filter(work => (!args.profileId || work.profileId === args.profileId) && (!args.query || [work.title, work.positioning ?? ""].join(" ").normalize("NFKC").toLowerCase().includes(args.query.normalize("NFKC").toLowerCase())))
         .sort((a, b) => a.id.localeCompare(b.id) || a.storagePurpose.localeCompare(b.storagePurpose));
       const end = args.offset + args.limit;
       return { works: works.slice(args.offset, end), nextOffset: end < works.length ? end : null, coverage: end < works.length ? "partial" : "complete" };
     }
     case "create_work": {
-      const args = inputs.create_work.parse(input), work = store.create(args.title, args.brief, args.operationId, undefined, true);
+      const args = inputs.create_work.parse(input), creativeProfile = service.documents.resolveProfile(args.brief, args.profileRef, undefined, undefined, true);
+      const work = store.create(args.title, args.brief, args.operationId, undefined, true, creativeProfile);
       await store.withLock(work.id, () => service.documents.initialize(store.read(work.id), args.brief, args.operationId, args.submission));
       return workView(service, work.id);
     }
-    case "submit_draft": { const args = inputs.submit_draft.parse(input); return service.documents.submit(args.workId, args.markdown, args.operationId, args.instruction, args.basedOn, args.assetIds, args.submission); }
+    case "submit_draft": { const args = inputs.submit_draft.parse(input); return service.documents.submit(args.workId, args.markdown, args.operationId, args.instruction, args.basedOn, args.assetIds, args.submission, args.profileRef); }
     case "read_document": { const args = inputs.read_document.parse(input); return service.documents.read(store.read(args.workId), args.ref); }
     case "get_asset": { const args = inputs.get_asset.parse(input); return service.assets.assets.view(store.read(args.workId), args.assetId); }
     case "search_assets": { const args = inputs.search_assets.parse(input); return new AssetCatalog(router.service(args.purpose).store).search(args); }
@@ -491,7 +564,7 @@ async function perform(name: ToolName, input: unknown, service: WorkService, rou
     case "submit_feedback": { const args = inputs.submit_feedback.parse(input); await store.feedback(args.workId, args.versionId, args.text, args.source, args.changesDirection, args.location, args.operationId, args.supersedes); return workView(service, args.workId); }
     case "record_review": { const args = inputs.record_review.parse(input); await store.review(args.workId, args.versionId, args.status, args.notes, args.source, args.materialIndexes, args.coverage); return workView(service, args.workId); }
     case "confirm_version": { const args = inputs.confirm_version.parse(input); await store.confirm(args.workId, args.versionId, args.kind, args.userConfirmation, args.scope); return workView(service, args.workId); }
-    case "search_experience": { const args = inputs.search_experience.parse(input); return service.knowledge.search(args.query, args.offset, args.limit); }
+    case "search_experience": { const args = inputs.search_experience.parse(input); return service.knowledge.search(args.query, args.offset, args.limit, undefined, args); }
     case "read_experience": { const ref = inputs.read_experience.parse(input); return { ref, experience: service.knowledge.read(ref) }; }
     case "save_experience": { const args = inputs.save_experience.parse(input); return service.knowledge.save(args.experience, { id: args.id, expectedRevision: args.expectedRevision }); }
     case "learning_status": { const work = store.read(inputs.learning_status.parse(input).workId); return { pending: service.learning.pending(work), batches: work.learningBatches ?? [], pendingSave: work.learningPending, error: work.learningError }; }

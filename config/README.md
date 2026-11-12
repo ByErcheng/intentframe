@@ -73,6 +73,12 @@ chmod 600 config/local.json
 
 从之前的用途切换方式升级时，删除客户端配置或终端中的 `INTENTFRAME_PURPOSE`，重启一次连接以刷新工具参数。该变量已停用，残留时会明确报错。以后无需为日常用途选择重启服务；已有作品、操作回执和用途未明的历史记录保留原位。
 
+## 更新检查配置
+
+`updates` 可省略，默认 `{"enabled":true,"dayStartHour":6,"timeoutMs":4000}`。`dayStartHour` 为本机时间的每日分界小时（0–23），不创建定时任务；`timeoutMs` 为本次公开版本查询的短超时（100–10000 毫秒）。`enabled:false` 关闭自动检查；测试或离线诊断可显式设置 `INTENTFRAME_UPDATE_CHECKS=0`，设为 `1` 强制启用，其他值拒绝。该覆盖项由项目启动环境继续传递。
+
+旧本机配置无需迁移即可使用默认值，修改后重启服务。`get_runtime_info` 返回实际加载的 `updateChecks`，工具调用在 `updateCheck` 中返回本次或本周期缓存结果。工具清单、检查范围与验证入口见[工具更新检查](../docs/maintenance.md#工具更新检查)；新增或升级工具时须同步维护[工具清单](./tool-updates.json)，不把当前版本重复手填到清单。
+
 ## 提示词与模型配置
 
 `local.json` 的必填 `models` 管理项目 Codex 调用，结构与当前初始选择见 [example.json](./example.json)。`default` 同时填写 `model` 与 `effort`；`stages` 按环节覆盖其中一项或两项，未覆盖字段继承 default。模型标识和强度不写入业务代码或提示词。此配置不修改用户全局 Codex 配置，也不改变当前外部聊天使用的模型。图片、语音、音乐等生成供应商仍独立使用 `providers`。

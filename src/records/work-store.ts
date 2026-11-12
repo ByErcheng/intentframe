@@ -4,13 +4,16 @@ import {
 } from "node:fs";
 import { join, resolve } from "node:path";
 import { z } from "zod";
+import { profileSnapshotSchema, profileAssignmentSchema, profileIdSchema, readCreativeBrief } from "./creative-profile.ts";
+import type { ProfileSnapshot } from "./creative-profile.ts";
+import { ProfileStore } from "./profile-store.ts";
 import { modelEvidenceFields } from "./model-settings.ts";
 import { analysisRunSchema } from "./model-analysis.ts";
 import { configuration } from "../config.ts";
 import { fileHash, sourceSnapshotSchema, verifyLegacySource, verifySourceSnapshot } from "./source-snapshot.ts";
 import { productionResultSchema } from "../runtime/production-result.ts";
 import { atomicJson, immutableJson, ownedPath, readJson, valueHash } from "./files.ts";
-import { experienceRefSchema, feedbackLocationSchema, learningResultSchema, purposeSchema, workInputSchema } from "./contracts.ts";
+import { experienceRefSchema, feedbackLocationSchema, learningResultSchema, learningCaseSourcesSchema, purposeSchema, workInputSchema } from "./contracts.ts";
 import type { FeedbackLocation, WorkPurpose } from "./contracts.ts";
 import { processExists } from "../runtime/process-state.ts";
 import { activeExecution, assertExecutionAccess, ExecutionStore, withExecutionDispatch } from "./execution-store.ts";
@@ -65,6 +68,7 @@ export const versionSchema = z.object({
   userConfirmation: z.string().optional(), error: z.string().optional(),
   operationId: z.string().optional(), contextSha256: z.string().optional(),
   designRef: documentRefSchema.optional(), designDecisionId: z.string().optional(),
+  creativeProfile: profileSnapshotSchema.optional(),
   assets: z.array(assetSchema).optional(), reviewPreparation: reviewPreparationSchema.optional(),
   assetRequestIds: z.array(z.string()).optional(),
   mediaToolsVersion: z.literal(1).optional(),
@@ -95,6 +99,8 @@ export const workSchema = z.object({
   comparison: z.object({ id: idSchema, side: z.enum(["before", "after"]), inputHash: z.string() }).optional(),
   id: idSchema, title: z.string(), briefPath: z.string(), createdAt: z.string(),
   authoring: authoringSchema.optional(),
+  creationProfile: profileSnapshotSchema.optional(),
+  profileAssignments: z.array(profileAssignmentSchema).optional(),
   assets: z.array(assetSchema).optional(),
   analysisRuns: z.array(analysisRunSchema).optional(),
   execution: executionSchema,
@@ -107,7 +113,8 @@ export const workSchema = z.object({
   versions: z.array(versionSchema),
   learningBatches: z.array(z.object({ id: idSchema, checkedSourceIds: z.array(z.string()), notes: z.string(), versionId: z.string(),
     experienceRefs: z.array(experienceRefSchema), savedAt: z.string(), staged: z.boolean(), draftSha256: z.string().optional() })).optional(),
-  learningPending: z.object({ id: idSchema, result: learningResultSchema, versionId: z.string(), sourceIds: z.array(z.string()), createdAt: z.string() }).optional(),
+  learningPending: z.object({ id: idSchema, result: learningResultSchema, versionId: z.string(), sourceIds: z.array(z.string()),
+    caseSources: learningCaseSourcesSchema.optional(), createdAt: z.string() }).optional(),
   learningError: z.string().optional(),
   learningRun: z.object({ id: idSchema, versionId: z.string(), sourceIds: z.array(z.string()), contextSha256: z.string(),
     ...modelEvidenceFields,
@@ -238,6 +245,7 @@ export class WorkStore {
         const record = this.read(entry.name);
         const latest = record.versions.at(-1);
         return { id: record.id, title: record.title, purpose: record.purpose ?? "unspecified", execution: record.execution.status,
+          ...this.profileContext(record),
           latestVersion: latest?.id, acceptance: latest?.acceptance,
           availability: latest ? this.availability(latest) : undefined };
       });
@@ -255,13 +263,15 @@ export class WorkStore {
     return "work-" + valueHash({ scopeId: this.scope(true)!.id, operationId }).slice(0, 32);
   }
 
-  create(title: string, brief: string, operationId?: string, comparison?: WorkRecord["comparison"], designFirst = false): WorkRecord {
+  create(title: string, brief: string, operationId?: string, comparison?: WorkRecord["comparison"], designFirst = false, creativeProfile?: ProfileSnapshot): WorkRecord {
     workInputSchema.parse({ title, brief });
+    if (creativeProfile) profileSnapshotSchema.parse(creativeProfile);
     const scope = this.scope(true)!;
     const id = operationId ? this.plannedWorkId(operationId) : "work-" + randomUUID();
     if (existsSync(this.resolvePath(join("works", id, "task.json")))) {
       const previous = this.read(id);
       if (previous.creationOperationId !== operationId || previous.title !== title || valueHash(previous.comparison ?? null) !== valueHash(comparison ?? null) ||
+          valueHash(previous.creationProfile ?? null) !== valueHash(creativeProfile ?? null) ||
           readFileSync(this.resolvePath(previous.briefPath), "utf8") !== "# 原始需求\n\n" + brief + "\n") throw new Error("原操作的任务内容不一致。");
       return previous;
     }
@@ -273,6 +283,8 @@ export class WorkStore {
       execution: { status: "idle" }, directionApproval: null, feedback: [], versions: [],
       // 新入口在首次写入就声明设计前置，避免后续草稿落盘失败时意外退回旧流程。
       authoring: designFirst ? authoringSchema.parse({}) : undefined,
+      ...(creativeProfile ? { creationProfile: creativeProfile, profileAssignments: [{ profileId: creativeProfile.ref.id,
+        previousProfileId: null, operationId: operationId ?? id, reason: "新作品明确选择创作档案。", assignedAt: now() }] } : {}),
     };
     writeFileSync(this.resolvePath(record.briefPath), "# 原始需求\n\n" + brief + "\n", { flag: "wx" });
     this.save(record);
@@ -516,6 +528,7 @@ export class WorkStore {
   summary(record: WorkRecord) {
     return {
       ...record,
+      ...this.profileContext(record),
       delivery: this.delivery(record),
       taskPath: join(this.workDirectory(record.id), "task.json"),
       briefLocation: this.resolvePath(record.briefPath),
@@ -531,5 +544,42 @@ export class WorkStore {
           diagnosticVideoLocation: availability.status === "available" ? this.resolvePath(version.mediaPath) : null };
       }),
     };
+  }
+
+  profileContext(record: WorkRecord) {
+    const draft = record.authoring?.drafts.at(-1), latest = record.versions.at(-1);
+    if (draft?.creativeProfile) {
+      const path = this.resolvePath(draft.path);
+      if (fileHash(path) !== draft.contentSha256 || valueHash(readCreativeBrief(readFileSync(path, "utf8"), draft.creativeProfile)) !== valueHash(draft.creativeBrief ?? null)) {
+        throw new Error("草稿定位摘要与原文不一致，不能作为查找依据。");
+      }
+    }
+    return { profileId: record.profileAssignments?.at(-1)?.profileId ?? null,
+      draftProfile: draft?.creativeProfile?.ref ?? null, productionProfile: latest?.creativeProfile?.ref ?? null,
+      positioning: draft?.creativeBrief?.positioning ?? null,
+      positioningSource: draft?.creativeBrief ? { id: draft.id, sha256: draft.sha256 } : null };
+  }
+
+  async assignProfile(id: string, profileId: string, expectedProfileId: string | null, reason: string, operationId: string) {
+    profileIdSchema.parse(profileId);
+    return this.withLock(id, () => {
+      const record = this.read(id), history = record.profileAssignments ?? [];
+      const previous = history.find(item => item.operationId === operationId);
+      if (previous) {
+        if (previous.profileId !== profileId || previous.previousProfileId !== expectedProfileId || previous.reason !== reason) throw new Error("同一归属操作内容不一致。");
+        return previous;
+      }
+      if (["running", "unknown"].includes(record.execution.status)) throw new Error("作品执行尚未核清，暂不能改变归属。");
+      if ((history.at(-1)?.profileId ?? null) !== expectedProfileId) throw new Error("作品归属已变化，请读取当前记录。");
+      const profiles = new ProfileStore(this.assetRoot), selected = profiles.current(profileId);
+      profiles.select(selected.ref);
+      const assignment = profileAssignmentSchema.parse({ profileId, previousProfileId: expectedProfileId, reason, operationId, assignedAt: now() });
+      // 归类旧任务只追加本字段，保留旧 JSON 中未知字段、缺省值及独立反馈的原保存形态。
+      const path = this.resolvePath(join("works", id, "task.json"));
+      const original = z.record(z.string(), z.unknown()).parse(readJson(path));
+      const next = { ...original, profileAssignments: [...history, assignment] };
+      validateRecord(next); atomicJson(path, next);
+      return assignment;
+    });
   }
 }

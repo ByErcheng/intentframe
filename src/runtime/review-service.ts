@@ -20,6 +20,7 @@ import { readPrompt } from "./prompts.ts";
 import { processExists } from "./process-state.ts";
 import { currentLibraryUsage } from "../records/asset-library.ts";
 import { ModelAnalysisService } from "./model-analysis-service.ts";
+import { selectReviewImages } from "../media/review-image-selection.ts";
 
 const resultSchema = z.object({ sufficient: z.boolean(), notes: z.string().trim().min(1).max(5000),
   additionalRanges: z.array(reviewRangeSchema).max(6), limitations: z.array(z.string().max(2000)).max(20),
@@ -128,8 +129,9 @@ export class ReviewService {
     const view = this.view(record, version), prompt = readPrompt("review-materials");
     const allSheets = view.batches.flatMap(batch => batch.sheets.map(item => item.location));
     // 请求必须说明实际传入哪几张图；长片不能把未读材料称为已看。
-    const images = allSheets.length <= 12 ? allSheets : Array.from({ length: 12 }, (_, index) => allSheets[Math.round(index * (allSheets.length - 1) / 11)]!);
+    const images = selectReviewImages(view.batches);
     immutableJson(this.store.resolvePath(inputPath), { runId: id, modelSelection, versionId: version.id, videoSha256: version.videoSha256, design: view.design,
+      creativeProfile: version.creativeProfile,
       internalRepair: version.internalRepair,
       externalReview: version.review,
       assetUsage: view.assetUsage,

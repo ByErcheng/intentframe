@@ -9,6 +9,24 @@ import type { renderVersion } from "../src/media/render.ts";
 import { DocumentStore } from "../src/records/document-store.ts";
 import { createHash } from "node:crypto";
 import type { DraftSubmission } from "../src/records/authoring-contracts.ts";
+import { ProfileStore } from "../src/records/profile-store.ts";
+import { profileHeading } from "../src/records/creative-profile.ts";
+import { valueHash } from "../src/records/files.ts";
+import { configuration } from "../src/config.ts";
+
+const fixtureProfileRequest = { id: "profile-fixture", expectedRevision: 0, operationId: "fixture-profile",
+  profile: { name: "合成测试", summary: "只验证系统行为。", markdown: "# 合成测试\n每条任务独立，不代表真实创作要求。", status: "active" as const, instruction: "隔离测试夹具。" } };
+const fixtureProfileRecord = { ...fixtureProfileRequest.profile, id: fixtureProfileRequest.id, revision: 1,
+  createdAt: "2026-01-01T00:00:00.000Z", operationId: fixtureProfileRequest.operationId, requestHash: valueHash(fixtureProfileRequest) };
+export const fixtureProfile = { ref: { id: fixtureProfileRecord.id, revision: 1, sha256: valueHash(fixtureProfileRecord) }, profile: fixtureProfileRecord };
+export function seedProfile(root: string) { return new ProfileStore(root, () => fixtureProfileRecord.createdAt).save(fixtureProfileRequest); }
+export function profiledMarkdown(markdown: string) {
+  if (markdown.includes("所属创作档案：")) return markdown;
+  return profileHeading(fixtureProfile) + "\n档案方向摘要：只验证系统行为。\n本条视频定位：合成输入用于当前回归。\n\n" + markdown;
+}
+// 常规系统回归不访问公开版本服务；更新检查用例显式注入合成来源，真实联网另测。
+configuration.updates.enabled = false;
+process.env.INTENTFRAME_UPDATE_CHECKS = "0";
 
 /** 调用方提供的合成文件来源与确认声明；不代表真实用户确认或真实素材。 */
 export function draftSubmission(markdown: string): DraftSubmission {
@@ -16,7 +34,10 @@ export function draftSubmission(markdown: string): DraftSubmission {
     authorization: { kind: "user", userInstruction: "合成用户确认：将此版本交给项目检查和设计。" } };
 }
 
-export function confirmedDraft<T extends { brief: string }>(input: T) { return { ...input, submission: draftSubmission(input.brief) }; }
+export function confirmedDraft<T extends { brief: string }>(input: T) {
+  const brief = input.brief.trim() ? profiledMarkdown(input.brief) : input.brief;
+  return { ...input, brief, profileRef: fixtureProfile.ref, submission: draftSubmission(brief) };
+}
 
 /** 合成已交接、已采用设计，供非模型设计能力测试复用；真实接入另测完整交接。 */
 export async function adoptedDesign(store: WorkStore, workId: string, markdown = "# 合成设计\n显示测试色块，检查交接。\n") {
@@ -39,6 +60,7 @@ export async function adoptedDesign(store: WorkStore, workId: string, markdown =
 
 export function fixtureRoot() {
   const path = mkdtempSync(join(realpathSync(tmpdir()), "intentframe-test-"));
+  seedProfile(path);
   return { path, cleanup: () => rmSync(path, { recursive: true, force: true }) };
 }
 

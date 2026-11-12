@@ -50,6 +50,11 @@ const settingsSchema = z.strictObject({
     decodeTimeoutMs: timeoutSchema, previewTimeoutMs: timeoutSchema }),
   backup: z.strictObject({ commandTimeoutMs: timeoutSchema }),
   diagnostics: z.strictObject({ toolTimeoutMs: timeoutSchema }),
+  updates: z.strictObject({
+    enabled: z.boolean().default(true),
+    dayStartHour: z.number().int().min(0).max(23).default(6),
+    timeoutMs: z.number().int().min(100).max(10_000).default(4_000),
+  }).default({ enabled: true, dayStartHour: 6, timeoutMs: 4_000 }),
   models: modelsSchema,
   providers: providersSchema.optional(),
   assetLibraries: z.array(assetLibrarySchema).max(20).default([]).refine(items => new Set(items.map(item => item.id)).size === items.length, "素材库编号须唯一"),
@@ -99,6 +104,11 @@ export function loadConfiguration(root = repositoryRoot, environment: NodeJS.Pro
     throw new Error("INTENTFRAME_PURPOSE 已停用；请从启动配置中删除，创建任务时明确指定 purpose 为 test 或 production。已有任务按编号沿用原用途。");
   }
   const environmentOverrides: string[] = [];
+  if (environment.INTENTFRAME_UPDATE_CHECKS !== undefined) {
+    if (!["0", "1"].includes(environment.INTENTFRAME_UPDATE_CHECKS)) throw new Error("INTENTFRAME_UPDATE_CHECKS 只接受 0 或 1。");
+    settings.updates.enabled = environment.INTENTFRAME_UPDATE_CHECKS === "1";
+    environmentOverrides.push("INTENTFRAME_UPDATE_CHECKS");
+  }
   const location = (name: string, configured: string): string => {
     const override = environment[name];
     if (override !== undefined) {
@@ -118,7 +128,7 @@ export function loadConfiguration(root = repositoryRoot, environment: NodeJS.Pro
     codex: location("INTENTFRAME_CODEX_BIN", settings.tools.codex.path),
     restic: location("INTENTFRAME_RESTIC_BIN", settings.tools.restic.path),
     tools: settings.tools, runtime: settings.runtime, mcp: settings.mcp,
-    media: settings.media, backup: settings.backup, diagnostics: settings.diagnostics,
+    media: settings.media, backup: settings.backup, diagnostics: settings.diagnostics, updates: settings.updates,
     providers: settings.providers ?? {},
     models: settings.models,
     assetLibraries: settings.assetLibraries.map(item => ({ ...item, path: resolve(root, item.path) })),
@@ -135,5 +145,6 @@ export function projectEnvironment(): Record<string, string> {
     INTENTFRAME_NODE_BIN: configuration.node,
     INTENTFRAME_CODEX_BIN: configuration.codex,
     INTENTFRAME_RESTIC_BIN: configuration.restic,
+    INTENTFRAME_UPDATE_CHECKS: configuration.updates.enabled ? "1" : "0",
   };
 }

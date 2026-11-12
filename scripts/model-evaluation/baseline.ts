@@ -4,6 +4,9 @@ import { WorkStore } from "../../src/records/work-store.ts";
 import type { WorkRecord, WorkVersion } from "../../src/records/work-store.ts";
 import { WorkService } from "../../src/runtime/work-service.ts";
 import { captureSourceSnapshot, fileHash } from "../../src/records/source-snapshot.ts";
+import { DocumentStore } from "../../src/records/document-store.ts";
+import { documentRefSchema, baselineDraftReviewEvidenceSchema } from "../../src/records/authoring-contracts.ts";
+import { immutableJson, valueHash } from "../../src/records/files.ts";
 import { inside, writeNew } from "./plan.ts";
 
 /** 导出新的测试基线，不改原件；不复制原模型审查、反馈、对话或完成声明。 */
@@ -18,10 +21,18 @@ export async function exportBaseline(sourceRoot: string, workId: string, version
   const design=source.authoring?.designs.find(d=>d.id===version.designRef!.id&&d.sha256===version.designRef!.sha256);
   const draft=source.authoring?.drafts.find(d=>d.id===design?.draft?.id);
   if(!design||!draft)throw new Error("原版本缺少可核对的草稿或设计");
+  const documents = new DocumentStore(original);
+  documents.document(source, design); documents.assertReviewed(source, draft);
+  const review = documents.latestDraftReview(source, draft);
+  const prerequisite = review ? baselineDraftReviewEvidenceSchema.parse({ kind: "verified_baseline_draft_review",
+    draft: documentRefSchema.parse(draft), sourceWorkId: source.id, sourceRunId: review.id,
+    sourceInputSha256: review.inputSha256, sourceResultSha256: valueHash(review.draftReview) }) : documents.baselineReviewEvidence(source, draft);
   mkdirSync(target,{recursive:true,mode:0o700});
   const store=new WorkStore(resolve(target,"testing"),"test",target),scope=store.scope(true)!;
   mkdirSync(store.workDirectory(workId),{recursive:true});
   for(const document of [draft,design]){mkdirSync(dirname(store.resolvePath(document.path)),{recursive:true});cpSync(original.resolvePath(document.path),store.resolvePath(document.path));}
+  const prerequisitePath = "works/" + workId + "/documents/" + draft.id + "-review-prerequisite.json";
+  if (prerequisite) immutableJson(store.resolvePath(prerequisitePath), prerequisite);
   writeFileSync(store.resolvePath(source.briefPath),"# 共同测试基线\n\n"+readFileSync(original.resolvePath(draft.path),"utf8"),{flag:"wx"});
   const sourceDir=dirname(original.resolvePath(version.sourcePath)), targetDir=dirname(store.resolvePath(version.sourcePath));
   cpSync(sourceDir,targetDir,{recursive:true,dereference:false});
@@ -42,7 +53,9 @@ export async function exportBaseline(sourceRoot: string, workId: string, version
     technicalCheck:{...version.technicalCheck,previews:[]},review:{status:"not_reviewed"},acceptance:"pending",mediaToolsVersion:version.mediaToolsVersion,audioPlan:version.audioPlan};
   const record:WorkRecord={schemaVersion:1,id:source.id,title:source.title+"共同基线",briefPath:source.briefPath,createdAt:new Date().toISOString(),purpose:"test",scopeId:scope.id,
     creationOperationId:"baseline-export",execution:{status:"idle"},directionApproval:null,feedback:[],assets,versions:[baseline],
-    authoring:{drafts:[draft],designs:[design],runs:[],handoffs:[{operationId:"baseline-handoff",draft:{id:draft.id,sha256:draft.sha256},userInstruction:"合成测试基线：固定已有输入，不代表真实用户交接。",createdAt:new Date().toISOString()}],
+    authoring:{drafts:[draft],designs:[design],runs:[],
+      ...(prerequisite ? { baselineDraftReviews: [{ draft: documentRefSchema.parse(draft), path: prerequisitePath, sha256: fileHash(store.resolvePath(prerequisitePath)) }] } : {}),
+      handoffs:[{operationId:"baseline-handoff",draft:{id:draft.id,sha256:draft.sha256},userInstruction:"合成测试基线：固定已有输入，不代表真实用户交接。",createdAt:new Date().toISOString()}],
       decisions:[{operationId:"baseline-adopt",design:version.designRef,status:"adopted",source:"external_ai",notes:"导出测试指定的确切设计；原始准备记录不作为参赛模型的审查答案。",createdAt:new Date().toISOString(),feedbackAcknowledgedIds:[]}]}};
   store.save(record);store.assertAvailable(baseline);
   const provenance={sourceRoot:origin,workId,versionId,originalVideoSha256:version.videoSha256,originalSourceSnapshot:version.sourceSnapshot,

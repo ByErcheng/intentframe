@@ -49,6 +49,8 @@ node scripts/run-model-evaluation.ts run /absolute/local-testing/new-round run-�
 
 `prepare` 冻结案例正文及摘要、配置、运行编号和顺序，分配独立候选目录；`run` 核对冻结正文、清单、系统指纹、运行脚本、资源配置和共同基线，条件变化拒绝同轮继续。基线必须是独立的单作品 `purpose=test` 数据快照，实际文件的目录摘要通过 `snapshot-hash <目录>` 获得。[绑定格式](config/baseline.example.json)中的核验记录由实际检查者填写；反馈修改额外提供 `feedbackIds`。经验基线须已有可追溯、未整理的来源记录，不能只提交四行文字当成工程历史。
 
+通过 [exportBaseline](../../scripts/model-evaluation/baseline.ts) 导出新流程作品时，先核对原稿件及其入项检查。副本保留确切草稿已通过的最小前置事实和来源摘要，原检查正文、反馈及模型回答不进入候选输入，也不伪造一次新模型检查。该依据仅供测试副本的原草稿使用；新稿仍须检查，后续实际检查失败优先于导出事实。旧流程没有检查记录时保持原兼容规则，不补认历史检查。导出只准备基线，媒体核验与比较评价仍须单独完成。
+
 运行器先查询实际模型目录，核对所输入的强度是否受支持，再在新线程及轮次中显式传入模型与强度；文件边界使用命名权限配置，并核对实际生效的 profile。旧的 `readOnly.access` 字段已被实机拒绝，不再使用。独立审查额外禁止读取版本源码、任务记录和反馈目录。有效模型、强度或权限配置不符或缺失时，不发送生成轮次；回执不代表服务端内部路由可知。依据为[官方 app-server 文档](https://learn.chatgpt.com/docs/app-server)、[权限配置说明](https://learn.chatgpt.com/docs/permissions)及本机生成的实验协议类型。
 
 ### 执行条件与失败处理

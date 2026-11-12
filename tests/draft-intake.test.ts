@@ -6,7 +6,7 @@ import { executeToolInline as call } from "../src/mcp/server.ts";
 import { WorkStore, workSchema } from "../src/records/work-store.ts";
 import { WorkService } from "../src/runtime/work-service.ts";
 import { KnowledgeStore } from "../src/records/knowledge-store.ts";
-import { confirmedDraft, draftSubmission, fakeCodex, fixtureRoot } from "./helpers.ts";
+import { confirmedDraft, draftSubmission, fakeCodex, fixtureRoot, profiledMarkdown } from "./helpers.ts";
 import { backgroundFixture } from "./background-helpers.ts";
 import type { DraftSubmission } from "../src/records/authoring-contracts.ts";
 
@@ -31,7 +31,7 @@ test("未确认、摘要错配与伪造首次纠错在创建任务前被拒绝�
     const request = confirmedDraft(input), userInstruction = "  合成用户确认：将此版本交给项目检查和设计。\n";
     request.submission.authorization = { kind: "user", userInstruction };
     const original = await call("create_work", request, service), work = workSchema.parse(original);
-    assert.equal(service.documents.read(work, work.authoring!.drafts[0]!).markdown, input.brief);
+    assert.equal(service.documents.read(work, work.authoring!.drafts[0]!).markdown, request.brief);
     assert.equal(work.authoring!.handoffs[0]!.userInstruction, userInstruction);
     assert.equal(work.authoring!.runs.length, 0);
     assert.deepEqual(await call("create_work", request, service), original);
@@ -63,7 +63,7 @@ test("外部纠错沿原授权生成新稿，新版须复查且旧检查不能�
   try {
     const review = await f.service.authoring.generate(f.work.id, "review_draft", f.draft, "合成问题", "review");
     assert.equal(review.status, "needs_input");
-    const markdown = "# 合成草稿\n按已有原话修正遗漏。";
+    const markdown = profiledMarkdown("# 合成草稿\n按已有原话修正遗漏。");
     const submission: DraftSubmission = { ...draftSubmission(markdown), authorization: {
       kind: "external_correction", reviewRunId: review.runId, notes: "依据已有原话补回漏掉的台词，意图不变。" } };
     const next = await f.service.documents.submit(f.work.id, markdown, "correct", "处理检查意见", f.draft, undefined, submission);
@@ -101,7 +101,7 @@ test("用户意图歧义不能以外部纠错绕过，须对修订版保存新�
   try {
     const review = await f.service.authoring.generate(f.work.id, "review_draft", f.draft, "合成歧义", "review");
     assert.equal(review.draftReview?.status, "needs_confirmation");
-    const markdown = "用户已澄清的新稿";
+    const markdown = profiledMarkdown("用户已澄清的新稿");
     await assert.rejects(call("submit_draft", { operationId: "bypass", workId: f.work.id, basedOn: f.draft, markdown, instruction: "不能猜意图",
       submission: { ...draftSubmission(markdown), authorization: { kind: "external_correction", reviewRunId: review.runId, notes: "试图自定" } } }, f.service), /意图歧义/);
     assert.equal(f.store.read(f.work.id).authoring!.drafts.length, 1);

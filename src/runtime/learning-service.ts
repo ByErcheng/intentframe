@@ -1,8 +1,9 @@
 import { z } from "zod";
-import { experienceRefSchema, learningResultSchema } from "../records/contracts.ts";
+import { experienceRefSchema, learningResultSchema, learningCaseSourcesSchema, learningLimits,
+  experienceSourceLimit, videoExperienceSourceSchema, documentExperienceSourceSchema } from "../records/contracts.ts";
 import type { ExperienceRef, ExperienceSource, LearningResult } from "../records/contracts.ts";
 import { immutableJson, readJson, valueHash } from "../records/files.ts";
-import { KnowledgeStore, pendingLearningSources } from "../records/knowledge-store.ts";
+import { KnowledgeStore, pendingLearningSources, experienceInputSchema } from "../records/knowledge-store.ts";
 import { ComparisonStore } from "../records/comparison-store.ts";
 import { sourceFingerprint } from "../records/source-snapshot.ts";
 import { WorkStore } from "../records/work-store.ts";
@@ -10,7 +11,13 @@ import type { WorkRecord, WorkVersion } from "../records/work-store.ts";
 import { DocumentStore } from "../records/document-store.ts";
 import type { AuthoringDocument } from "../records/authoring-contracts.ts";
 
-const searchSchema = z.strictObject({ query: z.string().max(2_000), offset: z.number().int().nonnegative().default(0), limit: z.number().int().min(1).max(50).default(20) });
+// 预检只展开记录，不读工程；缺失快照须留到原批次补存时核实，不能伪造指纹或丢弃来源。
+const sourcePlanSchema = z.union([videoExperienceSourceSchema.partial({ sourceFingerprint: true }), documentExperienceSourceSchema]);
+type SourcePlan = z.infer<typeof sourcePlanSchema>;
+const proposalPlanSchema = experienceInputSchema.extend({ sources: z.array(sourcePlanSchema).min(1).max(experienceSourceLimit) });
+
+const searchSchema = z.strictObject({ query: z.string().max(2_000), offset: z.number().int().nonnegative().default(0), limit: z.number().int().min(1).max(50).default(20),
+  scope: z.enum(["all", "same_profile"]).default("all") });
 const feedbackPageSchema = z.strictObject({ offset: z.number().int().nonnegative().default(0), limit: z.number().int().min(1).max(50).default(20) });
 const feedbackReadSchema = z.strictObject({ ids: z.array(z.string()).min(1).max(20) });
 export const knowledgeToolDefinitions = [
@@ -25,7 +32,7 @@ export class LearningService {
   readonly knowledge: KnowledgeStore;
   constructor(store: WorkStore, knowledge = new KnowledgeStore(store.assetRoot)) { this.store = store; this.knowledge = knowledge; }
 
-  tools(work: WorkRecord, runId: string) {
+  tools(work: WorkRecord, runId: string, profileId?: string) {
     const comparison = new ComparisonStore(this.store, this.knowledge).context(work);
     const reads = new Map<string, ExperienceRef>();
     const feedbackReads = new Set<string>();
@@ -50,7 +57,7 @@ export class LearningService {
         }
         if (name === "intentframe_search_experience") {
           const args = searchSchema.parse(input);
-          return this.knowledge.search(args.query, args.offset, args.limit, comparison?.input.knowledgeIndex);
+          return this.knowledge.search(args.query, args.offset, args.limit, comparison?.input.knowledgeIndex, { profileId, scope: args.scope });
         }
         if (name !== "intentframe_read_experience") throw new Error("本轮没有开放该工具。");
         const ref = experienceRefSchema.parse(input);
@@ -63,48 +70,92 @@ export class LearningService {
     };
   }
 
-  accept(work: WorkRecord, version: WorkVersion | AuthoringDocument, id: string, raw: LearningResult, sourceIds: string[]): void {
+  accept(work: WorkRecord, version: WorkVersion | AuthoringDocument, id: string, raw: LearningResult, sourceIds: string[],
+    caseSources?: Record<string, ExperienceSource[]>): void {
     const result = learningResultSchema.parse(raw), allowed = new Set(sourceIds);
     if (new Set(result.checkedSourceIds).size !== result.checkedSourceIds.length || result.checkedSourceIds.some(key => !allowed.has(key))) throw new Error("经验整理范围包含未交接或重复的来源。");
     if (result.proposals.some(proposal => proposal.sourceIds.some(key => !result.checkedSourceIds.includes(key)))) throw new Error("候选经验必须来自本次已检查的来源。");
+    if (caseSources) {
+      caseSources = learningCaseSourcesSchema.parse(caseSources);
+      if (Object.keys(caseSources).some(key => !allowed.has(key)) || Object.values(caseSources).flat().some(source =>
+        source.workId !== work.id || source.purpose !== this.store.purpose)) throw new Error("案例依据不属于本轮整理范围。");
+    }
     if (work.learningBatches?.some(batch => batch.id === id)) return;
     if (work.learningPending && work.learningPending.id !== id) throw new Error("还有未完成的经验保存，须先接续原批次。");
-    if (work.learningPending && valueHash(work.learningPending.result) !== valueHash(result)) throw new Error("同一整理批次返回了不同内容，须核对原结果。");
-    work.learningPending ??= { id, result, versionId: version.id, sourceIds, createdAt: new Date().toISOString() };
+    if (work.learningPending && (valueHash(work.learningPending.result) !== valueHash(result) ||
+        valueHash(work.learningPending.caseSources ?? {}) !== valueHash(caseSources ?? {}))) throw new Error("同一整理批次返回了不同内容，须核对原结果。");
+    // 所有候选的确定性约束须在冻结待保存状态或写入第一条经验前检查，包括比较暂存。
+    this.planProposals(work, version, result, caseSources);
+    work.learningPending ??= { id, result, versionId: version.id, sourceIds, ...(caseSources ? { caseSources } : {}), createdAt: new Date().toISOString() };
     this.store.save(work);
     this.finishPending(work);
   }
 
   target(work: WorkRecord, id: string): WorkVersion | AuthoringDocument {
     if (id.startsWith("v")) return this.store.version(work, id);
-    const document = [...work.authoring?.drafts ?? [], ...work.authoring?.designs ?? []].find(item => item.id === id);
-    if (!document) throw new Error("经验整理关联的稿件不存在。");
-    return new DocumentStore(this.store).document(work, document);
+    return new DocumentStore(this.store).document(work, this.documentRecord(work, id));
   }
 
-  private sources(work: WorkRecord, version: WorkVersion | AuthoringDocument, sourceIds: string[]): ExperienceSource[] {
+  private documentRecord(work: WorkRecord, id: string): AuthoringDocument {
+    const document = [...work.authoring?.drafts ?? [], ...work.authoring?.designs ?? []].find(item => item.id === id);
+    if (!document) throw new Error("经验整理关联的稿件不存在。");
+    return document;
+  }
+
+  private sourcePlans(work: WorkRecord, version: WorkVersion | AuthoringDocument, sourceIds: string[], caseSources?: Record<string, ExperienceSource[]>): SourcePlan[] {
     const feedbackIds = sourceIds.filter(id => id.startsWith("feedback:")).map(id => id.slice("feedback:".length));
     const versions = new Set([...(version.id.startsWith("v") ? [version.id] : []), ...work.feedback.filter(feedback => feedbackIds.includes(feedback.id)).map(feedback => feedback.versionId)]);
     for (const key of sourceIds) if (key.startsWith("review:")) versions.add(key.split(":")[1]!);
     for (const target of work.versions) if (sourceIds.some(key => key.startsWith("failure:" + target.runId + ":"))) versions.add(target.id);
-    const result: ExperienceSource[] = [...versions].map(id => {
+    const sources: SourcePlan[] = [...versions].map(id => {
       const target = this.store.version(work, id);
-      if (!target.sourceSnapshot) throw new Error("来源工程缺少完整快照，候选经验保留待核实。");
-      this.store.verifySource(target);
       return { purpose: this.store.purpose, workId: work.id, versionId: id,
-        sourceFingerprint: sourceFingerprint(target.sourceSnapshot),
+        sourceFingerprint: target.sourceSnapshot ? sourceFingerprint(target.sourceSnapshot) : undefined,
         feedbackIds: work.feedback.filter(feedback => feedback.versionId === id && feedbackIds.includes(feedback.id)).map(feedback => feedback.id) };
     });
-    const documents = new DocumentStore(this.store);
     for (const key of sourceIds) if (key.startsWith("document:") || key.startsWith("design-review:")) {
-      const document = this.target(work, key.split(":")[1]!);
-      if (!("kind" in document) || !["draft", "design"].includes(document.kind)) throw new Error("稿件经验来源类型错误。");
-      const ref = document as AuthoringDocument;
-      for (const target of [ref, ...(ref.basedOn ? [documents.document(work, ref.basedOn)] : [])]) {
-        if (!result.some(item => "documentRef" in item && item.documentRef.id === target.id)) result.push({ kind: "document", purpose: this.store.purpose, workId: work.id, documentRef: { id: target.id, sha256: target.sha256 } });
+      const document = this.documentRecord(work, key.split(":")[1]!);
+      for (const ref of [document, ...(document.basedOn ? [document.basedOn] : [])]) {
+        sources.push({ kind: "document", purpose: this.store.purpose, workId: work.id, documentRef: { id: ref.id, sha256: ref.sha256 } });
       }
     }
-    return result;
+    sources.push(...sourceIds.flatMap(id => caseSources?.[id] ?? []).map(source => structuredClone(source)));
+    const result = new Map<string, SourcePlan>();
+    for (const source of sources) {
+      if (source.workId !== work.id || source.purpose !== this.store.purpose) throw new Error("案例依据不属于本轮整理范围。");
+      if ("versionId" in source) {
+        const target = this.store.version(work, source.versionId);
+        if (source.sourceFingerprint && target.sourceSnapshot && source.sourceFingerprint !== sourceFingerprint(target.sourceSnapshot)) {
+          throw new Error("案例工程与冻结的整理依据不一致。");
+        }
+        if (source.feedbackIds.some(id => !work.feedback.some(item => item.id === id && item.versionId === source.versionId))) {
+          throw new Error("经验包含不属于来源版本的反馈。");
+        }
+      } else if (this.documentRecord(work, source.documentRef.id).sha256 !== source.documentRef.sha256) {
+        throw new Error("案例稿件与冻结的整理依据不一致。");
+      }
+      const key = "versionId" in source ? "video:" + source.versionId : "document:" + source.documentRef.id;
+      const existing = result.get(key);
+      if (existing && "versionId" in existing && "versionId" in source) {
+        if (existing.sourceFingerprint && source.sourceFingerprint && existing.sourceFingerprint !== source.sourceFingerprint) throw new Error("案例工程与冻结的整理依据不一致。");
+        existing.sourceFingerprint ??= source.sourceFingerprint;
+        existing.feedbackIds = [...new Set([...existing.feedbackIds, ...source.feedbackIds])];
+      } else if (!existing) result.set(key, source);
+    }
+    return [...result.values()];
+  }
+
+  private planProposals(work: WorkRecord, version: WorkVersion | AuthoringDocument, result: LearningResult, caseSources?: Record<string, ExperienceSource[]>) {
+    return result.proposals.map(({ sourceIds, ...body }) => proposalPlanSchema.parse({ ...body,
+      sources: this.sourcePlans(work, version, sourceIds, caseSources), status: "candidate", use: "reusable" }));
+  }
+
+  private resolveProposals(plans: z.infer<typeof proposalPlanSchema>[]) {
+    return plans.map(plan => {
+      if (plan.sources.some(source => "versionId" in source && !source.sourceFingerprint)) throw new Error("来源工程缺少完整快照，候选经验保留待核实。");
+      // 正式保存仍须完整指纹，随后由 KnowledgeStore 核对实际工程和稿件文件。
+      return experienceInputSchema.parse(plan);
+    });
   }
 
   finishPending(work: WorkRecord): void {
@@ -115,9 +166,9 @@ export class LearningService {
     immutableJson(this.store.resolvePath("works/" + work.id + "/learning/" + pending.id + ".json"), draft);
     const comparison = work.comparison ? new ComparisonStore(this.store, this.knowledge).context(work) : undefined;
     const staged = comparison?.state === "open";
-    const refs = staged ? [] : pending.result.proposals.map((proposal, index) => {
-      const { sourceIds, ...body } = proposal;
-      return this.knowledge.save({ ...body, sources: this.sources(work, version, sourceIds), status: "candidate", use: "reusable" },
+    const plans = this.planProposals(work, version, pending.result, pending.caseSources);
+    const refs = staged ? [] : this.resolveProposals(plans).map((proposal, index) => {
+      return this.knowledge.save(proposal,
         { id: "experience-" + valueHash({ scope: work.scopeId, workId: work.id, batch: pending.id, index }).slice(0, 24), replay: true, createdAt: pending.createdAt });
     });
     work.learningBatches ??= [];
@@ -134,14 +185,15 @@ export class LearningService {
       if (!batch.staged) continue;
       const saved = readJson(this.store.resolvePath("works/" + work.id + "/learning/" + batch.id + ".json"));
       if (!batch.draftSha256 || valueHash(saved) !== batch.draftSha256) throw new Error("暂存经验正文与原批次不一致，保留待核对。");
-      const draft = z.object({ workId: z.string(), id: z.string(), versionId: z.string(), createdAt: z.string(), result: learningResultSchema })
+      const draft = z.object({ workId: z.string(), id: z.string(), versionId: z.string(), createdAt: z.string(), result: learningResultSchema,
+        caseSources: learningCaseSourcesSchema.optional() })
         .parse(saved);
       if (draft.workId !== work.id || draft.id !== batch.id || draft.versionId !== batch.versionId ||
           valueHash(draft.result.checkedSourceIds) !== valueHash(batch.checkedSourceIds)) throw new Error("暂存经验与原整理批次不一致。");
       const version = this.target(work, batch.versionId);
-      batch.experienceRefs = draft.result.proposals.map((proposal, index) => {
-        const { sourceIds, ...body } = proposal;
-        return this.knowledge.save({ ...body, sources: this.sources(work, version, sourceIds), status: "candidate", use: "reusable" },
+      const proposals = this.resolveProposals(this.planProposals(work, version, draft.result, draft.caseSources));
+      batch.experienceRefs = proposals.map((proposal, index) => {
+        return this.knowledge.save(proposal,
           { id: "experience-" + valueHash({ scope: work.scopeId, workId: work.id, batch: batch.id, index }).slice(0, 24), replay: true, createdAt: draft.createdAt });
       });
       batch.staged = false;
@@ -151,7 +203,7 @@ export class LearningService {
 
   pending(work: WorkRecord, readDocuments = true) {
     const comparison = new ComparisonStore(this.store, this.knowledge).context(work);
-    const pending = pendingLearningSources(work, 50, comparison?.evaluation ? { id: comparison.id, content: comparison.evaluation } : undefined);
+    const pending = pendingLearningSources(work, learningLimits.batchSources, comparison?.evaluation ? { id: comparison.id, content: comparison.evaluation } : undefined);
     const documents = new DocumentStore(this.store);
     return { ...pending, items: pending.items.map(item => {
       if (!readDocuments || !item.documentRef) return item;

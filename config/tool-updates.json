@@ -1,0 +1,14 @@
+[
+  {"id":"remotion","name":"Remotion","packages":["remotion","@remotion/bundler","@remotion/renderer","@remotion/compositor-darwin-arm64"],"source":{"kind":"npm","package":"remotion"},"url":"https://www.remotion.dev/changelog","note":"配套包统一版本；FFmpeg/ffprobe 与渲染浏览器随工具链核对。升级时复查 renderer-patch 兼容补丁。"},
+  {"id":"react","name":"React","packages":["react","react-dom"],"source":{"kind":"npm","package":"react"},"url":"https://github.com/facebook/react/releases"},
+  {"id":"react-types","name":"React 类型","packages":["@types/react"],"source":{"kind":"npm","package":"@types/react"},"url":"https://www.npmjs.com/package/@types/react"},
+  {"id":"react-dom-types","name":"React DOM 类型","packages":["@types/react-dom"],"source":{"kind":"npm","package":"@types/react-dom"},"url":"https://www.npmjs.com/package/@types/react-dom"},
+  {"id":"mcp-client","name":"MCP Client SDK","packages":["@modelcontextprotocol/client"],"source":{"kind":"npm","package":"@modelcontextprotocol/client"},"url":"https://github.com/modelcontextprotocol/typescript-sdk/releases"},
+  {"id":"mcp-server","name":"MCP Server SDK","packages":["@modelcontextprotocol/server"],"source":{"kind":"npm","package":"@modelcontextprotocol/server"},"url":"https://github.com/modelcontextprotocol/typescript-sdk/releases"},
+  {"id":"zod","name":"Zod","packages":["zod"],"source":{"kind":"npm","package":"zod"},"url":"https://github.com/colinhacks/zod/releases"},
+  {"id":"typescript","name":"TypeScript","packages":["typescript"],"source":{"kind":"npm","package":"typescript"},"url":"https://github.com/microsoft/TypeScript/releases"},
+  {"id":"node-types","name":"Node 类型","packages":["@types/node"],"source":{"kind":"npm","package":"@types/node"},"url":"https://www.npmjs.com/package/@types/node","note":"类型版本需与运行时及项目实际使用的 API 一起核对。"},
+  {"id":"node","name":"Node","tool":"node","source":{"kind":"node"},"url":"https://nodejs.org/en/download","note":"跨主版本须核对依赖支持范围。"},
+  {"id":"codex","name":"Codex","tool":"codex","source":{"kind":"npm","package":"@openai/codex"},"url":"https://github.com/openai/codex/releases"},
+  {"id":"restic","name":"Restic","tool":"restic","source":{"kind":"github","repository":"restic/restic"},"url":"https://github.com/restic/restic/releases"}
+]

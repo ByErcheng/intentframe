@@ -53,6 +53,17 @@ export class OperationStore {
     throw new Error("原操作尚无确定回执，请查询原任务或核对恢复；不能重复执行。");
   }
 
+  /** 仅允许自带持久重放保护的本机操作补存回执；不推广到模型、媒体或收费调用。 */
+  async resumeLocal(id: string, name: string, input: unknown, action: () => Promise<unknown> | unknown) {
+    if (!["save_creative_profile", "assign_work_profile"].includes(name)) throw new Error("该操作不支持本机幂等补存。");
+    const original = this.read(id);
+    if (original.name !== name || original.inputHash !== valueHash(input)) throw new Error("同一操作编号已用于不同内容或目标。");
+    if (["succeeded", "accepted"].includes(original.state)) return original.result;
+    const result: unknown = JSON.parse(JSON.stringify(await action()));
+    atomicJson(ownedPath(this.root, "operations/" + id + "/request.json"), { ...original, state: "succeeded", result, recoveredAt: new Date().toISOString() });
+    return result;
+  }
+
   async execute(id: string, name: string, input: unknown, action: () => Promise<unknown> | unknown, purpose?: WorkPurpose,
     responseState: "succeeded" | "accepted" = "succeeded", receivedAt?: string) {
     const parsed = operationIdSchema.parse(id), inputHash = valueHash(input);

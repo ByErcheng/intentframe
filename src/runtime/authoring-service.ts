@@ -77,7 +77,7 @@ export class AuthoringService {
         status: "preparing", inputPath, inputSha256: fileHash(this.store.resolvePath(inputPath)), blockers: [], sendState: "not_sent", modelSelection };
       record.authoring!.runs.push(run); record.execution = { status: "running", runId }; this.store.save(record);
       let client: CodexAppServerClient | undefined, phase: "preparing" | "awaiting_result" | "checking_result" = "preparing";
-      const tools = new LearningService(this.store).tools(record, runId);
+      const tools = new LearningService(this.store).tools(record, runId, source.creativeProfile?.ref.id);
       let searches = 0;
       const knowledgePath = join(directory, "knowledge-evidence.json");
       const mediaTools = new ProductionMediaTools(this.store, record, runId, new AssetService(this.store), undefined,

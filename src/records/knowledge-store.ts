@@ -2,7 +2,7 @@ import { existsSync, mkdirSync, readdirSync, rmSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { z } from "zod";
 import { atomicJson, immutableJson, ownedPath, readJson, valueHash } from "./files.ts";
-import { experienceRefSchema, experienceSourceSchema, learningProposalSchema, recordIdSchema } from "./contracts.ts";
+import { experienceRefSchema, experienceSourceSchema, experienceSourceLimit, learningLimits, learningProposalSchema, recordIdSchema } from "./contracts.ts";
 import type { ExperienceRef, ExperienceSource } from "./contracts.ts";
 import { WorkStore } from "./work-store.ts";
 import type { WorkRecord } from "./work-store.ts";
@@ -12,7 +12,7 @@ import type { DocumentRef } from "./authoring-contracts.ts";
 
 export const experienceInputSchema = learningProposalSchema.omit({ sourceIds: true }).extend({
   status: z.enum(["candidate", "verified", "withdrawn"]),
-  sources: z.array(experienceSourceSchema).min(1).max(100),
+  sources: z.array(experienceSourceSchema).min(1).max(experienceSourceLimit),
   verification: z.string().trim().min(1).max(5_000).optional(),
   use: z.enum(["reusable", "evaluation_only"]).default("reusable"),
 });
@@ -23,6 +23,7 @@ const indexSchema = z.object({
   ref: experienceRefSchema, title: z.string(), problem: z.string(), conditions: z.string(),
   keywords: z.array(z.string()), status: z.enum(["candidate", "verified", "withdrawn"]),
   use: z.enum(["reusable", "evaluation_only"]),
+  sourceProfileIds: z.array(z.string()).optional(),
 });
 export type ExperienceIndex = z.infer<typeof indexSchema>;
 
@@ -95,17 +96,21 @@ export class KnowledgeStore {
     });
   }
 
-  search(query: string, offset = 0, limit = 20, scope?: ExperienceIndex[]) {
+  search(query: string, offset = 0, limit = 20, scope?: ExperienceIndex[], context: { profileId?: string; scope?: "all" | "same_profile" } = {}) {
     z.string().max(2_000).parse(query); z.number().int().nonnegative().parse(offset); z.number().int().min(1).max(50).parse(limit);
     const normalize = (text: string) => text.normalize("NFKC").toLowerCase();
     const terms = [...new Intl.Segmenter("zh", { granularity: "word" }).segment(normalize(query))]
       .filter(part => part.isWordLike).map(part => part.segment);
-    const matches = (scope ?? this.latest()).filter(item => item.use === "reusable" && item.status !== "withdrawn")
+    if (context.scope === "same_profile" && !context.profileId) throw new Error("同档案检索须提供实际采用的档案编号；历史未知来源不能补猜。");
+    const matches = (scope ?? this.latest()).filter(item => item.use === "reusable" && item.status !== "withdrawn" &&
+      (context.scope !== "same_profile" || item.sourceProfileIds?.includes(context.profileId!)))
       .map(item => ({ item, score: terms.reduce((n, term) => n + Number(normalize([item.title, item.problem, item.conditions, ...item.keywords].join(" ")).includes(term)), 0) }))
-      .filter(value => !terms.length || value.score > 0).sort((a, b) => b.score - a.score || a.item.ref.id.localeCompare(b.item.ref.id));
+      .filter(value => !terms.length || value.score > 0).sort((a, b) => b.score - a.score ||
+        Number(Boolean(b.item.sourceProfileIds?.includes(context.profileId ?? ""))) - Number(Boolean(a.item.sourceProfileIds?.includes(context.profileId ?? ""))) || a.item.ref.id.localeCompare(b.item.ref.id));
     const nextOffset = offset + limit < matches.length ? offset + limit : null;
     return { coverage: !matches.length ? "not_found" : nextOffset === null ? "complete" : "partial",
-      items: matches.slice(offset, offset + limit).map(value => value.item), nextOffset,
+      items: matches.slice(offset, offset + limit).map(({ item }) => ({ ...item, ...(context.profileId ? {
+        profileRelation: !item.sourceProfileIds?.length ? "unknown" : item.sourceProfileIds.includes(context.profileId) ? "same_profile" : "other_profile" } : {}) })), nextOffset,
       note: "索引只帮助定位；未命中不证明历史不存在，采用前须读取正文与核对来源。" };
   }
 
@@ -138,7 +143,12 @@ export class KnowledgeStore {
       const record = experienceSchema.parse({ ...value, id, revision: (head?.ref.revision ?? 0) + 1,
         createdAt: options.createdAt ?? new Date().toISOString() });
       const ref = { id, revision: record.revision, sha256: valueHash(record) };
-      const index = { ref, title: record.title, problem: record.problem, conditions: record.conditions,
+      const sourceProfileIds = value.status === "withdrawn" ? head?.sourceProfileIds ?? [] : [...new Set(record.sources.flatMap(source => {
+        const store = this.sourceStore(source), work = store.read(source.workId);
+        const profile = "documentRef" in source ? new DocumentStore(store).document(work, source.documentRef).creativeProfile : store.version(work, source.versionId).creativeProfile;
+        return profile ? [profile.ref.id] : [];
+      }))];
+      const index = { ref, title: record.title, problem: record.problem, conditions: record.conditions, sourceProfileIds,
         keywords: record.keywords, status: record.status, use: record.use };
       immutableJson(ownedPath(this.root, "items/" + id + "/v" + record.revision + ".json"), record);
       immutableJson(ownedPath(this.root, "items/" + id + "/index-" + record.revision + ".json"), index);
@@ -150,7 +160,7 @@ export class KnowledgeStore {
 
 export type LearningSource = { id: string; kind: "feedback" | "review" | "failure" | "comparison" | "document"; versionId?: string; documentRef?: DocumentRef; content: unknown };
 /** 按原记录身份增量核对；后续复查/错误变化会产生新来源，不能被旧进度掩盖。 */
-export function pendingLearningSources(work: WorkRecord, limit = 50, comparisonReview?: { id: string; content: unknown }) {
+export function pendingLearningSources(work: WorkRecord, limit: number = learningLimits.batchSources, comparisonReview?: { id: string; content: unknown }) {
   const checked = new Set(work.learningBatches?.flatMap(batch => batch.checkedSourceIds) ?? []);
   const all: LearningSource[] = work.feedback.map(feedback => ({ id: "feedback:" + feedback.id, kind: "feedback", versionId: feedback.versionId, content: feedback }));
   for (const document of [...work.authoring?.drafts ?? [], ...work.authoring?.designs ?? []]) {

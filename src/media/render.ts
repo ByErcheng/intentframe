@@ -13,6 +13,7 @@ import { fileHash } from "../common/file-hash.ts";
 import type { SourceSnapshot } from "../records/source-snapshot.ts";
 import { checkExecution, ExecutionBudgetExceeded } from "../runtime/execution-control.ts";
 import { previewFractions, previewPath } from "./previews.ts";
+import { immutableBytes } from "../records/files.ts";
 import { assertRendererPatch } from "./renderer-patch.ts";
 export { fileHash } from "../common/file-hash.ts";
 
@@ -99,6 +100,31 @@ async function extractPreviews(output: string, fps: number, frames: number, sign
     } finally { rmSync(temporary, { force: true }); }
   }
   return previews;
+}
+
+/** 帧号属于原工程；局部视频从零计时，抽取时须减去其起始帧。 */
+export async function extractPreviewFrames(output: string, expectedHash: string, fps: number, frameCount: number,
+  frames: number[], sourceStartFrame = 0, signal?: AbortSignal) {
+  if (!Number.isFinite(fps) || fps <= 0 || !Number.isSafeInteger(frameCount) || frameCount < 1 ||
+      !Number.isSafeInteger(sourceStartFrame) || sourceStartFrame < 0 || !frames.length || frames.length > 12 ||
+      new Set(frames).size !== frames.length || frames.some(frame => !Number.isSafeInteger(frame) ||
+        frame < sourceStartFrame || frame >= sourceStartFrame + frameCount)) throw new Error("指定预览帧须唯一且位于实际渲染范围内，每次最多12帧。");
+  checkExecution(signal);
+  if (fileHash(output) !== expectedHash) throw new Error("预览视频已变化，不能按旧记录抽帧。");
+  const results = [];
+  for (const frame of frames) {
+    const path = join(dirname(output), "selected-frame-" + String(frame).padStart(6, "0") + ".png");
+    const temporary = path + "." + randomUUID() + ".png", videoFrame = frame - sourceStartFrame;
+    try {
+      await mediaCommand(mediaBinaries().ffmpeg, ["-v", "error", "-ss", String(videoFrame / fps), "-i", output,
+        "-frames:v", "1", "-n", temporary], configuration.media.previewTimeoutMs, signal);
+      if (!existsSync(temporary) || statSync(temporary).size === 0) throw new Error("指定帧未实际生成：" + frame);
+      immutableBytes(path, readFileSync(temporary));
+      results.push({ path, sha256: fileHash(path), frame, seconds: frame / fps, videoFrame, videoSeconds: videoFrame / fps });
+    } finally { rmSync(temporary, { force: true }); }
+  }
+  if (fileHash(output) !== expectedHash) throw new Error("抽帧期间预览视频发生变化，结果未获确认。");
+  return results;
 }
 
 /** 从已核对字节的原视频重建派生预览，不打包工程、不渲染或替换视频。 */

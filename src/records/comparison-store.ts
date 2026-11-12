@@ -8,6 +8,8 @@ import type { ExperienceIndex } from "./knowledge-store.ts";
 import { WorkStore } from "./work-store.ts";
 import type { WorkRecord } from "./work-store.ts";
 import { captureSourceSnapshot, sourceSnapshotSchema, verifySourceSnapshot } from "./source-snapshot.ts";
+import { profileRefSchema, profileSnapshotSchema } from "./creative-profile.ts";
+import { ProfileStore } from "./profile-store.ts";
 
 const sideSuffixes = { before: "（修改前）", after: "（修改后）" } as const;
 function comparisonBrief(input: { brief: string; revisionRequest?: string }): string {
@@ -21,6 +23,7 @@ const recordedInputSchema = z.strictObject({
   revisionRequest: z.string().trim().min(1).max(10_000).optional(),
   base: videoExperienceSourceSchema.optional(),
   knowledgeRefs: z.array(experienceRefSchema).max(100),
+  profileRef: profileRefSchema.optional(),
 }).refine(value => value.kind !== "revision" || Boolean(value.base && value.revisionRequest), "反馈修改比较须提供共同工程基线和同一修改要求。");
 // 新建时预留两侧名称标记，并校验拼接后的需求；历史记录仍按原格式读取。
 export const comparisonInputSchema = recordedInputSchema.safeExtend({
@@ -30,8 +33,9 @@ export const comparisonInputSchema = recordedInputSchema.safeExtend({
   path: ["brief"], message: "原始需求、共同修改要求及分隔文字合计不能超过 " + workInputLimits.brief + " 字符。",
 });
 const indexSchema = z.object({ ref: experienceRefSchema, title: z.string(), problem: z.string(), conditions: z.string(),
+  sourceProfileIds: z.array(z.string()).optional(),
   keywords: z.array(z.string()), status: z.enum(["candidate", "verified", "withdrawn"]), use: z.enum(["reusable", "evaluation_only"]) });
-const definitionSchema = z.object({ ...recordedInputSchema.shape, knowledgeIndex: z.array(indexSchema), baseSnapshot: sourceSnapshotSchema.optional() });
+const definitionSchema = z.object({ ...recordedInputSchema.shape, knowledgeIndex: z.array(indexSchema), baseSnapshot: sourceSnapshotSchema.optional(), creativeProfile: profileSnapshotSchema.optional() });
 const comparisonSchema = z.object({
   schemaVersion: z.literal(1), id: recordIdSchema, state: z.enum(["open", "completed"]),
   inputHash: z.string(), input: definitionSchema, createdAt: z.string(),
@@ -50,8 +54,9 @@ export class ComparisonStore {
 
   read(id: string): Comparison {
     const record = comparisonSchema.parse(readJson(this.store.resolvePath("comparisons/" + recordIdSchema.parse(id) + "/record.json")));
-    const { knowledgeIndex, baseSnapshot: _snapshot, ...input } = record.input;
+    const { knowledgeIndex, baseSnapshot: _snapshot, creativeProfile, ...input } = record.input;
     recordedInputSchema.parse(input);
+    if (valueHash(creativeProfile?.ref ?? null) !== valueHash(input.profileRef ?? null)) throw new Error("比较档案与固定引用不一致。");
     if (valueHash(knowledgeIndex.map(item => item.ref)) !== valueHash(input.knowledgeRefs)) throw new Error("比较知识索引超出共同版本范围。");
     if (record.id !== id || valueHash(record.input) !== record.inputHash) throw new Error("比较记录的共同输入发生变化。");
     if (record.state === "completed" && !record.evaluation) throw new Error("比较缺少实际评价，不能当作已结束。");
@@ -61,6 +66,8 @@ export class ComparisonStore {
   create(raw: z.input<typeof comparisonInputSchema>, operationId: string): Comparison {
     if (this.store.purpose !== "test") throw new Error("比较任务只能在测试入口创建。");
     const input = comparisonInputSchema.parse(raw), id = "comparison-" + valueHash(operationId).slice(0, 24);
+    if (!input.profileRef) throw new Error("新比较须明确选择共同创作档案版本。");
+    const creativeProfile = new ProfileStore(this.store.assetRoot).select(input.profileRef);
     const tasks = (["before", "after"] as const).map(side => ({ side, ...workInputSchema.parse({
       title: input.title + sideSuffixes[side], brief: comparisonBrief(input),
     }) }));
@@ -83,12 +90,12 @@ export class ComparisonStore {
       baseSnapshot = captureSourceSnapshot(join(target, "entry.tsx"));
       if (valueHash(baseSnapshot) !== valueHash(version.sourceSnapshot)) throw new Error("复制后的比较工程与原基线不一致。");
     }
-    const definition = { ...input, knowledgeIndex, ...(baseSnapshot ? { baseSnapshot } : {}) }, inputHash = valueHash(definition);
+    const definition = { ...input, creativeProfile, knowledgeIndex, ...(baseSnapshot ? { baseSnapshot } : {}) }, inputHash = valueHash(definition);
     const record: Comparison = { schemaVersion: 1, id, state: "open", inputHash, input: definition,
       createdAt: new Date().toISOString(), workIds: { before: this.store.plannedWorkId(operationId + "-before"), after: this.store.plannedWorkId(operationId + "-after") } };
     atomicJson(join(directory, "record.json"), record);
     for (const { side, title, brief } of tasks) {
-      this.store.create(title, brief, operationId + "-" + side, { id, side, inputHash });
+      this.store.create(title, brief, operationId + "-" + side, { id, side, inputHash }, false, creativeProfile);
     }
     return record;
   }
@@ -97,6 +104,7 @@ export class ComparisonStore {
     if (!work.comparison) return undefined;
     if (this.store.purpose !== "test") throw new Error("比较作品不能在正式入口执行。");
     const comparison = this.read(work.comparison.id);
+    if (valueHash(work.creationProfile?.ref ?? null) !== valueHash(comparison.input.creativeProfile?.ref ?? null)) throw new Error("比较作品的创作档案与共同输入不一致。");
     if (comparison.workIds[work.comparison.side] !== work.id || comparison.inputHash !== work.comparison.inputHash) throw new Error("作品与比较输入的关联不一致。");
     if (readFileSync(this.store.resolvePath(work.briefPath), "utf8") !== "# 原始需求\n\n" + comparisonBrief(comparison.input) + "\n") throw new Error("比较任务的原始需求已变化。");
     return comparison;
@@ -131,7 +139,8 @@ export class ComparisonStore {
         if (!["ready", "failed", "blocked"].includes(version.production) || !version.systemFingerprint || !version.executionConditions) throw new Error("比较结果尚未取得可靠状态或系统版本依据。");
         if (version.production === "ready") this.store.assertAvailable(version);
         if (version.knowledgeUsed?.some(ref => !current.input.knowledgeRefs.some(allowed => valueHash(ref) === valueHash(allowed)))) throw new Error("比较使用了共同范围之外的经验。");
-        conditions[side] = { systemFingerprint: version.systemFingerprint, model: version.model, kind: version.kind,
+        if (valueHash(version.creativeProfile?.ref ?? null) !== valueHash(current.input.creativeProfile?.ref ?? null)) throw new Error("比较制作采用的档案不属于共同输入。");
+        conditions[side] = { systemFingerprint: version.systemFingerprint, model: version.model, kind: version.kind, creativeProfile: version.creativeProfile?.ref,
           modelSelection: version.modelSelection, reasoningEffort: version.reasoningEffort,
           analysisModels: work.analysisRuns?.filter(run => run.parentRunId === version.runId ||
             version.reviewPreparation?.inspections.some(inspection => inspection.id === run.parentRunId))
@@ -141,7 +150,7 @@ export class ComparisonStore {
           videoSha256: version.videoSha256, error: version.error };
       }
       const before = conditions.before as Record<string, unknown>, after = conditions.after as Record<string, unknown>;
-      conditions.differences = ["systemFingerprint", "model", "modelSelection", "reasoningEffort", "analysisModels", "kind", "execution", "knowledgeUsed"]
+      conditions.differences = ["systemFingerprint", "model", "modelSelection", "reasoningEffort", "analysisModels", "kind", "execution", "knowledgeUsed", "creativeProfile"]
         .filter(key => valueHash(before[key] ?? null) !== valueHash(after[key] ?? null));
       conditions.note = "差异须结合声明的改动判断，未受控差异不能归因为单一改动；记录不代替观看评价。";
       const record: Comparison = { ...current, state: "completed", evaluation: { ...input, conditions, evaluatedAt: new Date().toISOString() } };

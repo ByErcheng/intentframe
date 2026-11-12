@@ -9,7 +9,8 @@ import { AssetCatalog, assetSourceSchema, assetSearchSchema } from "../records/a
 import type { LibraryRoot } from "../records/asset-catalog.ts";
 import { AssetService } from "./asset-service.ts";
 import { musicInputSchema, soundEffectInputSchema, voiceIdSchema, voiceInstructionSchema, configuredVoices } from "../media/providers.ts";
-import { renderVersion, mediaCommand, mediaBinaries } from "../media/render.ts";
+import { renderVersion, mediaCommand, mediaBinaries, extractPreviewFrames } from "../media/render.ts";
+import { previewFractions } from "../media/previews.ts";
 import { downloadAsset, publicAssetUrl } from "../media/download-asset.ts";
 import { assetRoleSchema, voiceDeclarationSchema, voiceInfoSchema } from "../records/asset-types.ts";
 import { captureSourceSnapshot, sourceFingerprint } from "../records/source-snapshot.ts";
@@ -17,6 +18,7 @@ import type { WorkRecord, WorkStore, WorkVersion } from "../records/work-store.t
 import { NativeToolOutput } from "./codex-client.ts";
 import { checkExecution } from "./execution-control.ts";
 import { audioPlanInputSchema, readAudioPlan, saveAudioPlan } from "./audio-plan.ts";
+import { assertAudioPlanSettled } from "./audio-plan-commit.ts";
 import { ModelAnalysisService } from "./model-analysis-service.ts";
 
 const key = z.string().regex(/^[a-zA-Z0-9_-]{1,60}$/), description = z.string().trim().min(1).max(2000);
@@ -36,7 +38,11 @@ const schemas = {
     role: assetRoleSchema, voice: voiceInfoSchema.optional() }).refine(input => !input.voice || input.role === "narration", "讲话信息仅适用于 narration"),
   intentframe_download_image: z.object({ operationKey: key, url: z.url(), sourcePage: z.url(), usageNotes: description, description }),
   intentframe_set_audio_playback: audioPlanInputSchema.extend({ operationKey: key }),
-  intentframe_preview_video: z.object({ frameRange: z.tuple([z.number().int().nonnegative(), z.number().int().nonnegative()]).optional() }),
+  intentframe_preview_video: z.strictObject({ frameRange: z.tuple([z.number().int().nonnegative(), z.number().int().nonnegative()]).optional(),
+    frames: z.array(z.number().int().nonnegative()).min(1).max(12).optional().describe("可选的原工程帧号；返回指定画面，便于检查关键状态或相邻帧，不要求均匀采样。") })
+    .refine(args => !args.frameRange || args.frameRange[1] >= args.frameRange[0], "预览范围结束不得早于开始。")
+    .refine(args => !args.frames || new Set(args.frames).size === args.frames.length, "指定预览帧不得重复。")
+    .refine(args => !args.frameRange || !args.frames || args.frames.every(frame => frame >= args.frameRange![0] && frame <= args.frameRange![1]), "指定帧超出预览范围。"),
 };
 type Name = keyof typeof schemas;
 const descriptions: Record<Name, string> = {
@@ -51,7 +57,7 @@ const descriptions: Record<Name, string> = {
   intentframe_download_asset: "保存原生搜索找到的公开HTTPS图片、音乐、音效或讲话原声；注明用途、出处和选用说明，不执行下载内容，不试听。",
   intentframe_download_image: "保存通过现成网上搜索工具找到的公开HTTPS图片，保留来源页面和使用说明；下载不表示已认可或已确认许可。",
   intentframe_set_audio_playback: "记录本版实际音轨安排与台词事件，生成工程直接引用的ProjectAudio、playback、cueFrame；缺少真实字词边界时拒绝猜测。",
-  intentframe_preview_video: "渲染当前源码的全片或指定帧范围预览，返回实际帧图和本机视频；不创建成片认可，不重生成素材。",
+  intentframe_preview_video: "渲染当前源码的全片或frameRange预览；可用frames指定最多12个原工程帧号，返回原尺寸帧图及原工程/局部视频时间。省略时返回三张概览。不表示连续观看或成片认可。",
 };
 const readOnly = new Set<Name>(["intentframe_media_capabilities", "intentframe_search_assets", "intentframe_inspect_asset"]);
 export function mediaToolDefinitions(designOnly = false) {
@@ -83,7 +89,7 @@ export class ProductionMediaTools {
     this.pending = result.catch(() => undefined);
     return result;
   }
-  async settled() { await this.pending; if (this.version) this.assets.assertSettled(this.work, this.version); }
+  async settled() { await this.pending; if (this.version) { this.assets.assertSettled(this.work, this.version); assertAudioPlanSettled(this.store, this.version); } }
   async drain() { await this.pending; }
   private production() {
     const version = this.version;
@@ -107,6 +113,10 @@ export class ProductionMediaTools {
     const inputPath = join(directory, "input.json"), signature = { name, input: parsed };
     if (existsSync(inputPath) && valueHash(readJson(inputPath)) !== valueHash(signature)) throw new Error("同一工具操作已有不同输入，不能覆盖。");
     immutableJson(inputPath, signature);
+    if (name === "intentframe_set_audio_playback" && existsSync(join(directory, "result.json"))) {
+      this.production();
+      return readJson(join(directory, "result.json"));
+    }
     let output: unknown;
     switch (name) {
       case "intentframe_media_capabilities": output = { libraries: this.catalog.libraries.map(item => ({ id: item.id, role: item.role,
@@ -201,16 +211,24 @@ export class ProductionMediaTools {
           origin: args.sourcePage, metadata: { url: args.url, finalUrl: downloaded.finalUrl, sourcePage: args.sourcePage, usageNotes: args.usageNotes } }, this.options.signal);
         this.assets.assets.register(this.work, asset); output = this.attach(asset.id); break;
       }
-      case "intentframe_set_audio_playback": output = saveAudioPlan(this.store, this.work, this.production(), schemas.intentframe_set_audio_playback.parse(raw)); break;
+      case "intentframe_set_audio_playback": output = saveAudioPlan(this.store, this.work, this.production(), schemas.intentframe_set_audio_playback.parse(raw), operationId); break;
       case "intentframe_preview_video": {
         const version = this.production(), args = schemas.intentframe_preview_video.parse(raw), entry = this.store.resolvePath(version.sourcePath);
         await this.assets.assertSettled(this.work, version); readAudioPlan(this.store, version);
         const snapshot = captureSourceSnapshot(entry), video = join(directory, "preview.mp4");
         const cache = join(repositoryRoot, ".cache", "production-previews", this.work.id, this.runId, operationId);
         const checked = await (this.options.render ?? renderVersion)(entry, video, cache, { sourceSnapshot: snapshot, frameRange: args.frameRange, signal: this.options.signal });
-        const result = { video, sourceFingerprint: sourceFingerprint(snapshot), frameRange: args.frameRange, check: checked, previewOnly: true };
+        const startFrame = args.frameRange?.[0] ?? 0;
+        const frameImages = args.frames ? await extractPreviewFrames(video, checked.videoSha256, checked.fps, checked.frameCount,
+          args.frames, startFrame, this.options.signal) : checked.previews.slice(0, 3).map((path, index) => {
+          const videoFrame = Math.floor((checked.frameCount - 1) * previewFractions[index]!);
+          return { path, sha256: fileHash(path), frame: startFrame + videoFrame, seconds: (startFrame + videoFrame) / checked.fps,
+            videoFrame, videoSeconds: videoFrame / checked.fps };
+        });
+        const result = { video, sourceFingerprint: sourceFingerprint(snapshot), frameRange: args.frameRange, check: checked,
+          frameImages, previewOnly: true, limitation: "本次只返回所列帧图；文件生成和抽帧不表示已经连续观看、试听或检查全部帧。" };
         immutableJson(join(directory, "preview.json"), result);
-        const images = checked.previews.slice(0, 3);
+        const images = frameImages.map(item => item.path);
         const visualAnalysis = this.options.visualAnalysis ? await this.options.visualAnalysis.run(this.work, this.runId,
           "visual_understanding", { ...result, question: "描述本轮局部预览中的实际内容、遮挡与动作线索，列出未覆盖范围。" }, images) : undefined;
         output = new NativeToolOutput([{ type: "inputText", text: JSON.stringify({ ...result, visualAnalysis }) }, ...images.map(path => ({ type: "inputImage" as const, imageUrl: "data:image/png;base64," + readFileSync(path).toString("base64") }))]);

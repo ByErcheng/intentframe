@@ -2,11 +2,14 @@ import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
 import { fileHash } from "../common/file-hash.ts";
-import { immutableText, valueHash } from "./files.ts";
+import { immutableText, readJson, valueHash } from "./files.ts";
 import { AssetStore } from "./asset-store.ts";
-import { authoringSchema, documentIdSchema, documentRefSchema, markdownSchema, draftSubmissionSchema } from "./authoring-contracts.ts";
+import { authoringSchema, documentIdSchema, documentRefSchema, markdownSchema, draftSubmissionSchema, baselineDraftReviewEvidenceSchema } from "./authoring-contracts.ts";
 import type { AuthoringDocument, DocumentRef, DesignDecision, DraftSubmission } from "./authoring-contracts.ts";
 import type { WorkRecord, WorkStore } from "./work-store.ts";
+import { profileSnapshotSchema, readCreativeBrief } from "./creative-profile.ts";
+import type { ProfileRef, ProfileSnapshot } from "./creative-profile.ts";
+import { ProfileStore } from "./profile-store.ts";
 
 export class DocumentStore {
   readonly store: WorkStore;
@@ -29,7 +32,16 @@ export class DocumentStore {
     if (!value || value.sha256 !== ref.sha256) throw new Error("稿件版本不存在或内容摘要不符；请读取当前作品的准确稿件编号。");
     const expected = join("works", record.id, "documents", value.id + ".md");
     if (value.path !== expected || fileHash(this.store.resolvePath(expected)) !== value.contentSha256 ||
-        valueHash({ kind: value.kind, contentSha256: value.contentSha256, assetRefs: value.assetRefs }) !== value.sha256) throw new Error("稿件内容与保存版本不一致，不能继续采用。");
+        valueHash({ kind: value.kind, contentSha256: value.contentSha256, assetRefs: value.assetRefs, creativeProfile: value.creativeProfile?.ref }) !== value.sha256) throw new Error("稿件内容与保存版本不一致，不能继续采用。");
+    if (value.creativeProfile) {
+      profileSnapshotSchema.parse(value.creativeProfile);
+      if (value.kind === "draft" && valueHash(readCreativeBrief(readFileSync(this.store.resolvePath(value.path), "utf8"), value.creativeProfile)) !== valueHash(value.creativeBrief)) {
+        throw new Error("草稿定位摘要与原文不一致。");
+      }
+      if (value.draft && valueHash(this.document(record, value.draft).creativeProfile?.ref ?? null) !== valueHash(value.creativeProfile.ref)) {
+        throw new Error("设计与来源草稿的创作档案依据不一致。");
+      }
+    }
     if (value.assetIds.join("|") !== value.assetRefs.map(ref => ref.id).join("|")) throw new Error("稿件附件引用已变化。");
     const assets = new AssetStore(this.store);
     for (const ref of value.assetRefs) {
@@ -51,6 +63,14 @@ export class DocumentStore {
     if (latest && (!basedOn || basedOn.id !== latest.id || basedOn.sha256 !== latest.sha256)) throw new Error("草稿已变化；请读取最新稿，再明确修改基线，避免覆盖其他修改。");
     if (basedOn) this.document(record, basedOn);
     new AssetStore(this.store).select(record, assetIds ?? (basedOn ? this.document(record, basedOn).assetIds : []));
+  }
+
+  resolveProfile(markdown: string, ref?: ProfileRef, record?: WorkRecord, basedOn?: DocumentRef, required = false) {
+    const inherited = record && (basedOn ? this.document(record, basedOn).creativeProfile : record.creationProfile);
+    const snapshot = ref ? valueHash(ref) === valueHash(inherited?.ref ?? null) ? inherited! : new ProfileStore(this.store.assetRoot).select(ref) : inherited;
+    if (!snapshot && required) throw new Error("新交接须明确选择创作档案；先列出并读取档案，将名称、版本、方向摘要和本条视频定位写入草稿。");
+    if (snapshot) readCreativeBrief(markdown, snapshot);
+    return snapshot;
   }
 
   validateDraftInput(markdown: string, raw: DraftSubmission | undefined, record?: WorkRecord, basedOn?: DocumentRef): DraftSubmission {
@@ -84,10 +104,23 @@ export class DocumentStore {
     return record.authoring?.runs.filter(run => run.kind === "review_draft" && run.base.id === draft.id && run.base.sha256 === draft.sha256).at(-1);
   }
 
+  baselineReviewEvidence(record: WorkRecord, draft: DocumentRef) {
+    const ref = record.authoring?.baselineDraftReviews?.find(item => valueHash(item.draft) === valueHash(documentRefSchema.parse(draft)));
+    if (!ref) return undefined;
+    if (this.store.purpose !== "test" || record.purpose !== "test" ||
+        ref.path !== join("works", record.id, "documents", draft.id + "-review-prerequisite.json") ||
+        fileHash(this.store.resolvePath(ref.path)) !== ref.sha256) throw new Error("测试基线的草稿检查依据缺失、变化或不属于本次测试。");
+    const evidence = baselineDraftReviewEvidenceSchema.parse(readJson(this.store.resolvePath(ref.path)));
+    if (valueHash(evidence.draft) !== valueHash(ref.draft)) throw new Error("测试基线检查依据与确切草稿不一致。");
+    return evidence;
+  }
+
   assertReviewed(record: WorkRecord, draft: DocumentRef) {
     const document = this.document(record, draft), run = this.latestDraftReview(record, draft);
     // 旧稿件继续沿当时的交接规则；新提交与已明确开始检查的旧稿都不能跳过检查。
     if (!document.reviewRequired && !run) return;
+    // 新检查优先；旧基线通过事实不能掩盖后续检查失败，也不能用于新草稿或正式作品。
+    if (!run && this.baselineReviewEvidence(record, draft)) return;
     if (run?.status !== "completed" || run.draftReview?.status !== "passed") throw new Error("草稿尚未通过入项检查；先调用 review_draft，按意见修改或澄清后复查确切新版本，再设计。");
   }
 
@@ -108,7 +141,7 @@ export class DocumentStore {
 
   append(record: WorkRecord, kind: "draft" | "design", markdown: string,
     details: Pick<AuthoringDocument, "operationId" | "source" | "instruction" | "assetIds"> & {
-      basedOn?: DocumentRef; draft?: DocumentRef; submission?: DraftSubmission; reviewRequired?: boolean }) {
+      basedOn?: DocumentRef; draft?: DocumentRef; submission?: DraftSubmission; reviewRequired?: boolean; creativeProfile?: ProfileSnapshot }) {
     markdownSchema.parse(markdown);
     if (!record.authoring) throw new Error("作品尚未启用草稿设计流程，请先提交草稿。");
     if (details.basedOn) this.document(record, details.basedOn);
@@ -116,7 +149,11 @@ export class DocumentStore {
     const list = kind === "draft" ? record.authoring.drafts : record.authoring.designs;
     const contentSha256 = createHash("sha256").update(markdown).digest("hex");
     const assetRefs = new AssetStore(this.store).select(record, details.assetIds).map(asset => ({ id: asset.id, sha256: asset.sha256, metadataSha256: asset.metadataSha256 }));
-    const sha256 = valueHash({ kind, contentSha256, assetRefs });
+    const creativeProfile = details.creativeProfile ?? (details.draft ? this.document(record, details.draft).creativeProfile :
+      details.basedOn ? this.document(record, details.basedOn).creativeProfile : record.creationProfile);
+    if (creativeProfile) profileSnapshotSchema.parse(creativeProfile);
+    const creativeBrief = kind === "draft" && creativeProfile ? readCreativeBrief(markdown, creativeProfile) : undefined;
+    const sha256 = valueHash({ kind, contentSha256, assetRefs, creativeProfile: creativeProfile?.ref });
     const previous = list.find(item => item.operationId === details.operationId);
     if (previous) {
       if (previous.sha256 !== sha256) throw new Error("原操作已保存不同稿件，不能覆盖。");
@@ -128,19 +165,25 @@ export class DocumentStore {
     const id = prefix + String(number).padStart(3, "0");
     documentIdSchema.parse(id);
     const document: AuthoringDocument = { id, kind, sha256, contentSha256, assetRefs, ...details,
+      ...(creativeProfile ? { creativeProfile, creativeBrief } : {}),
       path: join("works", record.id, "documents", id + ".md"), createdAt: new Date().toISOString() };
     immutableText(this.store.resolvePath(document.path), markdown);
     list.push(document);
     return document;
   }
 
-  async submit(workId: string, markdown: string, operationId: string, instruction: string, basedOn?: DocumentRef, assetIds?: string[], submission?: DraftSubmission) {
+  async submit(workId: string, markdown: string, operationId: string, instruction: string, basedOn?: DocumentRef, assetIds?: string[], submission?: DraftSubmission, profileRef?: ProfileRef) {
     return this.store.withLock(workId, () => {
       const record = this.store.read(workId);
       if (!record.authoring) record.authoring = authoringSchema.parse({});
       this.validateSubmission(record, basedOn, assetIds);
       if (submission) this.validateDraftInput(markdown, submission, record, basedOn);
+      const creativeProfile = this.resolveProfile(markdown, profileRef, record, basedOn);
+      if (submission?.authorization.kind === "external_correction" && valueHash(creativeProfile?.ref ?? null) !== valueHash(basedOn ? this.document(record, basedOn).creativeProfile?.ref ?? null : null)) {
+        throw new Error("外部纠错不能切换创作档案依据；须按用户明确指令交接新版。");
+      }
       const document = this.append(record, "draft", markdown, { operationId, instruction, source: "external_ai", basedOn,
+        creativeProfile,
         assetIds: assetIds ?? (basedOn ? this.document(record, basedOn).assetIds : []),
         ...(submission ? { submission, reviewRequired: true } : {}) });
       if (submission) this.recordSubmissionHandoff(record, document, submission, operationId);

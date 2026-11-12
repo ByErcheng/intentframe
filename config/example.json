@@ -44,6 +44,11 @@
   "diagnostics": {
     "toolTimeoutMs": 10000
   },
+  "updates": {
+    "enabled": true,
+    "dayStartHour": 6,
+    "timeoutMs": 4000
+  },
   "models": {
     "default": {
       "model": "gpt-6.1-sol",

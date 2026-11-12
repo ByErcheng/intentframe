@@ -21,14 +21,21 @@ export const feedbackLocationSchema = z.strictObject({
 }).refine(value => value.endSeconds === undefined || (value.startSeconds !== undefined && value.endSeconds > value.startSeconds), "结束时间须晚于开始时间。");
 export type FeedbackLocation = z.infer<typeof feedbackLocationSchema>;
 
+export const learningLimits = { batchSources: 50, caseVersions: 12 } as const;
+// 每条待办展开至多 caseVersions 个版本或两个稿件，再计入本轮关联的制作版本。
+export const experienceSourceLimit = learningLimits.batchSources * Math.max(learningLimits.caseVersions, 2) + 1;
+
 export const videoExperienceSourceSchema = z.strictObject({
   purpose: purposeSchema, workId: recordIdSchema, versionId: z.string().regex(/^v\d{3,}$/),
   sourceFingerprint: z.string().regex(/^[a-f0-9]{64}$/),
   feedbackIds: z.array(z.string()).max(100),
 });
-export const experienceSourceSchema = z.union([videoExperienceSourceSchema,
-  z.strictObject({ kind: z.literal("document"), purpose: purposeSchema, workId: recordIdSchema, documentRef: documentRefSchema })]);
+export const documentExperienceSourceSchema = z.strictObject({
+  kind: z.literal("document"), purpose: purposeSchema, workId: recordIdSchema, documentRef: documentRefSchema,
+});
+export const experienceSourceSchema = z.union([videoExperienceSourceSchema, documentExperienceSourceSchema]);
 export type ExperienceSource = z.infer<typeof experienceSourceSchema>;
+export const learningCaseSourcesSchema = z.record(z.string(), z.array(experienceSourceSchema).max(100));
 
 export const learningProposalSchema = z.strictObject({
   title: z.string().trim().min(1).max(200), problem: z.string().trim().min(1).max(2_000),

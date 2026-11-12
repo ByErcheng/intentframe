@@ -146,6 +146,9 @@ export function run(mode = "completed", home, completionDelayMs = 1_000) {
       };
       const needsInput = ["needs_input", "partial_input", "disconnect_needs_input"].includes(mode);
       const reviewIssue = ["draft_changes", "draft_confirmation", "disconnect_draft_changes"].includes(mode);
+      const authoringInput = authoring && !analysis ? JSON.parse(readFileSync("input.json", "utf8")) : undefined;
+      const draftHeading = authoringInput?.kind === "revise_draft" && authoringInput.base.creativeProfile ?
+        authoringInput.base.markdown.split(/\r?\n/).filter(line => /^(所属创作档案|档案方向摘要|本条视频定位)：/.test(line)).join("\n") + "\n\n" : "";
       const result = analysis ? { status: mode === "analysis_needs_input" ? "needs_input" : "completed", markdown: "合成分析：保留采用设计，无需新增素材；图像观察仅验证交接。", limitations: ["合成响应，不证明真实效果。"] } : visual ? {status:'completed',summary:'合成截图理解，仅验证调用边界。',observations:[{image:'1',observation:'可见测试色块。',evidence:'本轮图像输入'}],limitations:['模拟响应不证明真实视觉能力。']} : draftReview ? {
         status: mode === "draft_confirmation" ? "needs_confirmation" : reviewIssue ? "needs_changes" : "passed",
         summary: "合成草稿检查，仅验证交接行为。",
@@ -161,7 +164,7 @@ export function run(mode = "completed", home, completionDelayMs = 1_000) {
           issues: repairNeeded || mode === "quality_change" ? [{ description: "合成检查：角色部件在中间动作断开。", correction: mode === "quality_change" ? "需要确认是否改变角色构造设计。" : "保持采用设计，修复部件连接并复查动作。" }] : [] },
       } : authoring ? {
         status: needsInput ? "needs_input" : ["failed", "disconnect_failed"].includes(mode) ? "failed" : "completed",
-        markdown: needsInput || ["failed", "disconnect_failed"].includes(mode) ? "" : "# 合成视频设计\n\n角色递出道具，保持脚底支撑；静音测试素材。\n",
+        markdown: needsInput || ["failed", "disconnect_failed"].includes(mode) ? "" : draftHeading + "# 合成视频设计\n\n角色递出道具，保持脚底支撑；静音测试素材。\n",
         summary: "合成稿件结果。", blockers: needsInput ? ["请补充参考。"] : [],
       } : organizing ? learning : {
         status: needsInput ? "needs_input" : mode === "failed" || mode === "partial_failed" ? "failed" : "completed",

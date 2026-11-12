@@ -11,7 +11,7 @@ import { sourceFingerprint } from "../src/records/source-snapshot.ts";
 import { WorkService } from "../src/runtime/work-service.ts";
 import { WorkRouter } from "../src/runtime/work-router.ts";
 import { executeTool, inputs, prepareOperation } from "../src/mcp/server.ts";
-import { fakeCodex, fixtureRender, fixtureRoot, readyVersion } from "./helpers.ts";
+import { fakeCodex, fixtureRender, fixtureRoot, readyVersion, fixtureProfile } from "./helpers.ts";
 
 test("比较固定共同输入和知识版本，新经验先暂存，评价后再发布且可增量整理评价", async () => {
   const root = fixtureRoot();
@@ -23,7 +23,7 @@ test("比较固定共同输入和知识版本，新经验先暂存，评价后�
     const input: ExperienceInput = { title: "字幕布局", problem: "字幕遮挡", method: "按主体调整", conditions: "主体接近字幕", limitations: "合成记录", keywords: ["字幕"], status: "candidate", use: "reusable", sources: [base] };
     const knowledge = new KnowledgeStore(root.path), shared = knowledge.save(input);
     const store = new WorkStore(join(root.path, "testing"), "test", root.path);
-    const comparison = new ComparisonStore(store, knowledge).create({ title: "反馈修改比较", brief: "相同字幕任务", kind: "revision", change: "测试制作策略", revisionRequest: "字幕避开主体", base, knowledgeRefs: [shared] }, "compare-one");
+    const comparison = new ComparisonStore(store, knowledge).create({ profileRef: fixtureProfile.ref, title: "反馈修改比较", brief: "相同字幕任务", kind: "revision", change: "测试制作策略", revisionRequest: "字幕避开主体", base, knowledgeRefs: [shared] }, "compare-one");
     const sourceBefore = readFileSync(production.resolvePath(source.versions[0]!.sourcePath), "utf8");
     const taskBefore = readFileSync(join(production.workDirectory(source.id), "task.json"), "utf8");
     const later = knowledge.save({ ...input, title: "后加入的字幕方法" });
@@ -66,7 +66,7 @@ test("比较不能改共同需求、引用额外反馈或将篡改的暂存正�
       codexExecutable: fakeCodex(root.path), render: fixtureRender,
     });
     assert.throws(() => new ComparisonStore(new WorkStore(root.path)).create({ title: "不能正式比较", brief: "x", kind: "creation", change: "x", knowledgeRefs: [] }, "wrong-mode"), /测试入口/);
-    const comparison = service.comparisons.create({ title: "同条件", brief: "相同初始需求", kind: "creation", change: "一个改动", knowledgeRefs: [] }, "inputs");
+    const comparison = service.comparisons.create({ profileRef: fixtureProfile.ref, title: "同条件", brief: "相同初始需求", kind: "creation", change: "一个改动", knowledgeRefs: [] }, "inputs");
     const before = store.read(comparison.workIds.before), briefPath = store.resolvePath(before.briefPath), original = readFileSync(briefPath, "utf8");
     writeFileSync(briefPath, "另一套需求");
     await assert.rejects(service.produce(before.id, "sample"), /原始需求已变化/);
@@ -86,7 +86,7 @@ test("比较不能改共同需求、引用额外反馈或将篡改的暂存正�
     await service.comparisons.evaluate(comparison.id, { beforeVersionId: "v001", afterVersionId: "v001", verdict: "inconclusive", observations: "只核对记录。", source: "user" });
     assert.throws(() => organizer.learning.publishStaged(store.read(before.id)), /暂存经验正文/);
     assert.equal(organizer.knowledge.latest().length, 0);
-    const next = service.comparisons.create({ title: "禁止新增反馈", brief: "固定", kind: "creation", change: "一个改动", knowledgeRefs: [] }, "extra");
+    const next = service.comparisons.create({ profileRef: fixtureProfile.ref, title: "禁止新增反馈", brief: "固定", kind: "creation", change: "一个改动", knowledgeRefs: [] }, "extra");
     await service.produce(next.workIds.before, "sample"); await service.produce(next.workIds.after, "sample");
     await store.feedback(next.workIds.before, "v001", "比较中临时增加的要求", "user");
     await assert.rejects(service.comparisons.evaluate(next.id, { beforeVersionId: "v001", afterVersionId: "v001", verdict: "improved", observations: "不能声称条件相同", source: "external_ai" }), /额外制作或人工反馈/);
@@ -125,7 +125,7 @@ test("比较派生任务可使用长度上限，需求原文完整保留且重�
     try {
       const router = new WorkRouter(root.path);
       const request = prepareOperation("create_comparison", { comparison: {
-        title: "题".repeat(195), kind: "creation", change: "一个改动", knowledgeRefs: [], ...fields,
+        title: "题".repeat(195), kind: "creation", change: "一个改动", knowledgeRefs: [], ...fields, profileRef: fixtureProfile.ref,
       } });
       const created = await executeTool(request.name, request.arguments, router) as { id: string; workIds: { before: string; after: string } };
       const store = router.service("test").store;
@@ -149,7 +149,7 @@ test("新建比较的长度校验不阻断旧版已保存的比较记录", () =>
   const root = fixtureRoot();
   try {
     const store = new WorkStore(join(root.path, "testing"), "test", root.path), comparisons = new ComparisonStore(store);
-    const original = comparisons.create({ title: "历史比较", brief: "共同需求", kind: "creation", change: "一个改动", knowledgeRefs: [] }, "legacy");
+    const original = comparisons.create({ profileRef: fixtureProfile.ref, title: "历史比较", brief: "共同需求", kind: "creation", change: "一个改动", knowledgeRefs: [] }, "legacy");
     // 旧版任务创建以 trim 后长度校验，可能已经保存包含更多前导空白的完整原文。
     const brief = " ".repeat(20) + "需".repeat(29_980);
     const input = { ...original.input, brief, revisionRequest: "改" };
