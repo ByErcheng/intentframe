@@ -9,7 +9,7 @@ import { selectProduction } from "../src/runtime/production-selection.ts";
 import { fakeCodex, fixtureRender, fixtureRoot, readyVersion } from "./helpers.ts";
 
 async function feedbackApplications(service: WorkService, workId: string) {
-  const view = await executeToolInline("get_work", { workId }, service) as {
+  const view = await executeToolInline("get_work", { view: "detail", workId }, service) as {
     feedback: { id: string; appliedInVersionIds: string[] }[];
   };
   return view.feedback.map(item => item.appliedInVersionIds);

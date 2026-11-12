@@ -1,0 +1,9 @@
+{
+ "id":"effort-astra-production-one-minute","media":{"durationSeconds":60,"width":1080,"height":1920},
+ "variants":[{"id":"astra-medium","model":"gpt-6-astra","effort":"medium"},{"id":"astra-high","model":"gpt-6-astra","effort":"high"},{"id":"astra-xhigh","model":"gpt-6-astra","effort":"xhigh"},{"id":"astra-max","model":"gpt-6-astra","effort":"max"}],
+ "caseIds":["effort-produce"],"repetitions":1,
+ "limits":{"modelTurnMs":1800000,"operationMs":7200000,"generationCalls":12,"mediaProbeMs":180000,"mediaDecodeMs":180000,"mediaPreviewMs":180000},
+ "providerKinds":["speech"],"assetLibraries":"configured",
+ "repeatRule":"同一设计、台词、服务与额度；保留首稿和全部修复，每档一次仅作观察。",
+ "choicePolicy":"只比较中等、高、极高、最大值；不替用户选强度。"
+}

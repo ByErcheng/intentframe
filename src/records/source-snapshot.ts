@@ -22,7 +22,11 @@ export function captureSourceSnapshot(entry: string): SourceSnapshot {
       if (stat.isSymbolicLink()) throw new Error("工程包含符号链接，须先将引用材料纳入版本：" + relative);
       if (name === "node_modules" || name === ".git") throw new Error("制作目录不能包含独立依赖或 Git 仓库：" + relative);
       if (stat.isDirectory()) visit(path, relative + "/");
-      else if (stat.isFile()) files[relative] = fileHash(path);
+      else if (stat.isFile()) {
+        // 只有文件路径会作为键保存；同名目录下的完整相对路径可以可靠序列化。
+        if (relative === "__proto__") throw new Error("工程根目录的 __proto__ 文件名不能可靠保存到快照，请重命名后重试。");
+        files[relative] = fileHash(path);
+      }
       else throw new Error("工程包含不支持的文件类型：" + relative);
     }
   }

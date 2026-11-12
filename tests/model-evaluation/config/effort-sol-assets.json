@@ -1,0 +1,9 @@
+{
+ "id":"effort-sol-assets-one-minute","media":{"durationSeconds":60,"width":1080,"height":1920},
+ "variants":[{"id":"sol-medium","model":"gpt-6.1-sol","effort":"medium"},{"id":"sol-high","model":"gpt-6.1-sol","effort":"high"},{"id":"sol-xhigh","model":"gpt-6.1-sol","effort":"xhigh"},{"id":"sol-max","model":"gpt-6.1-sol","effort":"max"}],
+ "caseIds":["effort-assets"],"repetitions":1,
+ "limits":{"modelTurnMs":1800000,"operationMs":7200000,"generationCalls":1,"mediaProbeMs":180000,"mediaDecodeMs":180000,"mediaPreviewMs":180000},
+ "providerKinds":["image"],"assetLibraries":"configured",
+ "repeatRule":"同一图片服务，每档仅一张，不重试；图像随机性不等于指挥模型强度差异。",
+ "choicePolicy":"保留原图、声音与决策说明；只测试四档，等用户选择。"
+}

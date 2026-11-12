@@ -2,8 +2,21 @@ import type { WorkRecord, WorkVersion } from "../records/work-store.ts";
 import { WorkStore } from "../records/work-store.ts";
 import { DocumentStore } from "../records/document-store.ts";
 import type { DocumentRef } from "../records/authoring-contracts.ts";
+import { valueHash } from "../records/files.ts";
 
-export type ProductionSelection = { feedbackIds?: string[]; newDirection?: boolean; designRef?: DocumentRef; assetIds?: string[] };
+export type ProductionSelection = { feedbackIds?: string[]; newDirection?: boolean; designRef?: DocumentRef; assetIds?: string[]; preflightHash?: string };
+export type ProductionRequest = ProductionSelection & { kind: "sample" | "complete"; feedbackId?: string;
+  threadMode?: "fresh" | "resume"; baseVersionId?: string; baseReason?: string };
+
+/** 同时绑定业务状态和已展示的选择；查询计时、经验整理等无关记录不使预检失效。 */
+export function productionPreflightHash(record: WorkRecord, request: ProductionRequest) {
+  return valueHash({ work: { id: record.id, purpose: record.purpose, execution: record.execution,
+    versions: record.versions, feedback: record.feedback, directionApproval: record.directionApproval,
+    authoring: record.authoring, assets: record.assets },
+  selection: { kind: request.kind, feedbackId: request.feedbackId, feedbackIds: request.feedbackIds,
+    threadMode: request.threadMode ?? "fresh", baseVersionId: request.baseVersionId, baseReason: request.baseReason,
+    newDirection: request.newDirection ?? false, designRef: request.designRef, assetIds: request.assetIds } });
+}
 
 /** 累计应用记录含继承成果；本轮应用还须与通过回执及工程校验的模型声明对应。 */
 export function feedbackAppliedByVersion(version: WorkVersion): string[] {
@@ -41,6 +54,10 @@ function continuesApprovedDirection(store: WorkStore, record: WorkRecord, base: 
 export function selectProduction(store: WorkStore, record: WorkRecord, kind: "sample" | "complete",
   feedbackId?: string, threadMode: "fresh" | "resume" = "fresh", baseVersionId?: string, baseReason?: string,
   selection: ProductionSelection = {}) {
+  if (selection.preflightHash && selection.preflightHash !== productionPreflightHash(record,
+    { ...selection, kind, feedbackId, threadMode, baseVersionId, baseReason })) {
+    throw new Error("预检后的作品状态或请求选择已变化，尚未开始制作；请重新 prepare_operation 核对本轮范围。");
+  }
   if (["running", "unknown"].includes(record.execution.status)) throw new Error("已有执行尚未取得明确结果，不能重复发起。请查询原执行并核对恢复。");
   if (record.authoring && !selection.designRef) throw new Error("新流程制作须明确提供 designRef，不能猜测采用哪份设计。");
   if (!record.authoring && selection.designRef) throw new Error("旧任务尚未启用稿件流程，不能忽略或跨任务采用 designRef；请先提交本任务草稿。");

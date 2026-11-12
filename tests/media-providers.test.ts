@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { test } from "node:test";
-import { generateImage, synthesizeSpeech, speechSegments, ProviderRequestError } from "../src/media/providers.ts";
+import { generateImage, synthesizeSpeech, speechSegments, ProviderRequestError, configuredVoices, selectSpeechVoice } from "../src/media/providers.ts";
 import { rgbPng } from "../src/media/review-materials.ts";
 import { mediaBinaries, mediaCommand } from "../src/media/render.ts";
 import { WorkStore } from "../src/records/work-store.ts";
@@ -15,6 +15,20 @@ import { valueHash } from "../src/records/files.ts";
 import { executeTool, executeToolInline as call } from "../src/mcp/server.ts";
 import { ExecutionBudgetExceeded, StopRequested } from "../src/runtime/execution-control.ts";
 import { fixtureRoot } from "./helpers.ts";
+
+test("音色声明兼容旧配置，选择其他音色不继承默认音色身份", () => {
+  const settings = { apiKey: "fixture-secret", speaker: "default-speaker", resourceId: "fixture-resource", timeoutMs: 1000,
+    label: "默认测试音色", description: "合成默认身份声明", voices: [{ id: "other", label: "其他测试音色", speaker: "other-speaker", resourceId: "other-resource" }] };
+  assert.deepEqual(configuredVoices({}), []);
+  assert.equal(configuredVoices({ speech: settings })[0]!.description, "合成默认身份声明");
+  assert.equal(configuredVoices({ speech: settings })[1]!.description, undefined);
+  assert(!JSON.stringify(configuredVoices({ speech: settings })).includes("fixture-secret"));
+  const other = selectSpeechVoice(settings, "other");
+  assert.equal(other.speaker, "other-speaker"); assert.equal(other.description, undefined);
+  const legacy = { apiKey: "fixture", speaker: "s", resourceId: "r", timeoutMs: 1000 };
+  assert.equal(configuredVoices({ speech: legacy })[0]!.label, "本机默认音色");
+  assert.equal(configuredVoices({ speech: legacy })[0]!.description, undefined);
+});
 
 function silentWav() {
   const samples = 2400, wav = Buffer.alloc(44 + samples * 2);
@@ -167,8 +181,11 @@ test("图片保存到本机并绑定稿件；未配置不调用，未知请求�
     const service = new WorkService(store, { providerSettings: { image: { apiKey: "test-secret", model: "test-model", timeoutMs: 1000 } },
       providerFetch: async () => { calls++; return Response.json({ data: [{ b64_json: bytes.toString("base64") }] }); } });
     const input = { kind: "image" as const, document, prompt: "合成图像", referenceAssetIds: [], description: "仅测试保存" };
-    const result = await service.assets.generate(work.id, input, "image-op");
+    const { kind: _kind, ...arguments_ } = input;
+    const result = await call("generate_image", { ...arguments_, workId: work.id, operationId: "image-op" }, service) as { id: string; location: string };
     assert.equal(calls, 1); assert.deepEqual(readFileSync(result.location), bytes);
+    assert.equal(store.read(work.id).authoring!.decisions.length, 0, "独立素材任务不补造设计采用");
+    assert.equal(store.read(work.id).versions.length, 0, "独立素材任务不启动视频制作");
     assert(!JSON.stringify(result).includes("test-secret"));
     const latest = await documents.submit(work.id, "引用图片的新稿。", "with-image", "加入参考图", document, [result.id]);
     assert.equal(latest.attachments[0]!.id, result.id);
@@ -223,9 +240,9 @@ test("素材输出恢复补齐原后台回执，补存中断后仍沿原操作�
     executions.finish(request, { status: "unknown", error: "合成登记失败后工作进程收尾" });
     const originalBytes = readFileSync(executions.path(input.operationId, "outcome.json"));
     t.mock.method(ExecutionStore.prototype, "recordRecovery", () => { throw new Error("合成恢复回执保存失败"); }, { times: 1 });
-    await assert.rejects(call("recover_work", { operationId: "recover-first", workId: work.id }, service), /合成恢复回执保存失败/);
+    await assert.rejects(call("recover_work", { mode: "resume", operationId: "recover-first", workId: work.id }, service), /合成恢复回执保存失败/);
     assert.equal(store.read(work.id).assets?.length, 1, "素材已登记，后续只需补回执");
-    const recovered = await call("recover_work", { operationId: "recover-second", workId: work.id }, service) as { status: string; asset: { id: string } };
+    const recovered = await call("recover_work", { mode: "resume", operationId: "recover-second", workId: work.id }, service) as { status: string; asset: { id: string } };
     assert.equal(recovered.status, "recovered");
     const original = await executeTool("get_execution", { executionId: input.operationId }, service) as {
       status: string; result: { id: string; location: string }; timing: { elapsedMs: number };
@@ -274,7 +291,7 @@ test("素材恢复区分服务明确拒绝与未知结果，只补有依据的�
         createdAt: new Date().toISOString(), systemFingerprint: "fixture", configurationFingerprint: "fixture" });
       await assert.rejects(service.assets.generate(work.id, { ...input, kind: "image" }, input.operationId), /HTTP/);
       executions.finish(request, { status: "unknown", error: "模拟业务已记录，但后台未取得终态。" });
-      await call("recover_work", { operationId: "recover", workId: work.id }, service);
+      await call("recover_work", { mode: "resume", operationId: "recover", workId: work.id }, service);
       const original = executions.view(input.operationId);
       assert.equal(original.status, expected); assert.equal(store.read(work.id).execution.status, expected);
       if (expected === "failed") assert.match(original.error!, /HTTP 400/);

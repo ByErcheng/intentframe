@@ -4,6 +4,8 @@ import {
 } from "node:fs";
 import { join, resolve } from "node:path";
 import { z } from "zod";
+import { modelEvidenceFields } from "./model-settings.ts";
+import { analysisRunSchema } from "./model-analysis.ts";
 import { configuration } from "../config.ts";
 import { fileHash, sourceSnapshotSchema, verifyLegacySource, verifySourceSnapshot } from "./source-snapshot.ts";
 import { productionResultSchema } from "../runtime/production-result.ts";
@@ -14,7 +16,8 @@ import { processExists } from "../runtime/process-state.ts";
 import { activeExecution, assertExecutionAccess, ExecutionStore, withExecutionDispatch } from "./execution-store.ts";
 import { inspectPreviews } from "../media/previews.ts";
 import { authoringSchema, documentRefSchema } from "./authoring-contracts.ts";
-import { assetSchema, reviewPreparationSchema, internalReviewPassed } from "./media-contracts.ts";
+import { assetSchema, reviewPreparationSchema, internalReviewPassed, reviewCoverageSchema, validateReviewCoverage } from "./media-contracts.ts";
+import type { ReviewCoverage } from "./media-contracts.ts";
 import { readReviewBatch } from "../media/review-materials.ts";
 import { dirname } from "node:path";
 
@@ -36,6 +39,7 @@ const reviewSchema = z.object({
   source: z.enum(["user", "external_ai", "internal_check"]).optional(),
   checkedAt: z.string().optional(),
   materialIndexes: z.array(z.string()).optional(),
+  coverage: reviewCoverageSchema.optional(),
 });
 const confirmationSchema = z.object({
   versionId: versionIdSchema, kind: z.enum(["direction", "acceptance"]),
@@ -51,7 +55,7 @@ export const versionSchema = z.object({
   feedbackId: z.string().optional(), runId: z.string(),
   feedbackIds: z.array(z.string()).optional(), appliedFeedbackIds: z.array(z.string()).optional(),
   baseReason: z.string().optional(), agentReply: z.string().optional(), agentResult: productionResultSchema.optional(),
-  threadId: z.string().optional(), turnId: z.string().optional(), model: z.string().optional(),
+  threadId: z.string().optional(), turnId: z.string().optional(), ...modelEvidenceFields,
   sourceSha256: z.string().optional(), videoSha256: z.string().optional(),
   sourceSnapshot: sourceSnapshotSchema.optional(),
   technicalCheck: z.record(z.string(), z.unknown()).optional(),
@@ -92,6 +96,7 @@ export const workSchema = z.object({
   id: idSchema, title: z.string(), briefPath: z.string(), createdAt: z.string(),
   authoring: authoringSchema.optional(),
   assets: z.array(assetSchema).optional(),
+  analysisRuns: z.array(analysisRunSchema).optional(),
   execution: executionSchema,
   directionApproval: z.object({
     sampleVersionId: versionIdSchema, scope: z.string(), userConfirmation: z.string(), confirmedAt: z.string(),
@@ -105,6 +110,7 @@ export const workSchema = z.object({
   learningPending: z.object({ id: idSchema, result: learningResultSchema, versionId: z.string(), sourceIds: z.array(z.string()), createdAt: z.string() }).optional(),
   learningError: z.string().optional(),
   learningRun: z.object({ id: idSchema, versionId: z.string(), sourceIds: z.array(z.string()), contextSha256: z.string(),
+    ...modelEvidenceFields,
     threadId: z.string().optional(), turnId: z.string().optional(), runnerPid: z.number().int().positive().optional(),
     sendState: z.enum(["not_sent", "sending", "acknowledged"]), previousExecution: executionSchema,
     completed: z.boolean(), createdAt: z.string() }).optional(),
@@ -116,6 +122,10 @@ function validateRecord(input: unknown): WorkRecord {
   const record = workSchema.parse(input), workPath = "works/" + record.id;
   if (record.briefPath !== workPath + "/brief.md") throw new Error("需求路径与所属作品不一致。");
   const ids = new Set<string>();
+  for (const run of record.analysisRuns ?? []) {
+    if (ids.has(run.id) || run.inputPath !== workPath + "/analysis/" + idSchema.parse(run.id) + "/input.json") throw new Error("分析记录身份或位置不一致。");
+    ids.add(run.id);
+  }
   for (const document of [...record.authoring?.drafts ?? [], ...record.authoring?.designs ?? []]) {
     if (ids.has(document.id) || document.path !== join(workPath, "documents", document.id + ".md") ||
       !document.id.startsWith(document.kind === "draft" ? "d" : "s")) throw new Error("稿件身份、种类或位置不一致。");
@@ -428,7 +438,7 @@ export class WorkStore {
 
   async review(
     id: string, versionId: string, status: "needs_changes" | "passed",
-    notes: string, source: "user" | "external_ai" | "internal_check", materialIndexes?: string[],
+    notes: string, source: "user" | "external_ai" | "internal_check", materialIndexes?: string[], coverage?: ReviewCoverage,
   ): Promise<WorkRecord> {
     z.string().trim().min(1).parse(notes);
     return this.withLock(id, () => {
@@ -436,6 +446,7 @@ export class WorkStore {
       const version = this.version(record, versionId);
       if (version.production !== "ready") throw new Error("须先取得实际作品再记录审查。");
       this.assertAvailable(version);
+      const actualCoverage = coverage === undefined ? undefined : validateReviewCoverage(coverage, version.technicalCheck?.durationSeconds);
       if (version.designRef && source === "external_ai" && !materialIndexes?.length) throw new Error("外部 AI 审查须关联实际读取的项目审查索引。");
       for (const path of materialIndexes ?? []) {
         const ref = version.reviewPreparation?.batches.find(item => item.path === path);
@@ -443,7 +454,7 @@ export class WorkStore {
         readReviewBatch(dirname(this.resolvePath(path)), version.videoSha256!);
       }
       version.reviews ??= version.review.status === "not_reviewed" ? [] : [{ ...version.review }];
-      version.review = { status, notes, source, materialIndexes, checkedAt: now() };
+      version.review = { status, notes, source, materialIndexes, ...(actualCoverage ? { coverage: actualCoverage } : {}), checkedAt: now() };
       version.reviews.push(version.review);
       this.save(record);
       return record;

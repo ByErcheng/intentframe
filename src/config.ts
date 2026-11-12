@@ -2,6 +2,8 @@ import { closeSync, constants, fstatSync, lstatSync, openSync, readFileSync } fr
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
+import { assetRoleSchema } from "./records/asset-types.ts";
+import { modelsSchema } from "./records/model-settings.ts";
 
 export const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const pathSchema = z.string().refine(value => value.trim().length > 0 && !/[\0\r\n]/.test(value));
@@ -11,15 +13,32 @@ const toolSchema = z.strictObject({
   path: pathSchema, version: z.string().trim().min(1), source: z.url(),
   archiveSha256: z.string().regex(/^[a-f0-9]{64}$/).optional(),
 });
+const voiceProfileSchema = z.strictObject({ id: z.string().regex(/^[a-z0-9-]{1,40}$/).refine(id => id !== "default"),
+  label: z.string().trim().min(1), description: z.string().trim().min(1).max(2000).optional(),
+  speaker: z.string().trim().min(1), resourceId: z.string().trim().min(1), model: z.string().trim().min(1).optional() });
+const audioProviderSchema = z.strictObject({ apiKey: z.string().trim().min(1), model: z.string().trim().min(1),
+  timeoutMs: timeoutSchema.default(300_000) });
 export const providersSchema = z.strictObject({
   image: z.strictObject({ apiKey: z.string().trim().min(1), model: z.string().trim().min(1),
     timeoutMs: timeoutSchema.default(300_000) }).optional(),
   speech: z.strictObject({ apiKey: z.string().trim().min(1), speaker: z.string().trim().min(1),
     resourceId: z.string().trim().min(1), model: z.string().trim().min(1).optional(),
+    label: z.string().trim().min(1).max(300).optional(), description: z.string().trim().min(1).max(2000).optional(),
+    voices: z.array(voiceProfileSchema).max(50).refine(voices => new Set(voices.map(voice => voice.id)).size === voices.length, "音色编号不能重复").optional(),
     timeoutMs: timeoutSchema.default(120_000) }).optional(),
+  music: audioProviderSchema.optional(),
+  sound_effect: audioProviderSchema.optional(),
 });
+export const libraryRelativePathSchema = z.string().min(1).refine(value =>
+  !/[\\\0\r\n]/.test(value) && value.split("/").every(part => part.length > 0 && part !== "." && part !== ".."),
+  "素材路径须为素材库根目录内的相对路径，不能包含空段、点段或反斜杠");
 export const assetLibrarySchema = z.strictObject({ id: z.string().regex(/^[a-z0-9-]{1,40}$/), path: pathSchema,
-  role: z.enum(["reference", "image", "narration", "music"]) });
+  role: assetRoleSchema,
+  usageNotes: z.string().trim().min(1).max(2000).optional(),
+  attributionPaths: z.array(libraryRelativePathSchema).max(100).optional(),
+  roleOverrides: z.array(z.strictObject({ path: libraryRelativePathSchema, role: assetRoleSchema })).max(100)
+    .refine(items => new Set(items.map(item => item.path)).size === items.length, "分类路径不能重复").optional() });
+export type LibraryRoot = z.infer<typeof assetLibrarySchema>;
 const settingsSchema = z.strictObject({
   dataRoot: pathSchema,
   backupRoot: pathSchema,
@@ -31,6 +50,7 @@ const settingsSchema = z.strictObject({
     decodeTimeoutMs: timeoutSchema, previewTimeoutMs: timeoutSchema }),
   backup: z.strictObject({ commandTimeoutMs: timeoutSchema }),
   diagnostics: z.strictObject({ toolTimeoutMs: timeoutSchema }),
+  models: modelsSchema,
   providers: providersSchema.optional(),
   assetLibraries: z.array(assetLibrarySchema).max(20).default([]).refine(items => new Set(items.map(item => item.id)).size === items.length, "素材库编号须唯一"),
 });
@@ -100,6 +120,7 @@ export function loadConfiguration(root = repositoryRoot, environment: NodeJS.Pro
     tools: settings.tools, runtime: settings.runtime, mcp: settings.mcp,
     media: settings.media, backup: settings.backup, diagnostics: settings.diagnostics,
     providers: settings.providers ?? {},
+    models: settings.models,
     assetLibraries: settings.assetLibraries.map(item => ({ ...item, path: resolve(root, item.path) })),
   };
 }

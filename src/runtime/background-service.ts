@@ -17,7 +17,8 @@ export class BackgroundService {
   readonly executions: ExecutionStore;
   constructor(router: WorkRouter) { this.router = router; this.executions = new ExecutionStore(router.assetRoot); }
 
-  async submit(name: BackgroundTool, input: Record<string, unknown> & { operationId: string; workId: string }, receivedAt?: string) {
+  async submit(name: BackgroundTool, input: Record<string, unknown> & { operationId: string; workId: string }, receivedAt?: string,
+    resolvedInput: Record<string, unknown> = input) {
     const service = this.router.forWork(input.workId), store = service.store;
     if (store.assetRoot !== configuration.assetRoot) throw new Error("后台进程须使用当前入口已配置的资产目录；隔离调用请先设置独立配置。");
     return withExecutionDispatch(store.dataRoot, input.workId, async () => {
@@ -45,12 +46,15 @@ export class BackgroundService {
           const owner = lockingStore.lockOwner(input.workId);
           if (owner && processExists(owner.pid)) throw new Error("原任务写入进程仍在运行，暂不另行恢复。");
         } else service.assertCanProduce(store.read(input.workId), name === "produce_version" && input.kind === "complete" ? "complete" : "sample");
-        let prepared;
+        // 原请求继续与操作回执逐字对应；新默认模式单独固定，历史未提供模式的请求不被改写。
+        let prepared: { input: Record<string, unknown>; snapshot?: unknown } | undefined =
+          valueHash(resolvedInput) === valueHash(input) ? undefined : { input: resolvedInput };
         if (name === "produce_version") {
           const args = z.object({ kind: z.enum(["sample", "complete"]), feedbackId: z.string().optional(),
             feedbackIds: z.array(z.string()).optional(), newDirection: z.boolean().optional(), threadMode: z.enum(["fresh", "resume"]),
             baseVersionId: z.string().optional(), baseReason: z.string().optional(),
-            designRef: z.object({ id: z.string(), sha256: z.string() }).optional(), assetIds: z.array(z.string()).optional() }).parse(input);
+            designRef: z.object({ id: z.string(), sha256: z.string() }).optional(), assetIds: z.array(z.string()).optional(),
+            preflightHash: z.string().optional() }).parse(input);
           const snapshot = store.read(input.workId);
           const chosen = selectProduction(store, snapshot, args.kind, args.feedbackId, args.threadMode, args.baseVersionId, args.baseReason, args);
           const { feedbackId: _feedbackId, ...original } = input;

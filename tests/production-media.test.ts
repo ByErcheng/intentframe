@@ -6,7 +6,7 @@ import { WorkStore } from "../src/records/work-store.ts";
 import { AssetStore } from "../src/records/asset-store.ts";
 import { AssetCatalog } from "../src/records/asset-catalog.ts";
 import { AssetService } from "../src/runtime/asset-service.ts";
-import { ProductionMediaTools } from "../src/runtime/production-media.ts";
+import { ProductionMediaTools, mediaToolDefinitions } from "../src/runtime/production-media.ts";
 import { NativeToolOutput } from "../src/runtime/codex-client.ts";
 import { audioPlacementSchema, mapNarration } from "../src/media/audio-timing.ts";
 import { readAudioPlan, saveAudioPlan } from "../src/runtime/audio-plan.ts";
@@ -28,6 +28,44 @@ function wav() {
   data.writeUInt32LE(16, 16); data.writeUInt16LE(1, 20); data.writeUInt16LE(1, 22); data.writeUInt32LE(24000, 24);
   data.writeUInt32LE(48000, 28); data.writeUInt16LE(2, 32); data.writeUInt16LE(16, 34); data.write("data", 36); data.writeUInt32LE(data.length - 44, 40); return data;
 }
+
+test("项目内部能力查询提供音色身份说明及本机使用声明，不触发生成或暴露凭据", async () => {
+  const { root, store, work, version } = await setup();
+  try {
+    const service = new AssetService(store, { providerSettings: { speech: { apiKey: "fixture-secret-voice", speaker: "fixture",
+      resourceId: "fixture", timeoutMs: 1000, label: "合成音色", description: "合成用户身份声明。" } },
+      providerFetch: async () => { throw new Error("能力查询不能调用供应商"); } });
+    const tools = new ProductionMediaTools(store, work, version.runId, service, version, { libraries: [{ id: "music",
+      path: join(root.path, "library"), role: "music", usageNotes: "合成声明：可商用。", attributionPaths: ["credits"] }] });
+    const result = await tools.call("intentframe_media_capabilities", {}) as any;
+    assert.equal(result.voices[0].label, "合成音色"); assert.equal(result.voices[0].description, "合成用户身份声明。");
+    assert.equal(result.voices[0].configured, true); assert.deepEqual(result.libraries[0].attributionPaths, ["credits"]);
+    assert.match(result.libraries[0].usageNotes, /可商用/); assert(!JSON.stringify(result).includes("fixture-secret-voice"));
+    assert.equal(version.assetRequestIds, undefined);
+  } finally { root.cleanup(); }
+});
+
+test("设计阶段不开放生成工具，制作内部不能使用未采用或失效设计", async () => {
+  const { root, store, work, version, ref } = await setup(); let calls = 0;
+  try {
+    const assets = new AssetService(store, { providerSettings: { image: { apiKey: "fixture", model: "fixture", timeoutMs: 1000 } },
+      providerFetch: async () => { calls++; throw new Error("不得发起生成"); } });
+    assert(!mediaToolDefinitions(true).some(tool => tool.name === "intentframe_generate_image"));
+    const tools = new ProductionMediaTools(store, work, "design-only", assets, undefined, { libraries: [] });
+    await assert.rejects(tools.call("intentframe_generate_image", { operationKey: "forbidden", prompt: "图", description: "合成" }), /设计阶段/);
+    const input = { kind: "image" as const, document: ref, prompt: "图", referenceAssetIds: [], description: "合成" };
+    const adoption = work.authoring!.decisions.at(-1)!;
+    await store.withLock(work.id, async () => {
+      work.authoring!.decisions = [];
+      await assert.rejects(assets.generateInProduction(work, version, input, "unadopted"), /采用/);
+      work.authoring!.decisions = [{ ...adoption, status: "needs_changes" }];
+      await assert.rejects(assets.generateInProduction(work, version, input, "revoked"), /采用/);
+      work.authoring!.decisions = [adoption];
+      assert.doesNotThrow(() => assets.validate(work, input, version));
+    });
+    assert.equal(calls, 0); assert.equal(version.assetRequestIds, undefined);
+  } finally { root.cleanup(); }
+});
 
 test("制作内部生成不覆盖父任务身份；同编号重取、同素材复用和真实图片查看不再次生成", async () => {
   const { root, store, work, version } = await setup(); let calls = 0;

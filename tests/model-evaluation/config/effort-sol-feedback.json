@@ -1,0 +1,9 @@
+{
+ "id":"effort-sol-feedback-one-minute","media":{"durationSeconds":60,"width":1080,"height":1920},
+ "variants":[{"id":"sol-medium","model":"gpt-6.1-sol","effort":"medium"},{"id":"sol-high","model":"gpt-6.1-sol","effort":"high"},{"id":"sol-xhigh","model":"gpt-6.1-sol","effort":"xhigh"},{"id":"sol-max","model":"gpt-6.1-sol","effort":"max"}],
+ "caseIds":["effort-feedback"],"repetitions":1,
+ "limits":{"modelTurnMs":1800000,"operationMs":7200000,"generationCalls":0,"mediaProbeMs":180000,"mediaDecodeMs":180000,"mediaPreviewMs":180000},
+ "providerKinds":[],"assetLibraries":[],
+ "repeatRule":"同一工程、反馈、音频和预算，保留首次修改及后续修复；每档一次观察。",
+ "choicePolicy":"修改固定Sol，四档比较不自动选优。"
+}

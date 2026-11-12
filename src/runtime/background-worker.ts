@@ -20,7 +20,7 @@ async function run(id: string) {
       signal: controller.signal,
       onProgress: phase => executions.update(request, "running", phase),
       onRunner: pid => runnerPids.add(pid),
-      productionSnapshot: request.prepared ? workSchema.parse(request.prepared.snapshot) : undefined,
+      productionSnapshot: request.prepared?.snapshot !== undefined ? workSchema.parse(request.prepared.snapshot) : undefined,
     }));
   const service = router.forWork(request.workId);
   if (service.store.purpose !== request.purpose) throw new Error("后台请求与任务用途不一致。");
@@ -80,9 +80,12 @@ async function run(id: string) {
   let status: ExecutionOutcome["status"];
   if (originalUnresolved || writersAlive || ["running", "unknown", "needs_verification"].includes(String(resultStatus))) status = "unknown";
   else if (failure) status = controller.signal.reason instanceof StopRequested ? "cancelled" : "failed";
-  else if (["produce_version", "revise_draft", "design_video", "recover_work"].includes(request.name) && work.execution.status === "failed") status = "failed";
+  else if (["produce_version", "revise_draft", "review_draft", "design_video", "recover_work"].includes(request.name) && work.execution.status === "failed") status = "failed";
   else {
-    const awaitingThisTask = ["produce_version", "recover_work", "revise_draft", "design_video", "prepare_review_materials"].includes(request.name);
+    // 只补材料的操作完成不等于作品已解决原有阻塞；分别返回操作终态和作品状态。
+    const materialsOnly = request.name === "prepare_review_materials" && result !== null && typeof result === "object" &&
+      "mode" in result && result.mode === "materials_only";
+    const awaitingThisTask = !materialsOnly && ["produce_version", "recover_work", "revise_draft", "review_draft", "design_video", "prepare_review_materials"].includes(request.name);
     status = awaitingThisTask && work.execution.status === "waiting_input" ? "waiting_input" : "succeeded";
   }
   const cause = failure instanceof Error ? failure.message : failure === undefined ? undefined : String(failure);

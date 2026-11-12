@@ -11,16 +11,17 @@ import { assetSchema } from "../records/media-contracts.ts";
 import { DocumentStore } from "../records/document-store.ts";
 import type { DocumentRef } from "../records/authoring-contracts.ts";
 import type { WorkRecord, WorkStore, WorkVersion } from "../records/work-store.ts";
-import { generateImage, synthesizeSpeech, speechSegments, validateVoiceInstruction, ProviderRequestError } from "../media/providers.ts";
-import type { ProviderSettings, Fetcher, ProviderResponse } from "../media/providers.ts";
+import { generateImage, generateAudio, synthesizeSpeech, speechSegments, selectSpeechVoice, musicInputSchema, soundEffectInputSchema, validateVoiceInstruction, ProviderRequestError } from "../media/providers.ts";
+import type { AudioGeneration, ProviderSettings, Fetcher, ProviderResponse } from "../media/providers.ts";
 import { processExists } from "./process-state.ts";
 
 export type AssetOptions = { providerSettings?: ProviderSettings; providerFetch?: Fetcher; signal?: AbortSignal };
 export type Generation = { kind: "image"; document: DocumentRef; prompt: string; referenceAssetIds: string[]; description: string; background?: "auto" | "opaque" | "transparent" } |
-  { kind: "speech"; document: DocumentRef; segmentIds: string[]; speechRate: number; voiceInstruction?: string; description: string };
+  { kind: "speech"; document: DocumentRef; segmentIds: string[]; speechRate: number; voiceInstruction?: string; voiceId?: string; description: string } |
+  (AudioGeneration & { document: DocumentRef; description: string });
 const requestSchema = z.object({ workId: z.string(), operationId: z.string(), providerRequestId: z.string(),
-  document: z.object({ id: z.string(), sha256: z.string() }), kind: z.enum(["image", "speech"]), description: z.string(),
-  role: z.enum(["image", "narration"]), extension: z.enum([".png", ".mp3"]),
+  document: z.object({ id: z.string(), sha256: z.string() }), kind: z.enum(["image", "speech", "music", "sound_effect"]), description: z.string(),
+  role: z.enum(["image", "narration", "music", "sound_effect"]), extension: z.enum([".png", ".mp3"]),
   parameters: z.record(z.string(), z.unknown()), runtime: z.record(z.string(), z.unknown()),
   parent: z.object({ runId: z.string(), versionId: z.string() }).optional() });
 type Request = z.infer<typeof requestSchema>;
@@ -38,16 +39,21 @@ export class AssetService {
       if (!parent.designRef || valueHash(parent.designRef) !== valueHash(input.document)) throw new Error("内部素材须使用本轮已采用设计。");
     } else if (["running", "unknown"].includes(work.execution.status)) throw new Error("原任务结果尚未核清，不能发起新的素材生成。");
     const documents = new DocumentStore(this.store), source = documents.read(work, input.document);
+    // 视频制作内部须沿已采用设计；独立图片任务可引用草稿，不自动采用或启动视频制作。
+    if (parent || input.kind === "speech") documents.adopted(work, input.document);
     const settings = this.options.providerSettings ?? configuration.providers;
-    if (!settings[input.kind === "image" ? "image" : "speech"]) throw new Error("尚未配置" + (input.kind === "image" ? "GPT 图片 API" : "豆包语音的凭据与已有音色") + "；前置草稿和设计可以继续，未发起付费调用。");
+    if (!settings[input.kind]) throw new Error("尚未配置" + ({ image: "GPT 图片 API", speech: "豆包语音的凭据与已有音色", music: "音乐生成服务", sound_effect: "音效生成服务" }[input.kind]) + "；前置草稿和设计可以继续，未发起付费调用。");
+    if (input.kind === "music" || input.kind === "sound_effect") {
+      (input.kind === "music" ? musicInputSchema : soundEffectInputSchema).parse(input);
+      return { source, text: undefined, references: [], voiceInstruction: undefined };
+    }
     if (input.kind === "image") {
       if (!input.prompt.trim()) throw new Error("图片描述不能为空。");
       const references = this.assets.select(work, input.referenceAssetIds);
       if (references.some(asset => !asset.mimeType.startsWith("image/"))) throw new Error("图片参考只接受图像素材。");
       return { source, text: undefined, references, voiceInstruction: undefined };
     }
-    documents.adopted(work, input.document);
-    const voiceInstruction = validateVoiceInstruction(settings.speech!, input.voiceInstruction);
+    const voiceInstruction = validateVoiceInstruction(selectSpeechVoice(settings.speech!, input.voiceId), input.voiceInstruction);
     const segments = speechSegments(source.markdown);
     if (!input.segmentIds.length || new Set(input.segmentIds).size !== input.segmentIds.length) throw new Error("须明确选择非重复的实际台词片段。");
     const selected = input.segmentIds.map(id => {
@@ -86,18 +92,22 @@ export class AssetService {
   private async generateLocked(work: WorkRecord, input: Generation, operationId: string, parent?: WorkVersion) {
       const workId = work.id, validated = this.validate(work, input, parent);
       const settings = this.options.providerSettings ?? configuration.providers;
+      const speechSettings = input.kind === "speech" ? selectSpeechVoice(settings.speech!, input.voiceId) : undefined;
       const directory = this.store.resolvePath(join("works", workId, "assets", "requests", operationId));
       const requestPath = join(directory, "request.json");
       const previous = existsSync(requestPath) ? requestSchema.parse(readJson(requestPath)) : undefined;
       if (previous && !parent) throw new Error("原素材请求已登记，须恢复原结果，不能重发。");
       const request = requestSchema.parse({ workId, operationId, providerRequestId: randomUUID(), document: input.document,
         ...(parent ? { parent: { runId: parent.runId, versionId: parent.id } } : {}),
-        kind: input.kind, description: input.description, role: input.kind === "image" ? "image" : "narration", extension: input.kind === "image" ? ".png" : ".mp3",
+        kind: input.kind, description: input.description, role: input.kind === "speech" ? "narration" : input.kind, extension: input.kind === "image" ? ".png" : ".mp3",
         parameters: input.kind === "image" ? { prompt: input.prompt, background: input.background ?? "auto", references: validated.references.map(asset => ({ id: asset.id, sha256: asset.sha256 })) } :
+          input.kind === "music" ? musicInputSchema.parse(input) : input.kind === "sound_effect" ? soundEffectInputSchema.parse(input) :
           { text: validated.text, segmentIds: input.segmentIds, speechRate: input.speechRate,
+            ...(input.voiceId ? { voiceId: input.voiceId } : {}),
             ...(validated.voiceInstruction ? { voiceInstruction: validated.voiceInstruction } : {}) },
         runtime: input.kind === "image" ? { provider: "openai", model: settings.image!.model } :
-          { provider: "doubao", speaker: settings.speech!.speaker, resourceId: settings.speech!.resourceId, model: settings.speech!.model } });
+          input.kind === "music" || input.kind === "sound_effect" ? { provider: "elevenlabs", model: settings[input.kind]!.model } :
+          { provider: "doubao", speaker: speechSettings!.speaker, resourceId: speechSettings!.resourceId, model: speechSettings!.model } });
       if (previous) {
         if (valueHash({ ...request, providerRequestId: previous.providerRequestId }) !== valueHash(previous)) throw new Error("同一内部操作编号已有不同请求，不能覆盖。");
         if (!existsSync(join(directory, "result.json"))) throw new ProviderRequestError("原内部请求未完成，不自动重发。", true);
@@ -112,7 +122,8 @@ export class AssetService {
         const exchange = { capture: (response: ProviderResponse) => immutableJson(join(directory, "provider-response.json"), { response, sha256: valueHash(response) }) };
         const result = input.kind === "image" ? await generateImage(settings.image!, input.prompt,
           validated.references.map(asset => ({ bytes: readFileSync(this.store.resolvePath(asset.path)), mimeType: asset.mimeType, name: basename(asset.path) })), this.options.providerFetch, this.options.signal, exchange, input.background) :
-          await synthesizeSpeech(settings.speech!, validated.text!, input.speechRate, this.options.providerFetch, this.options.signal, request.providerRequestId, validated.voiceInstruction, exchange);
+          input.kind === "speech" ? await synthesizeSpeech(speechSettings!, validated.text!, input.speechRate, this.options.providerFetch, this.options.signal, request.providerRequestId, validated.voiceInstruction, exchange) :
+          await generateAudio(settings[input.kind]!, input, this.options.providerFetch, this.options.signal, exchange);
         // 外部生成与本机登记分开落盘，保存失败后可核回已有字节，不再付费生成。
         immutableBytes(join(directory, "provider-output.bin"), result.bytes);
         immutableJson(join(directory, "provider-output.json"), { sha256: fileHash(join(directory, "provider-output.bin")), metadata: result.metadata });
@@ -128,13 +139,18 @@ export class AssetService {
 
   private async restoreOutput(request: Request, directory: string) {
     if (existsSync(join(directory, "provider-output.json"))) return;
-    const archived = z.object({ response: z.object({ status: z.number().int(), body: z.string() }), sha256: z.string() })
+    const archived = z.object({ response: z.object({ status: z.number().int(), body: z.string(), bodyEncoding: z.literal("base64").optional(),
+      headers: z.record(z.string(), z.string()).optional() }), sha256: z.string() })
       .parse(readJson(join(directory, "provider-response.json")));
     if (valueHash(archived.response) !== archived.sha256) throw new Error("原供应商响应已改变。");
     const noNetwork: Fetcher = async () => { throw new Error("恢复不能重新发送请求。"); };
     const runtime = request.runtime, parameters = request.parameters, exchange = { saved: archived.response };
     const result = request.kind === "image" ? await generateImage({ apiKey: "", model: z.string().parse(runtime.model), timeoutMs: 1000 },
       z.string().parse(parameters.prompt), [], noNetwork, this.options.signal, exchange, z.enum(["auto", "opaque", "transparent"]).default("auto").parse(parameters.background)) :
+      request.kind === "music" ? await generateAudio({ apiKey: "", model: z.string().parse(runtime.model), timeoutMs: 1000 },
+        { kind: "music", ...musicInputSchema.parse(parameters) }, noNetwork, this.options.signal, exchange) :
+      request.kind === "sound_effect" ? await generateAudio({ apiKey: "", model: z.string().parse(runtime.model), timeoutMs: 1000 },
+        { kind: "sound_effect", ...soundEffectInputSchema.parse(parameters) }, noNetwork, this.options.signal, exchange) :
       await synthesizeSpeech({ apiKey: "", speaker: z.string().parse(runtime.speaker), resourceId: z.string().parse(runtime.resourceId),
         model: z.string().optional().parse(runtime.model), timeoutMs: 1000 }, z.string().parse(parameters.text), z.number().parse(parameters.speechRate),
         noNetwork, this.options.signal, request.providerRequestId, z.string().optional().parse(parameters.voiceInstruction), exchange);
@@ -165,6 +181,8 @@ export class AssetService {
     if (fileHash(bytesPath) !== output.sha256) throw new Error("原素材输出内容发生变化。");
     const asset = await this.assets.write(work, { bytes: readFileSync(bytesPath), extension: request.extension,
       role: request.role, description: request.description, operationId: request.operationId, origin: String(request.runtime.provider),
+      ...(request.kind === "speech" ? { voice: { kind: "synthesized" as const, speaker: String(request.runtime.speaker),
+        source: "doubao", transcript: { text: String(request.parameters.text), source: "script:" + request.document.id } } } : {}),
       document: request.document, metadata: { request: { ...request, providerRequestId: request.providerRequestId }, response: output.metadata } }, this.options.signal);
     if (request.kind === "speech") {
       const media = z.object({ probe: z.object({ format: z.object({ duration: z.string() }) }) }).parse(readJson(this.store.resolvePath(asset.metadataPath!)));

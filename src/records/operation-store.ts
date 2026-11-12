@@ -5,7 +5,8 @@ import { purposeSchema } from "./contracts.ts";
 import type { WorkPurpose } from "./contracts.ts";
 
 export const operationIdSchema = z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,79}$/);
-export const recoverableOperations: readonly string[] = ["produce_version", "prepare_review_materials", "revise_draft", "design_video", "generate_image", "synthesize_speech"];
+export const recoverableOperations: readonly string[] = ["produce_version", "prepare_review_materials", "revise_draft", "review_draft", "design_video",
+  "generate_image", "synthesize_speech", "generate_music", "generate_sound_effect"];
 const operationSchema = z.object({
   schemaVersion: z.literal(1), id: operationIdSchema, name: z.string(), inputHash: z.string().regex(/^[a-f0-9]{64}$/),
   state: z.enum(["unresolved", "accepted", "succeeded", "failed"]), createdAt: z.string(),

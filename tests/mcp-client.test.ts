@@ -1,3 +1,4 @@
+import { confirmedDraft } from "./helpers.ts";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
@@ -8,14 +9,14 @@ import { repositoryRoot } from "../src/config.ts";
 import { WorkStore } from "../src/records/work-store.ts";
 import { Client } from "@modelcontextprotocol/client";
 import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
-import { fakeCodex, fixtureRoot } from "./helpers.ts";
+import { fakeCodex, fixtureRoot, draftSubmission } from "./helpers.ts";
 
 test("真实 MCP 子进程继承隔离目录，写入前核对服务实际目标", { timeout: 30_000 }, () => {
   const root = fixtureRoot();
   try {
     const data = join(root.path, "isolated-data"); mkdirSync(data);
     const input = join(root.path, "create.json");
-    writeFileSync(input, JSON.stringify({ operationId: "create-isolated-work", title: "合成测试任务", brief: "只测试目标隔离，不调用模型。", purpose: "production" }));
+    writeFileSync(input, JSON.stringify(confirmedDraft({ operationId: "create-isolated-work", title: "合成测试任务", brief: "只测试目标隔离，不调用模型。", purpose: "production" })));
     const result = JSON.parse(execFileSync(process.execPath, [join(repositoryRoot, "scripts/mcp-call.ts"), "create_work", input], {
       cwd: repositoryRoot, encoding: "utf8", timeout: 20_000,
       env: { ...process.env, INTENTFRAME_NODE_BIN: process.execPath, INTENTFRAME_DATA_ROOT: data,
@@ -49,11 +50,11 @@ test("同一个真实 MCP 连接交错处理两种用途，换连接后仅凭任
     assert.equal(info.purpose, undefined);
     const tools = await first.listTools(), creation = tools.tools.find(tool => tool.name === "create_work")!;
     assert(creation.inputSchema.required?.includes("purpose"));
-    await assert.rejects(call(first, "create_work", { operationId: "without-purpose", title: "不要猜用途", brief: "合成" }), /purpose/);
-    const testArgs = { title: "测试字幕", brief: "需要补充参考的合成任务。", purpose: "test" };
+    await assert.rejects(call(first, "create_work", confirmedDraft({ operationId: "without-purpose", title: "不要猜用途", brief: "合成" })), /purpose/);
+    const testArgs = confirmedDraft({ title: "测试字幕", brief: "需要补充参考的合成任务。", purpose: "test" });
     const prepared = await call(first, "prepare_operation", { name: "create_work", arguments: testArgs });
     const testing = await call(first, prepared.name, prepared.arguments);
-    const formal = await call(first, "create_work", { operationId: "formal-create", title: "正式字幕", brief: "正式用途也可以做样例。", purpose: "production" });
+    const formal = await call(first, "create_work", confirmedDraft({ operationId: "formal-create", title: "正式字幕", brief: "正式用途也可以做样例。", purpose: "production" }));
     const savedFormal = readFileSync(formal.taskPath, "utf8");
     const draft = testing.authoring.drafts[0], base = { id: draft.id, sha256: draft.sha256 };
     const accepted = await call(first, "revise_draft", { operationId: "test-produce", workId: testing.id, base, instruction: "合成：继续修改草稿。" });
@@ -71,13 +72,13 @@ test("同一个真实 MCP 连接交错处理两种用途，换连接后仅凭任
     assert.equal((await call(first, "list_works", { purpose: "test" })).works[0].id, testing.id);
     await first.close();
     const next = await connect();
-    assert.equal((await call(next, "get_work", { workId: testing.id })).purpose, "test");
+    assert.equal((await call(next, "get_work", { view: "detail", workId: testing.id })).purpose, "test");
     assert.deepEqual(await call(next, prepared.name, prepared.arguments), testing);
     const updated = await call(next, "submit_draft", { operationId: "test-feedback", workId: testing.id,
-      basedOn: base, markdown: "后续修改仍属于这次测试。", instruction: "合成用户补充。" });
+      basedOn: base, markdown: "后续修改仍属于这次测试。", instruction: "合成用户补充。", submission: draftSubmission("后续修改仍属于这次测试。") });
     assert.equal(updated.id, "d002"); assert(updated.location.includes("/testing/works/"));
     assert.equal((await call(next, "get_operation", { operationId: "test-produce" })).purpose, "test");
-    assert.equal((await call(next, "get_work", { workId: formal.id })).purpose, "production");
+    assert.equal((await call(next, "get_work", { view: "detail", workId: formal.id })).purpose, "production");
     assert.equal(readFileSync(formal.taskPath, "utf8"), savedFormal);
   } finally { for (const client of clients) await client.close(); root.cleanup(); }
 });

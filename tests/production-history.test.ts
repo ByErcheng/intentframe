@@ -47,11 +47,13 @@ test("制作会话可实际取得历史材料，完成状态与旧声明分开�
     const record = await store.feedback(work.id, base.id, "已处理的历史要求", "user");
     record.versions[0]!.appliedFeedbackIds = [record.feedback[0]!.id]; store.save(record);
     const oldSource = readFileSync(store.resolvePath(base.sourcePath));
-    const service = new WorkService(store, { codexExecutable: fakeCodex(root.path, "read_history"), render: fixtureRender });
+    const service = new WorkService(store, { codexExecutable: fakeCodex(root.path, "read_history"), render: fixtureRender,
+      models: { default: { model: "fixture-a", effort: "medium" }, stages: {} } });
     const result = await service.produce(work.id, "sample", undefined, "fresh", undefined, undefined, undefined, { feedbackIds: [] });
     const version = result.versions.at(-1)!;
     assert.equal(version.production, "ready");
-    assert.equal(version.model, "local-fixture", "记录运行器返回的模型，不写死生产模型名");
+    assert.equal(version.model, "fixture-a", "记录配置请求及运行器返回的模型，不写死生产模型名");
+    assert.equal(version.reasoningEffort, "medium");
     const directory = dirname(store.resolvePath(version.sourcePath));
     const context = readFileSync(join(directory, "context.md"), "utf8");
     assert(!context.includes(base.agentReply!)); assert(!context.includes("已处理的历史要求"));

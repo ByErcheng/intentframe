@@ -3,6 +3,8 @@ import { dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { z } from "zod";
 import { configuration } from "../config.ts";
+import { selectModel } from "../records/model-settings.ts";
+import { checkModel, modelThreadParameters, modelThreadSchema, modelTurnParameters, verifyModelThread } from "./model-call.ts";
 import { fileHash } from "../common/file-hash.ts";
 import { immutableJson, readJson, valueHash } from "../records/files.ts";
 import { DocumentStore } from "../records/document-store.ts";
@@ -16,6 +18,8 @@ import { audioPlanSummary } from "./audio-plan.ts";
 import type { AuthoringOptions } from "./authoring-service.ts";
 import { readPrompt } from "./prompts.ts";
 import { processExists } from "./process-state.ts";
+import { currentLibraryUsage } from "../records/asset-library.ts";
+import { ModelAnalysisService } from "./model-analysis-service.ts";
 
 const resultSchema = z.object({ sufficient: z.boolean(), notes: z.string().trim().min(1).max(5000),
   additionalRanges: z.array(reviewRangeSchema).max(6), limitations: z.array(z.string().max(2000)).max(20),
@@ -27,6 +31,18 @@ export class ReviewService {
   readonly options: AuthoringOptions;
   constructor(store: WorkStore, options: AuthoringOptions = {}) { this.store = store; this.options = options; }
 
+  /** 仅保存材料，不创建检查轮次、不调用模型、不改变已有质量结论。 */
+  async prepareOnly(record: WorkRecord, version: WorkVersion, ranges: ReviewRange[]) {
+    this.store.assertAvailable(version);
+    if (version.reviewPreparation?.status === "unknown" || version.reviewPreparation?.inspections.some(item => ["preparing", "running", "unknown"].includes(item.status))) {
+      throw new Error("原材料检查尚未核清，须先恢复原执行；仅补材料不能解除未知保护。");
+    }
+    version.reviewPreparation ??= { status: "needs_attention", batches: [], inspections: [], error: "材料尚未经项目内检。" };
+    // 异常交给本次操作或后台执行回执保存；补材料失败不能改写已有内检结论。
+    if (ranges.length || !version.reviewPreparation.batches.length) await this.batch(record, version, ranges);
+    return { ...this.view(record, version), inspectionPerformed: false, note: "本次仅保存材料，未调用模型或修复作品；已有内检结论不代表检查过新增材料。" };
+  }
+
   view(record: WorkRecord, version: WorkVersion) {
     this.store.assertAvailable(version);
     if (!version.videoSha256) throw new Error("版本没有可核对视频。");
@@ -34,6 +50,8 @@ export class ReviewService {
     return { status: material?.status ?? "not_prepared", readyForExternalReview: internalReviewPassed(material),
       video: this.store.resolvePath(version.mediaPath),
       videoSha256: version.videoSha256, designRef: version.designRef,
+      assetUsage: (version.assets ?? []).map(asset => ({ id: asset.id, role: asset.role, origin: asset.origin, usage: asset.usage,
+        currentLibraryUsage: currentLibraryUsage(asset.origin, configuration.assetLibraries, asset.usage) })),
       audioTimeline: audioPlanSummary(this.store, version), audioInspection: "manual",
       design: version.designRef ? new DocumentStore(this.store).read(record, version.designRef) : undefined,
       batches: (material?.batches ?? []).map(ref => {
@@ -42,7 +60,8 @@ export class ReviewService {
         const batch = readReviewBatch(dirname(path), version.videoSha256!);
         return { ...batch, indexRef: ref.path, indexLocation: path, frames: batch.frames.map(item => ({ ...item, location: join(dirname(path), item.path) })),
           sheets: batch.sheets.map(item => ({ ...item, location: join(dirname(path), item.path) })),
-          audio: batch.audio ? { ...batch.audio, location: join(dirname(path), batch.audio.path) } : undefined };
+          audio: batch.audio ? { ...batch.audio, location: join(dirname(path), batch.audio.path) } : undefined,
+          temporalAnalysis: batch.temporalAnalysis ? { ...batch.temporalAnalysis, location: join(dirname(path), batch.temporalAnalysis.path) } : undefined };
       }), inspections: material?.inspections, error: material?.error,
       review: version.review, note: "内检通过只表示在已声明范围内未发现待修问题；外部 AI 仍须独立审查，用户认可另存。" };
   }
@@ -105,19 +124,22 @@ export class ReviewService {
   private async newInspection(record: WorkRecord, version: WorkVersion) {
     const id = "inspection-" + randomUUID(), inputPath = join("works", record.id, "runs", id, "input.json");
     const directory = dirname(this.store.resolvePath(inputPath)); mkdirSync(directory, { recursive: true });
+    const modelSelection = selectModel(this.options.models ?? configuration.models, "internal_review");
     const view = this.view(record, version), prompt = readPrompt("review-materials");
     const allSheets = view.batches.flatMap(batch => batch.sheets.map(item => item.location));
     // 请求必须说明实际传入哪几张图；长片不能把未读材料称为已看。
     const images = allSheets.length <= 12 ? allSheets : Array.from({ length: 12 }, (_, index) => allSheets[Math.round(index * (allSheets.length - 1) / 11)]!);
-    immutableJson(this.store.resolvePath(inputPath), { runId: id, versionId: version.id, videoSha256: version.videoSha256, design: view.design,
+    immutableJson(this.store.resolvePath(inputPath), { runId: id, modelSelection, versionId: version.id, videoSha256: version.videoSha256, design: view.design,
       internalRepair: version.internalRepair,
       externalReview: version.review,
+      assetUsage: view.assetUsage,
       feedback: record.feedback.filter(item => item.versionId === version.id || version.feedbackIds?.includes(item.id)).slice(-10),
-      previousInternalReview: version.internalRepair?.inspectionId ? record.versions.flatMap(item => item.reviewPreparation?.inspections ?? [])
-        .find(item => item.id === version.internalRepair!.inspectionId)?.result : undefined,
+      previousInternalReview: version.reviewPreparation?.inspections.at(-1)?.result ?? (version.internalRepair?.inspectionId ? record.versions.flatMap(item => item.reviewPreparation?.inspections ?? [])
+        .find(item => item.id === version.internalRepair!.inspectionId)?.result : undefined),
       batches: view.batches, audioTimeline: view.audioTimeline, audioInspection: view.audioInspection,
       images, omittedSheetCount: allSheets.length - images.length, prompt, outputSchema: z.toJSONSchema(resultSchema) });
     const run: ReviewInspection = { id, inputPath, inputSha256: fileHash(this.store.resolvePath(inputPath)),
+      modelSelection,
       operationId: version.reviewPreparation!.operationId, sendState: "not_sent", status: "preparing" };
     version.reviewPreparation!.inspections.push(run); this.store.save(record); return run;
   }
@@ -148,14 +170,25 @@ export class ReviewService {
           if (original.turn.status !== "completed") throw new Error("原材料核对失败，未重发。");
           run.turnId = original.turn.id; reply = original.reply;
         } else {
+          const analysis = await new ModelAnalysisService(this.store, this.options).run(record, run.id, "visual_understanding",
+            { videoSha256: input.videoSha256, question: "逐图描述实际画面，标出遮挡、图表数据和可见动作线索，不判断整片通过。" }, input.images);
+          immutableJson(join(directory, "visual-analysis.json"), analysis);
           this.options.onProgress?.("项目 AI 正在回看实际画面，检查缺陷与材料覆盖");
-          const response = z.object({ thread: z.object({ id: z.string() }), model: z.string().optional() }).parse(await client.sendRequest("thread/start", {
+          const modelSelection = run.modelSelection ?? selectModel(this.options.models ?? configuration.models, "internal_review");
+          run.modelSelection = modelSelection; this.store.save(record);
+          await checkModel(client, modelSelection);
+          const response = modelThreadSchema.parse(await client.sendRequest("thread/start", {
+            ...modelThreadParameters(modelSelection),
             cwd: directory, sandbox: "read-only", approvalPolicy: "never", developerInstructions: input.prompt.text,
           }));
-          run.threadId = response.thread.id; run.model = response.model; run.sendState = "sending"; run.status = "running"; this.store.save(record); phase = "awaiting_result";
+          run.threadId = response.thread.id; run.model = response.model; run.reasoningEffort = response.reasoningEffort; this.store.save(record);
+          verifyModelThread(modelSelection, response);
+          run.sendState = "sending"; run.status = "running"; this.store.save(record); phase = "awaiting_result";
           const started = z.object({ turn: codexTurnSchema }).parse(await client.sendRequest("turn/start", {
             threadId: run.threadId, outputSchema: input.outputSchema,
+            ...modelTurnParameters(modelSelection),
             input: [{ type: "text", text: "本次执行编号：" + run.id + "\n读取 input.json，查看实际附图，对照采用脚本检查画面与动作；报告可修缺陷、设计歧义和确有需要的补帧范围。" },
+              { type: "text", text: "视觉材料理解结果（须独立核对，不自动继承结论）：\n" + JSON.stringify(analysis) },
               ...input.images.map(path => ({ type: "localImage", path }))],
           }));
           run.turnId = started.turn.id; run.sendState = "acknowledged"; this.store.save(record);
@@ -177,7 +210,7 @@ export class ReviewService {
       if (result.quality && ["needs_repair", "needs_confirmation"].includes(result.quality.status) && !result.quality.issues.length) throw new Error("内检未通过须给出明确问题与处理要求。");
       result.sound = { status: "not_checked", notes: "按用户要求不执行自动听音；音频和逐字时间已保留供人工试听与同步核对。", ranges: [] };
       run.result = result; run.status = "completed"; run.error = undefined; this.store.save(record);
-    } catch (error) { run.status = executionFailureStatus(error, phase); run.error = describeError(error); this.store.save(record); throw error; }
+    } catch (error) { run.status = record.analysisRuns?.some(item => item.status === "unknown") ? "unknown" : executionFailureStatus(error, phase); run.error = describeError(error); this.store.save(record); throw error; }
     finally { await client?.close(); }
   }
 }

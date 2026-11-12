@@ -1,3 +1,4 @@
+import { confirmedDraft } from "./helpers.ts";
 import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -110,7 +111,7 @@ test("MCP 校验保留需求、反馈和确认原文，拒绝纯空白输入", a
   try {
     const store = new WorkStore(root), service = new WorkService(store);
     const brief = "    缩进的原始需求\n\n";
-    await executeTool("create_work", { operationId: "create-verbatim", title: "原文", brief, purpose: "production" }, service);
+    await executeTool("create_work", confirmedDraft({ operationId: "create-verbatim", title: "原文", brief, purpose: "production" }), service);
     const work = store.read(store.list()[0]!.id);
     assert.equal(readFileSync(store.resolvePath(work.briefPath), "utf8"), "# 原始需求\n\n" + brief + "\n");
     work.versions.push(readyVersion(store, work.id, "v001", "sample")); store.save(work);
@@ -119,7 +120,7 @@ test("MCP 校验保留需求、反馈和确认原文，拒绝纯空白输入", a
     await executeTool("confirm_version", { operationId: "confirm-verbatim", workId: work.id, versionId: "v001", kind: "direction", userConfirmation: original, scope: "样例方向" }, service);
     assert.equal(store.read(work.id).feedback[0]?.text, original);
     assert.equal(store.read(work.id).directionApproval?.userConfirmation, original);
-    await assert.rejects(executeTool("create_work", { operationId: "reject-whitespace", title: "空白", brief: " \n ", purpose: "production" }, service));
+    await assert.rejects(executeTool("create_work", confirmedDraft({ operationId: "reject-whitespace", title: "空白", brief: " \n ", purpose: "production" }), service));
   } finally { rmSync(root, { recursive: true }); }
 });
 

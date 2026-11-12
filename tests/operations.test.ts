@@ -1,3 +1,4 @@
+import { confirmedDraft } from "./helpers.ts";
 import assert from "node:assert/strict";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -11,14 +12,14 @@ import { fixtureRoot, readyVersion } from "./helpers.ts";
 test("回复丢失后跨服务重试返回同一结果；同文新操作仍可另建任务", async () => {
   const root = fixtureRoot();
   try {
-    const store = new WorkStore(root.path), request = prepareOperation("create_work", { title: "相同标题", brief: "原始需求", purpose: "production" });
+    const store = new WorkStore(root.path), request = prepareOperation("create_work", confirmedDraft({ title: "相同标题", brief: "原始需求", purpose: "production" }));
     const first = await executeTool(request.name, request.arguments, new WorkService(store));
     const replay = await executeTool(request.name, request.arguments, new WorkService(new WorkStore(root.path)));
     assert.deepEqual(replay, first);
     assert.equal(store.list().length, 1);
     await assert.rejects(executeTool(request.name, { ...request.arguments, brief: "不同需求" }, new WorkService(store)), /同一操作编号/);
     assert.equal(store.list().length, 1);
-    const next = prepareOperation("create_work", { title: "相同标题", brief: "原始需求", purpose: "production" });
+    const next = prepareOperation("create_work", confirmedDraft({ title: "相同标题", brief: "原始需求", purpose: "production" }));
     await executeTool(next.name, next.arguments, new WorkService(store));
     assert.equal(store.list().length, 2);
   } finally { root.cleanup(); }

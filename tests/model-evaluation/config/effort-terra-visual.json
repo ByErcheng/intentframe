@@ -1,0 +1,9 @@
+{
+ "id":"effort-terra-visual-one-minute","media":{"durationSeconds":60,"width":1080,"height":1920},
+ "variants":[{"id":"terra-medium","model":"gpt-6.1-terra","effort":"medium"},{"id":"terra-high","model":"gpt-6.1-terra","effort":"high"},{"id":"terra-xhigh","model":"gpt-6.1-terra","effort":"xhigh"},{"id":"terra-max","model":"gpt-6.1-terra","effort":"max"}],
+ "caseIds":["effort-visual"],"repetitions":1,
+ "limits":{"modelTurnMs":1800000,"operationMs":7200000,"generationCalls":0,"mediaProbeMs":180000,"mediaDecodeMs":180000,"mediaPreviewMs":180000},
+ "providerKinds":[],"assetLibraries":[],
+ "repeatRule":"同一实际成片的七张固定截图；不提供脚本数字答案、不触发成片内检。每档一次。",
+ "choicePolicy":"视觉理解固定Terra，成片独立审查另由Astra比较；只比四档。"
+}

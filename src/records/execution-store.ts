@@ -6,8 +6,8 @@ import { operationIdSchema, recoverableOperations } from "./operation-store.ts";
 import { purposeSchema, recordIdSchema } from "./contracts.ts";
 import { processMatches, processStartedAt } from "../runtime/process-state.ts";
 
-export const backgroundTools = ["produce_version", "render_version", "organize_experience", "recover_work", "revise_draft", "design_video",
-  "generate_image", "synthesize_speech", "prepare_review_materials", "import_asset"] as const;
+export const backgroundTools = ["produce_version", "render_version", "organize_experience", "recover_work", "revise_draft", "review_draft", "design_video",
+  "generate_image", "synthesize_speech", "generate_music", "generate_sound_effect", "prepare_review_materials", "import_asset"] as const;
 export const backgroundToolSchema = z.enum(backgroundTools);
 export type BackgroundTool = z.infer<typeof backgroundToolSchema>;
 const requestSchema = z.object({
@@ -15,7 +15,7 @@ const requestSchema = z.object({
   inputHash: z.string(), workId: recordIdSchema, purpose: purposeSchema, createdAt: z.string(),
   systemFingerprint: z.string(), configurationFingerprint: z.string(),
   receivedAt: z.iso.datetime().optional(),
-  prepared: z.object({ input: z.record(z.string(), z.unknown()), snapshot: z.unknown() }).optional(),
+  prepared: z.object({ input: z.record(z.string(), z.unknown()), snapshot: z.unknown().optional() }).optional(),
   preparedHash: z.string().optional(),
 });
 export type ExecutionRequest = z.infer<typeof requestSchema>;
@@ -169,6 +169,7 @@ export class ExecutionStore {
   }
 
   selection(request: ExecutionRequest) {
+    if (request.name !== "produce_version") return undefined;
     const input = request.prepared?.input;
     return input ? { baseVersionId: input.baseVersionId, feedbackIds: input.feedbackIds,
       newDirection: input.newDirection, baseReason: input.baseReason, designRef: input.designRef, assetIds: input.assetIds } : undefined;

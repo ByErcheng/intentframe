@@ -132,12 +132,16 @@ export class ComparisonStore {
         if (version.production === "ready") this.store.assertAvailable(version);
         if (version.knowledgeUsed?.some(ref => !current.input.knowledgeRefs.some(allowed => valueHash(ref) === valueHash(allowed)))) throw new Error("比较使用了共同范围之外的经验。");
         conditions[side] = { systemFingerprint: version.systemFingerprint, model: version.model, kind: version.kind,
+          modelSelection: version.modelSelection, reasoningEffort: version.reasoningEffort,
+          analysisModels: work.analysisRuns?.filter(run => run.parentRunId === version.runId ||
+            version.reviewPreparation?.inspections.some(inspection => inspection.id === run.parentRunId))
+            .map(run => ({ kind: run.kind, modelSelection: run.modelSelection, model: run.model, reasoningEffort: run.reasoningEffort })),
           execution: version.executionConditions,
           production: version.production, knowledgeUsed: version.knowledgeUsed ?? [],
           videoSha256: version.videoSha256, error: version.error };
       }
       const before = conditions.before as Record<string, unknown>, after = conditions.after as Record<string, unknown>;
-      conditions.differences = ["systemFingerprint", "model", "kind", "execution", "knowledgeUsed"]
+      conditions.differences = ["systemFingerprint", "model", "modelSelection", "reasoningEffort", "analysisModels", "kind", "execution", "knowledgeUsed"]
         .filter(key => valueHash(before[key] ?? null) !== valueHash(after[key] ?? null));
       conditions.note = "差异须结合声明的改动判断，未受控差异不能归因为单一改动；记录不代替观看评价。";
       const record: Comparison = { ...current, state: "completed", evaluation: { ...input, conditions, evaluatedAt: new Date().toISOString() } };

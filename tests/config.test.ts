@@ -1,3 +1,4 @@
+import { confirmedDraft } from "./helpers.ts";
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
 import { chmodSync, cpSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
@@ -25,6 +26,23 @@ function configurationFixture() {
   save();
   return { ...root, project, configPath: path, settings, save };
 }
+
+test("本机音色说明和素材使用声明通过配置边界，空说明和越界署名路径被拒绝", () => {
+  const f = configurationFixture();
+  try {
+    f.settings.providers = { speech: { apiKey: "fixture-secret", speaker: "fixture", resourceId: "fixture",
+      label: "测试默认音色", description: "测试用户提供的身份声明。" } };
+    f.settings.assetLibraries = [{ id: "music", path: "../music", role: "music", usageNotes: "合成声明：可商用。", attributionPaths: ["credits"] }];
+    f.save();
+    const config = loadConfiguration(f.project, {});
+    assert.equal(config.providers.speech!.description, "测试用户提供的身份声明。");
+    assert.deepEqual(config.assetLibraries[0]!.attributionPaths, ["credits"]);
+    f.settings.assetLibraries[0].attributionPaths = ["../credits"]; f.save();
+    assert.throws(() => loadConfiguration(f.project, {}), /attributionPaths/);
+    f.settings.assetLibraries[0].attributionPaths = []; f.settings.providers.speech.description = " "; f.save();
+    assert.throws(() => loadConfiguration(f.project, {}), /description/);
+  } finally { f.cleanup(); }
+});
 
 test("完整配置以仓库为路径基准，临时覆盖可追溯且不改文件", () => {
   const fixture = configurationFixture();
@@ -76,6 +94,9 @@ test("错误配置不回退、不吞未知字段，也不在错误中输出填�
       { ...fixture.settings, audioInspection: "pretend-heard" },
       { ...fixture.settings, assetLibraries: [{ id: "music", path: "../music", role: "music" }, { id: "music", path: "../other", role: "music" }] },
       { ...fixture.settings, assetLibraries: [{ id: "music", path: " ", role: "music" }] },
+      { ...fixture.settings, providers: { music: { apiKey: privateValue, model: "", timeoutMs: 1000 } } },
+      { ...fixture.settings, providers: { speech: { apiKey: privateValue, speaker: "default", resourceId: "fixture", voices: [
+        { id: "default", label: "reserved", speaker: "voice", resourceId: "fixture" }] } } },
       { ...fixture.settings, media: { ...fixture.settings.media, concurrency: 0 } },
       { ...fixture.settings, media: { ...fixture.settings.media, concurrency: 1.5 } },
       ...[0, -1, 1.5, 2_147_483_648, "3000"].map(commandTimeoutMs =>
@@ -146,6 +167,30 @@ function runnableFixture() {
   return fixture;
 }
 
+test("索引维护入口使用配置目录，MCP 直接检索音效而不启动模型", { timeout: 15_000 }, () => {
+  const fixture = runnableFixture();
+  try {
+    const library = join(fixture.path, "shared music");
+    mkdirSync(join(library, "effects"), { recursive: true });
+    writeFileSync(join(library, "effects/rain.mp3"), "仅用于名称检索，不是可解码音频。");
+    fixture.settings.assetLibraries = [{ id: "music", path: library, role: "music",
+      roleOverrides: [{ path: "effects", role: "sound_effect" }] }];
+    fixture.save();
+    const output = execFileSync("/bin/sh", [join(fixture.project, "scripts/intentframe"), "index-assets"],
+      { cwd: fixture.path, env: cleanEnvironment, encoding: "utf8", timeout: 5_000 });
+    const index = JSON.parse(output);
+    assert.equal(index.total, 1); assert.equal(index.roles.sound_effect, 1);
+    assert.equal(index.path, join(fixture.path, "isolated data/library/index.json"));
+    const request = join(fixture.path, "search.json");
+    writeFileSync(request, JSON.stringify({ query: "rain", role: "sound_effect" }));
+    const found = JSON.parse(execFileSync(process.execPath, [join(fixture.project, "scripts/mcp-call.ts"), "search_assets", request],
+      { cwd: fixture.path, env: cleanEnvironment, encoding: "utf8", timeout: 5_000 }));
+    assert.equal(found.total, 1); assert.equal(found.index.status, "current");
+    assert.equal(found.items[0].source.sha256, JSON.parse(readFileSync(index.path, "utf8")).entries[0].sha256);
+    assert.equal(existsSync(join(fixture.path, "native-fixture")), false);
+  } finally { fixture.cleanup(); }
+});
+
 test("启动脚本与后台进程使用本机配置，协议请求时限确实生效", { timeout: 20_000 }, async () => {
   const fixture = runnableFixture();
   try {
@@ -160,7 +205,7 @@ test("启动脚本与后台进程使用本机配置，协议请求时限确实�
     writeFileSync(input, "{}");
     const info = JSON.parse(execFileSync("/bin/sh", [join(fixture.project, "scripts/intentframe"), "call", "get_runtime_info", input], options));
     assert.equal(info.assetRoot, join(fixture.path, "isolated data"));
-    writeFileSync(input, JSON.stringify({ operationId: "configured-create", title: "配置隔离测试", brief: "合成需求，不调用真实模型。", purpose: "production" }));
+    writeFileSync(input, JSON.stringify(confirmedDraft({ operationId: "configured-create", title: "配置隔离测试", brief: "合成需求，不调用真实模型。", purpose: "production" })));
     const work = JSON.parse(execFileSync(process.execPath, [join(fixture.project, "scripts/mcp-call.ts"), "create_work", input], options));
     assert.equal(work.taskPath, join(info.workRoots.production, "works", work.id, "task.json"));
     assert(existsSync(work.taskPath));
@@ -225,7 +270,7 @@ test("同一启动配置跨 MCP 进程按任务接续，旧用途变量明确停
         env: cleanEnvironment, encoding: "utf8", timeout: 5_000, stdio: ["pipe", "pipe", "pipe"],
       }));
     };
-    const request = { operationId: "production-request", title: "合成用途检查", brief: "不调用模型或写真实数据。", purpose: "production" };
+    const request = confirmedDraft({ operationId: "production-request", title: "合成用途检查", brief: "不调用模型或写真实数据。", purpose: "production" });
     const production = call("create_work", request);
     const before = readFileSync(production.taskPath, "utf8");
     const testRequest = { ...request, operationId: "test-request", purpose: "test" };
@@ -233,9 +278,9 @@ test("同一启动配置跨 MCP 进程按任务接续，旧用途变量明确停
     assert.equal(testing.purpose, "test"); assert.notEqual(testing.id, production.id);
     assert.equal(testing.taskPath, join(testConfig.workRoots.test, "works", testing.id, "task.json"));
     assert.equal(call("create_work", testRequest).id, testing.id);
-    assert.throws(() => call("create_work", { ...testRequest, purpose: "production" }), /同一操作编号/);
-    assert.equal(call("get_work", { workId: testing.id }).purpose, "test");
-    assert.equal(call("get_work", { workId: production.id }).purpose, "production");
+    assert.throws(() => call("create_work", confirmedDraft({ ...testRequest, purpose: "production" })), /同一操作编号/);
+    assert.equal(call("get_work", { view: "detail", workId: testing.id }).purpose, "test");
+    assert.equal(call("get_work", { view: "detail", workId: production.id }).purpose, "production");
     assert.equal(call("list_works", {}).works.length, 1);
     assert.equal(call("list_works", { purpose: "test" }).works.length, 1);
     assert.equal(call("list_works", { purpose: "all" }).works.length, 2);

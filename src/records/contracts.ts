@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { documentRefSchema } from "./authoring-contracts.ts";
+export { experienceRefSchema, type ExperienceRef } from "./experience-ref.ts";
 
 export const recordIdSchema = z.string().regex(/^[a-z0-9][a-z0-9-]{0,79}$/);
 export const workInputLimits = { title: 200, brief: 30_000 } as const;
@@ -10,8 +11,6 @@ export const workInputSchema = z.strictObject({
 });
 export const purposeSchema = z.enum(["production", "test"]);
 export type WorkPurpose = z.infer<typeof purposeSchema>;
-export const experienceRefSchema = z.strictObject({ id: recordIdSchema, revision: z.number().int().positive(), sha256: z.string().regex(/^[a-f0-9]{64}$/) });
-export type ExperienceRef = z.infer<typeof experienceRefSchema>;
 export const feedbackLocationSchema = z.strictObject({
   description: z.string().trim().min(1).max(2_000),
   precision: z.enum(["verified", "approximate", "unresolved"]),

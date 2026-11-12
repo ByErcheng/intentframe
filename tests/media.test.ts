@@ -2,11 +2,20 @@ import assert from "node:assert/strict";
 import { copyFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { test } from "node:test";
-import { fileHash, renderVersion, restoreVideoPreviews } from "../src/media/render.ts";
-import { captureSourceSnapshot } from "../src/records/source-snapshot.ts";
+import { fileHash, renderVersion, restoreVideoPreviews, verifyFrameTiming } from "../src/media/render.ts";
+import { captureSourceSnapshot, sourceSnapshotSchema, verifySourceSnapshot } from "../src/records/source-snapshot.ts";
 import { WorkStore } from "../src/records/work-store.ts";
 import { WorkService } from "../src/runtime/work-service.ts";
 import { fixtureRoot, readyVersion, videoSource } from "./helpers.ts";
+
+test("技术时间校验拒绝缺帧、重复、倒序、跳变与未知时间戳", () => {
+  assert.equal(verifyFrameTiming(3, [0, 0.1, 0.2], 3, 10).monotonic, true);
+  assert.equal(verifyFrameTiming(1, [0], 1, 30).checked, true);
+  for (const times of [[0, 0.1], [0, 0.1, 0.1], [0, 0.2, 0.1], [0, 0.15, 0.2], [0, NaN, 0.2]]) {
+    assert.throws(() => verifyFrameTiming(3, times, 3, 10), /帧数或帧时间戳/);
+  }
+  assert.throws(() => verifyFrameTiming(2, [0, 0.1, 0.2], 3, 10), /帧数或帧时间戳/);
+});
 
 test("局部预览按实际帧范围渲染并保存可用帧图，不与完整渲染混用", { timeout: 90000 }, async () => {
   const root = fixtureRoot();
@@ -30,6 +39,7 @@ test("真实渲染核对帧率、拒绝陌生成片，并能恢复丢失的已�
     rmSync(output);
     const result = await renderVersion(entry, output, join(root.path, "cache-a"), { sourceSnapshot: version.sourceSnapshot });
     assert.equal(result.fps, 10); assert.equal(result.decoded, true);
+    assert.equal(result.frameCount, 10); assert.equal(result.frameTiming.monotonic, true);
     version.technicalCheck = result; version.videoSha256 = result.videoSha256;
     work.versions.push(version); store.save(work);
     await store.confirm(work.id, version.id, "acceptance", "合成回归中的确认");
@@ -138,5 +148,24 @@ test("缺失和空预览单独恢复，失败可见且不重渲染视频或改�
     await service.recover(work.id, false); assert(!existsSync(rendered.previews[0]!));
     await service.recover(work.id, true); assert(existsSync(rendered.previews[0]!));
     assert.equal(fileHash(output), rendered.videoSha256);
+  } finally { root.cleanup(); }
+});
+
+test("完整工程快照不能静默漏记特殊文件名，改动后不能通过原版本核验", () => {
+  const root = fixtureRoot();
+  try {
+    const entry = join(root.path, "source", "entry.tsx"); mkdirSync(dirname(entry)); writeFileSync(entry, videoSource());
+    mkdirSync(join(dirname(entry), "assets"));
+    mkdirSync(join(dirname(entry), "__proto__"));
+    const names = ["assets/__proto__", "__proto__/material.txt", "constructor", "toString"];
+    for (const name of names) writeFileSync(join(dirname(entry), name), "原始内容");
+    const snapshot = sourceSnapshotSchema.parse(JSON.parse(JSON.stringify(captureSourceSnapshot(entry))));
+    for (const name of names) assert(Object.hasOwn(snapshot.files, name), name + " 未被记录");
+    assert.doesNotThrow(() => verifySourceSnapshot(entry, snapshot));
+    writeFileSync(join(dirname(entry), "assets/__proto__"), "已改变");
+    assert.throws(() => verifySourceSnapshot(entry, snapshot), /变化/);
+    rmSync(join(dirname(entry), "__proto__"), { recursive: true });
+    writeFileSync(join(dirname(entry), "__proto__"), "不能漏记");
+    assert.throws(() => captureSourceSnapshot(entry), /__proto__.*重命名/);
   } finally { root.cleanup(); }
 });

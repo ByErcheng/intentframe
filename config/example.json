@@ -43,5 +43,22 @@
   "assetLibraries": [],
   "diagnostics": {
     "toolTimeoutMs": 10000
+  },
+  "models": {
+    "default": {
+      "model": "gpt-6.1-sol",
+      "effort": "high"
+    },
+    "stages": {
+      "production": {
+        "model": "gpt-6-astra"
+      },
+      "internal_review": {
+        "model": "gpt-6-astra"
+      },
+      "visual_understanding": {
+        "model": "gpt-6.1-terra"
+      }
+    }
   }
 }

@@ -1,0 +1,9 @@
+{
+ "id":"effort-sol-learning-one-minute","media":{"durationSeconds":60,"width":1080,"height":1920},
+ "variants":[{"id":"sol-medium","model":"gpt-6.1-sol","effort":"medium"},{"id":"sol-high","model":"gpt-6.1-sol","effort":"high"},{"id":"sol-xhigh","model":"gpt-6.1-sol","effort":"xhigh"},{"id":"sol-max","model":"gpt-6.1-sol","effort":"max"}],
+ "caseIds":["effort-learning"],"repetitions":1,
+ "limits":{"modelTurnMs":1800000,"operationMs":7200000,"generationCalls":0,"mediaProbeMs":180000,"mediaDecodeMs":180000,"mediaPreviewMs":180000},
+ "providerKinds":[],"assetLibraries":[],
+ "repeatRule":"同一合成历史来源，仅证明整理，不代表真实迁移；每档一次。",
+ "choicePolicy":"经验整理固定Sol，只比四档，等待用户确认。"
+}

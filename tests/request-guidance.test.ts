@@ -1,3 +1,4 @@
+import { confirmedDraft } from "./helpers.ts";
 import assert from "node:assert/strict";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -16,7 +17,7 @@ test("错误参数可定位并纠正，准备回显默认值，拒绝前置条�
   const root = fixtureRoot();
   try {
     const store = new WorkStore(root.path), service = new WorkService(store);
-    assert.throws(() => prepareOperation("create_work", { title: "合成", brief: "需求" }), error => {
+    assert.throws(() => prepareOperation("create_work", confirmedDraft({ title: "合成", brief: "需求" })), error => {
       assert(error instanceof RequestRejected);
       assert.equal(error.details.issues[0]?.field, "purpose");
       assert.match(error.message, /test/); assert.match(error.message, /production/); return true;
@@ -194,7 +195,7 @@ test("替代或取消的意见保留原文但不再自动执行，无法用失�
     const result = await service.produce(work.id, "sample");
     assert.deepEqual(result.versions.at(-1)?.feedbackIds, [replacement.id]);
     assert.equal(store.read(work.id).feedback[0]?.text, first.text);
-    const view = await executeTool("get_work", { workId: work.id }, service) as { feedback: { id: string; supersededByFeedbackIds: string[] }[] };
+    const view = await executeTool("get_work", { view: "detail", workId: work.id }, service) as { feedback: { id: string; supersededByFeedbackIds: string[] }[] };
     assert.deepEqual(view.feedback.find(f => f.id === first.id)?.supersededByFeedbackIds, [replacement.id]);
   } finally { root.cleanup(); }
 });

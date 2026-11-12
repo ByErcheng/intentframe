@@ -4,8 +4,8 @@ import { createHash } from "node:crypto";
 import { fileHash } from "../common/file-hash.ts";
 import { immutableText, valueHash } from "./files.ts";
 import { AssetStore } from "./asset-store.ts";
-import { authoringSchema, documentIdSchema, documentRefSchema, markdownSchema } from "./authoring-contracts.ts";
-import type { AuthoringDocument, DocumentRef, DesignDecision } from "./authoring-contracts.ts";
+import { authoringSchema, documentIdSchema, documentRefSchema, markdownSchema, draftSubmissionSchema } from "./authoring-contracts.ts";
+import type { AuthoringDocument, DocumentRef, DesignDecision, DraftSubmission } from "./authoring-contracts.ts";
 import type { WorkRecord, WorkStore } from "./work-store.ts";
 
 export class DocumentStore {
@@ -13,10 +13,13 @@ export class DocumentStore {
   constructor(store: WorkStore) { this.store = store; }
 
   /** 仅在新业务入口启用；已有作品不补造历史草稿或确认。 */
-  initialize(record: WorkRecord, markdown: string, operationId: string) {
+  initialize(record: WorkRecord, markdown: string, operationId: string, submission?: DraftSubmission) {
     if (record.authoring?.drafts.length) return;
     record.authoring ??= authoringSchema.parse({});
-    this.append(record, "draft", markdown, { operationId, source: "external_ai", instruction: "保存外部 AI 提交的原始草稿。", assetIds: [] });
+    if (submission) this.validateDraftInput(markdown, submission);
+    const document = this.append(record, "draft", markdown, { operationId, source: "external_ai", instruction: "保存外部 AI 提交的原始草稿。", assetIds: [],
+      ...(submission ? { submission, reviewRequired: true } : {}) });
+    if (submission) this.recordSubmissionHandoff(record, document, submission, operationId);
     this.store.save(record);
   }
 
@@ -50,6 +53,44 @@ export class DocumentStore {
     new AssetStore(this.store).select(record, assetIds ?? (basedOn ? this.document(record, basedOn).assetIds : []));
   }
 
+  validateDraftInput(markdown: string, raw: DraftSubmission | undefined, record?: WorkRecord, basedOn?: DocumentRef): DraftSubmission {
+    if (!raw) throw new Error("先在外部维护可打开的 Markdown 文件，取得用户对该版的明确交接，再提交 submission 文件来源、正文摘要和授权依据。");
+    const submission = draftSubmissionSchema.parse(raw);
+    if (createHash("sha256").update(markdown).digest("hex") !== submission.contentSha256) throw new Error("提交正文与已展示草稿的摘要不一致；重新核对确切文件版本，不能改写或截断原文。");
+    if (submission.authorization.kind === "external_correction") {
+      if (!record || !basedOn) throw new Error("首次交接须有用户明确确认，不能以外部纠错代替。");
+      this.assertHandedOff(record, basedOn);
+      const run = this.latestDraftReview(record, basedOn);
+      if (!run || run.id !== submission.authorization.reviewRunId || run.status !== "completed" || run.draftReview?.status !== "needs_changes") {
+        throw new Error("外部纠错须对应当前草稿最近一次仅由外部 AI 处理的检查意见；意图歧义或变更须取得用户确认。");
+      }
+    }
+    return submission;
+  }
+
+  private recordSubmissionHandoff(record: WorkRecord, document: AuthoringDocument, submission: DraftSubmission, operationId: string) {
+    const authorization = submission.authorization;
+    const previous = record.authoring!.handoffs.at(-1);
+    if (record.authoring!.handoffs.some(item => item.operationId === operationId)) return;
+    if (authorization.kind === "external_correction" && !previous) throw new Error("纠错缺少原交接记录。");
+    record.authoring!.handoffs.push({ operationId, draft: { id: document.id, sha256: document.sha256 },
+      userInstruction: authorization.kind === "user" ? authorization.userInstruction : previous!.userInstruction,
+      ...(authorization.kind === "external_correction" ? { correctionOf: {
+        operationId: previous!.operationId, reviewRunId: authorization.reviewRunId, notes: authorization.notes,
+      } } : {}), createdAt: new Date().toISOString() });
+  }
+
+  latestDraftReview(record: WorkRecord, draft: DocumentRef) {
+    return record.authoring?.runs.filter(run => run.kind === "review_draft" && run.base.id === draft.id && run.base.sha256 === draft.sha256).at(-1);
+  }
+
+  assertReviewed(record: WorkRecord, draft: DocumentRef) {
+    const document = this.document(record, draft), run = this.latestDraftReview(record, draft);
+    // 旧稿件继续沿当时的交接规则；新提交与已明确开始检查的旧稿都不能跳过检查。
+    if (!document.reviewRequired && !run) return;
+    if (run?.status !== "completed" || run.draftReview?.status !== "passed") throw new Error("草稿尚未通过入项检查；先调用 review_draft，按意见修改或澄清后复查确切新版本，再设计。");
+  }
+
   validateHandoff(record: WorkRecord, draft: DocumentRef) {
     if (["running", "unknown"].includes(record.execution.status)) throw new Error("原执行尚未结束或核清，不能切换交接依据。");
     if (this.document(record, draft).kind !== "draft" || record.authoring?.drafts.at(-1)?.id !== draft.id) throw new Error("须明确交接最新草稿，不能自动采用旧稿。");
@@ -59,14 +100,15 @@ export class DocumentStore {
     if (["running", "unknown"].includes(record.execution.status)) throw new Error("原执行尚未结束或核清，不能改变设计采用记录。");
     const document = this.document(record, design);
     if (document.kind !== "design" || !document.draft) throw new Error("只能审查已保存的设计脚本。");
-    if (status === "adopted") this.assertHandedOff(record, document.draft);
+    if (status === "adopted") { this.assertHandedOff(record, document.draft); this.assertReviewed(record, document.draft); }
     const run = record.authoring!.runs.find(item => item.outputDocument?.id === document.id);
     if (status === "adopted" && run && run.status !== "completed") throw new Error("设计尚未完成，不能采用有阻塞的脚本。");
     return document;
   }
 
   append(record: WorkRecord, kind: "draft" | "design", markdown: string,
-    details: Pick<AuthoringDocument, "operationId" | "source" | "instruction" | "assetIds"> & { basedOn?: DocumentRef; draft?: DocumentRef }) {
+    details: Pick<AuthoringDocument, "operationId" | "source" | "instruction" | "assetIds"> & {
+      basedOn?: DocumentRef; draft?: DocumentRef; submission?: DraftSubmission; reviewRequired?: boolean }) {
     markdownSchema.parse(markdown);
     if (!record.authoring) throw new Error("作品尚未启用草稿设计流程，请先提交草稿。");
     if (details.basedOn) this.document(record, details.basedOn);
@@ -92,13 +134,16 @@ export class DocumentStore {
     return document;
   }
 
-  async submit(workId: string, markdown: string, operationId: string, instruction: string, basedOn?: DocumentRef, assetIds?: string[]) {
+  async submit(workId: string, markdown: string, operationId: string, instruction: string, basedOn?: DocumentRef, assetIds?: string[], submission?: DraftSubmission) {
     return this.store.withLock(workId, () => {
       const record = this.store.read(workId);
       if (!record.authoring) record.authoring = authoringSchema.parse({});
       this.validateSubmission(record, basedOn, assetIds);
+      if (submission) this.validateDraftInput(markdown, submission, record, basedOn);
       const document = this.append(record, "draft", markdown, { operationId, instruction, source: "external_ai", basedOn,
-        assetIds: assetIds ?? (basedOn ? this.document(record, basedOn).assetIds : []) });
+        assetIds: assetIds ?? (basedOn ? this.document(record, basedOn).assetIds : []),
+        ...(submission ? { submission, reviewRequired: true } : {}) });
+      if (submission) this.recordSubmissionHandoff(record, document, submission, operationId);
       this.store.save(record); return this.read(record, document);
     });
   }
@@ -136,6 +181,7 @@ export class DocumentStore {
     const document = this.document(record, decision.design);
     if (!document.draft) throw new Error("设计缺少来源草稿。");
     this.assertHandedOff(record, document.draft);
+    this.assertReviewed(record, document.draft);
     if (record.feedback.some(item => item.changesDirection && !decision.feedbackAcknowledgedIds.includes(item.id))) throw new Error("采用设计后出现方向变更意见，须更新设计并重新审查采用。");
     return { document, decision, markdown: this.read(record, document).markdown, draft: this.read(record, document.draft) };
   }

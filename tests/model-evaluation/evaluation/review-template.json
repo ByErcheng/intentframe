@@ -1,0 +1,11 @@
+{
+  "runId": "<本轮运行编号>",
+  "reviewer": "<评价者>",
+  "observedArtifacts": [{"path":"<实际查看文件>","sha256":"<文件摘要>","scope":"<完整观看/片段/抽帧/文本>"}],
+  "dimensions": [{"name":"<需求/表达/事实/画面/声音/修改保留>","judgment":"not_checked","observations":[],"criticalIssues":[]}],
+  "audioListened": false,
+  "limitations": [],
+  "confounds": [],
+  "repeatNeeded": null,
+  "qualityConclusion": "pending"
+}

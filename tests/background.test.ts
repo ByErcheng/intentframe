@@ -14,7 +14,7 @@ test("MCP 提供实际指南，短调用受理制作，断开后继续并由新�
   try {
     const first = await fixture.connect();
     assert(first.getInstructions()?.includes("read_usage_guide"));
-    const guide = await fixture.call(first, "read_usage_guide");
+    const guide = await fixture.call(first, "read_usage_guide", { view: "full" });
     assert.equal(guide.content, readFileSync(join(fixture.project, "scripts/README.md"), "utf8"));
     assert.equal(guide.version, createHash("sha256").update(guide.content).digest("hex"));
     const rules = await fixture.call(first, "read_usage_guide", { document: "workflow", section: "反馈处理" });
@@ -33,7 +33,7 @@ test("MCP 提供实际指南，短调用受理制作，断开后继续并由新�
     assert.deepEqual(await fixture.call(next, "produce_version", request), submitted);
     const finished = await fixture.wait(next, submitted.executionId);
     assert.equal(finished.status, "succeeded", JSON.stringify(finished));
-    const finalWork = await fixture.call(next, "get_work", { workId: work.id });
+    const finalWork = await fixture.call(next, "get_work", { view: "detail", workId: work.id });
     assert.equal(finalWork.versions.length, 1); assert.equal(finalWork.versions[0].production, "ready");
     assert.equal(finalWork.activeExecutionId, undefined);
     assert(existsSync(join(fixture.data, "testing", finalWork.versions[0].mediaPath)));
@@ -52,18 +52,18 @@ test("未领取的后台请求可取消，迟到的工作进程不会开始制�
     await fixture.call(client, "produce_version", { operationId: "queued", workId: work.id, kind: "sample" });
     // 首次任务尚无任何版本；可以追加反馈不等于允许虚构反馈目标。
     await assert.rejects(fixture.call(client, "submit_feedback", { operationId: "during-queue", workId: work.id, versionId: "v001", text: "不能引用尚未创建的版本", source: "user" }), /版本/);
-    assert.equal((await fixture.call(client, "get_work", { workId: work.id })).feedback.length, 0);
+    assert.equal((await fixture.call(client, "get_work", { view: "detail", workId: work.id })).feedback.length, 0);
     const cancelled = await fixture.call(client, "cancel_execution", { operationId: "cancel", executionId: "queued" });
     assert.equal(cancelled.status, "cancelled");
     assert.equal(cancelled.timing.firstReturnedStatus, "cancelled");
     assert(cancelled.timing.firstReturnedAt);
-    assert.equal((await fixture.call(client, "get_work", { workId: work.id })).activeExecutionId, undefined);
+    assert.equal((await fixture.call(client, "get_work", { view: "detail", workId: work.id })).activeExecutionId, undefined);
     await fixture.call(client, "produce_version", { operationId: "changed-system", workId: work.id, kind: "sample" });
     appendFileSync(join(fixture.project, "docs/workflow.md"), "\n合成：受理后条件已变化。\n");
     const stopped = await fixture.wait(client, "changed-system");
     assert.equal(stopped.status, "failed"); assert.match(stopped.error, /系统或运行配置已变化/);
     assert.equal(fixture.countTurns(), 0);
-    assert.equal((await fixture.call(client, "get_work", { workId: work.id })).versions.length, 0);
+    assert.equal((await fixture.call(client, "get_work", { view: "detail", workId: work.id })).versions.length, 0);
   } finally { await fixture.cleanup(); }
 });
 
@@ -80,7 +80,7 @@ test("工作进程崩溃不伪装成完成或安全失败，原执行身份与�
     assert.equal(state.status, "unknown"); assert.match(state.message, /进程已退出/);
     assert.deepEqual(await fixture.call(client, "produce_version", { operationId: "produce", workId: work.id, kind: "sample" }), original);
     await assert.rejects(fixture.call(client, "produce_version", { operationId: "second-produce", workId: work.id, kind: "sample" }), /已有后台执行/);
-    assert.equal((await fixture.call(client, "get_work", { workId: work.id })).activeExecutionId, "produce");
+    assert.equal((await fixture.call(client, "get_work", { view: "detail", workId: work.id })).activeExecutionId, "produce");
     assert.equal(fixture.countTurns(), 1);
   } finally { await fixture.cleanup(); }
 });
@@ -95,7 +95,7 @@ test("后台总执行预算独立生效，超时不会被报告为用户取消�
     assert.equal(state.status, "failed", JSON.stringify(state)); assert.match(state.error, /总等待上限/);
     assert.equal(state.stopRequested, false);
     assert(fixture.countTurns() <= 1);
-    assert.equal((await fixture.call(client, "get_work", { workId: work.id })).activeExecutionId, undefined);
+    assert.equal((await fixture.call(client, "get_work", { view: "detail", workId: work.id })).activeExecutionId, undefined);
   } finally { await fixture.cleanup(); }
 });
 
@@ -109,14 +109,14 @@ test("渲染停止后保留完成工程，后台恢复只继续渲染并补齐�
     await fixture.call(client, "cancel_execution", { operationId: "cancel", executionId: "produce" });
     const stopped = await fixture.wait(client, "produce");
     assert.equal(stopped.status, "cancelled", JSON.stringify(stopped));
-    const before = await fixture.call(client, "get_work", { workId: work.id });
+    const before = await fixture.call(client, "get_work", { view: "detail", workId: work.id });
     assert.equal(before.versions[0].agentResult.status, "completed"); assert(before.versions[0].sourceSnapshot);
-    await fixture.call(client, "recover_work", { operationId: "recover", workId: work.id });
+    await fixture.call(client, "recover_work", { mode: "resume", operationId: "recover", workId: work.id });
     const restored = await fixture.wait(client, "recover");
     assert.equal(restored.status, "succeeded", JSON.stringify(restored));
     const previous = await fixture.call(client, "get_execution", { executionId: "produce" });
     assert.equal(previous.status, "succeeded");
-    const after = await fixture.call(client, "get_work", { workId: work.id });
+    const after = await fixture.call(client, "get_work", { view: "detail", workId: work.id });
     assert.equal(after.versions.length, 1); assert.equal(after.versions[0].production, "ready");
     assert.equal(after.activeExecutionId, undefined); assert.equal(fixture.countTurns(), 1);
     assert.equal(JSON.parse(readFileSync(fixture.executions.path("produce", "outcome.json"), "utf8")).status, "cancelled", "原停止事实仍保留");
@@ -133,7 +133,7 @@ test("停止请求经原生中断取得终态后才报告取消，随后可继�
     await fixture.call(client, "cancel_execution", { operationId: "cancel", executionId: "produce", reason: "合成用户要求停止" });
     const finished = await fixture.wait(client, "produce");
     assert.equal(finished.status, "cancelled", JSON.stringify(finished)); assert.equal(finished.stopRequested, true);
-    const record = await fixture.call(client, "get_work", { workId: work.id });
+    const record = await fixture.call(client, "get_work", { view: "detail", workId: work.id });
     assert.equal(record.activeExecutionId, undefined); assert.equal(record.execution.status, "failed");
     assert.equal(record.versions[0].nativeResult.status, "interrupted");
     assert.equal(record.versions[0].production, "failed");
@@ -152,7 +152,7 @@ test("未取得停止终态时保留未知与占用，不能用新操作再次�
     await fixture.call(client, "cancel_execution", { operationId: "cancel", executionId: "produce" });
     const finished = await fixture.wait(client, "produce");
     assert.equal(finished.status, "unknown", JSON.stringify(finished));
-    const record = await fixture.call(client, "get_work", { workId: work.id });
+    const record = await fixture.call(client, "get_work", { view: "detail", workId: work.id });
     assert.equal(record.execution.status, "unknown"); assert.equal(record.activeExecutionId, "produce");
     await assert.rejects(fixture.call(client, "produce_version", { operationId: "retry", workId: work.id, kind: "sample" }), /已有后台执行/);
     assert.equal(fixture.countTurns(), 1);
@@ -166,12 +166,12 @@ test("未知后台执行可交给恢复核对，原工程依据缺失时仍不�
     const work = await fixture.createLegacyWork(client, { operationId: "create", title: "未知后核对", brief: "合成原调用断线。", purpose: "test" });
     await fixture.call(client, "produce_version", { operationId: "produce", workId: work.id, kind: "sample" });
     assert.equal((await fixture.wait(client, "produce")).status, "unknown");
-    await fixture.call(client, "recover_work", { operationId: "recover", workId: work.id });
+    await fixture.call(client, "recover_work", { mode: "resume", operationId: "recover", workId: work.id });
     const checked = await fixture.wait(client, "recover");
     assert.equal(checked.status, "unknown"); assert.equal(checked.result.status, "needs_verification");
     const previous = await fixture.call(client, "get_execution", { executionId: "produce" });
     assert.equal(previous.recoveryOperationId, "recover");
-    const current = await fixture.call(client, "get_work", { workId: work.id });
+    const current = await fixture.call(client, "get_work", { view: "detail", workId: work.id });
     assert.equal(current.activeExecutionId, "recover"); assert.equal(current.execution.status, "unknown");
     assert.equal(current.versions[0].sourceSnapshot, undefined); assert.equal(fixture.countTurns(), 1);
   } finally { await fixture.cleanup(); }
@@ -190,7 +190,7 @@ test("渲染复用和经验整理各自完成，不混同作品原有的待补�
     await fixture.call(client, "organize_experience", { operationId: "organize", workId: work.id });
     const organized = await fixture.wait(client, "organize");
     assert.equal(organized.status, "succeeded");
-    const current = await fixture.call(client, "get_work", { workId: work.id });
+    const current = await fixture.call(client, "get_work", { view: "detail", workId: work.id });
     assert.equal(current.execution.status, "waiting_input"); assert.equal(current.learningBatches.length, 1);
     assert.equal(current.learningBatches[0].experienceRefs.length, 1); assert.equal(current.activeExecutionId, undefined);
   } finally { await fixture.cleanup(); }
@@ -213,8 +213,8 @@ test("已开始的执行丢失领取身份时，不补认未开始、取消成�
     assert.equal(stop.status, "unknown"); assert.equal(stop.stopRequested, true);
     assert.equal(fixture.executions.outcome(request), undefined);
     assert.throws(() => fixture.executions.claim(request), /已被领取/);
-    await assert.rejects(fixture.call(client, "recover_work", { operationId: "recover", workId: work.id }), /身份缺失/);
-    assert.equal((await fixture.call(client, "get_work", { workId: work.id })).activeExecutionId, input.operationId);
+    await assert.rejects(fixture.call(client, "recover_work", { mode: "resume", operationId: "recover", workId: work.id }), /身份缺失/);
+    assert.equal((await fixture.call(client, "get_work", { view: "detail", workId: work.id })).activeExecutionId, input.operationId);
     assert.equal(fixture.countTurns(), 0);
   } finally { await fixture.cleanup(); }
 });
@@ -231,8 +231,8 @@ test("后台占用错绑其他作品时，不清除另一条作品的占用", as
     const otherPath = join(store.workDirectory(second.id), "active-execution.json");
     writeFileSync(otherPath, JSON.stringify({ operationId: request.operationId, workId: second.id }));
     const originalPath = join(store.workDirectory(first.id), "active-execution.json"), original = readFileSync(originalPath, "utf8");
-    await assert.rejects(fixture.call(client, "get_work", { workId: second.id }), /归属不一致/);
-    await assert.rejects(fixture.call(client, "recover_work", { operationId: "recover", workId: second.id }), /归属不一致/);
+    await assert.rejects(fixture.call(client, "get_work", { view: "detail", workId: second.id }), /归属不一致/);
+    await assert.rejects(fixture.call(client, "recover_work", { mode: "resume", operationId: "recover", workId: second.id }), /归属不一致/);
     assert.equal(readFileSync(originalPath, "utf8"), original);
     assert.equal(fixture.countTurns(), 0);
   } finally { await fixture.cleanup(); }

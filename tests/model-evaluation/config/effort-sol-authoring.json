@@ -1,0 +1,9 @@
+{
+ "id":"effort-sol-authoring-one-minute","media":{"durationSeconds":60,"width":1080,"height":1920},
+ "variants":[{"id":"sol-medium","model":"gpt-6.1-sol","effort":"medium"},{"id":"sol-high","model":"gpt-6.1-sol","effort":"high"},{"id":"sol-xhigh","model":"gpt-6.1-sol","effort":"xhigh"},{"id":"sol-max","model":"gpt-6.1-sol","effort":"max"}],
+ "caseIds":["effort-draft-errors","effort-draft-clean","effort-draft-intent","effort-revise","effort-design"],"repetitions":1,
+ "limits":{"modelTurnMs":1800000,"operationMs":7200000,"generationCalls":0,"mediaProbeMs":180000,"mediaDecodeMs":180000,"mediaPreviewMs":180000},
+ "providerKinds":["image","speech"],"assetLibraries":"configured",
+ "repeatRule":"每例每档一次观察，不能宣称稳定排名；重要差异后续等量复测。",
+ "choicePolicy":"模型由用户确认；只比较中等、高、极高、最大值，展示原始输入和输出后等用户选强度。"
+}

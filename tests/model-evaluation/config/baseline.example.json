@@ -1,0 +1,11 @@
+{
+  "caseId": "review-defects",
+  "inputSha256": "<本轮该案例冻结输入的SHA256>",
+  "dataRoot": "<独立的单作品测试快照绝对路径>",
+  "workId": "<快照内的作品编号>",
+  "versionId": "<实际版本编号>",
+  "treeSha256": "<snapshot-hash命令返回值>",
+  "verifiedBy": "<实际核验者>",
+  "verifiedAt": "<ISO8601核验时间>",
+  "observations": "<实际观看范围、缺陷或正常区域、材料覆盖及限制>"
+}

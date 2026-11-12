@@ -8,11 +8,15 @@ export function run(mode = "completed", home, completionDelayMs = 1_000) {
   if (home) mkdirSync(home, { recursive: true });
   const historyPath = home ? join(home, "history.json") : undefined;
   const history = historyPath && existsSync(historyPath) ? JSON.parse(readFileSync(historyPath, "utf8")) : { threads: {} };
+  const ownedThreads = new Set();
   const send = value => process.stdout.write(JSON.stringify(value) + "\n");
   const save = () => {
     if (!historyPath) return;
     const temporary = historyPath + "." + process.pid;
-    writeFileSync(temporary, JSON.stringify(history));
+    // 嵌套只读调用使用另一 app-server 进程；父进程不能用旧快照覆盖子线程。
+    const saved = existsSync(historyPath) ? JSON.parse(readFileSync(historyPath, "utf8")) : { threads: {} };
+    writeFileSync(temporary, JSON.stringify({ threads: { ...saved.threads,
+      ...Object.fromEntries([...ownedThreads].map(id => [id, history.threads[id]])) } }));
     renameSync(temporary, historyPath);
   };
   const callbacks = new Map();
@@ -26,6 +30,7 @@ export function run(mode = "completed", home, completionDelayMs = 1_000) {
   const makeThread = requested => {
     const count = Object.keys(history.threads).length;
     const id = requested ?? (count ? "fixture-thread-" + (count + 1) : "fixture-thread");
+    ownedThreads.add(id);
     return history.threads[id] ??= { id, cwd: process.cwd(), historyMode: "paginated", turns: [] };
   };
   const proposal = sourceIds => ({
@@ -40,13 +45,19 @@ export function run(mode = "completed", home, completionDelayMs = 1_000) {
       if (callback) { callbacks.delete(request.id); callback(request.result); }
       return;
     }
-    if (home) appendFileSync(join(home, "calls.jsonl"), JSON.stringify({ method: request.method, cwd: process.cwd(), pid: process.pid }) + "\n");
+    if (home) appendFileSync(join(home, "calls.jsonl"), JSON.stringify({ method: request.method, cwd: process.cwd(), pid: process.pid,
+      ...(request.params?.model ? { params: { model: request.params.model, effort: request.params.effort,
+        config: Object.fromEntries(Object.entries(request.params.config ?? {}).filter(([key]) => key === "model_reasoning_effort" || key === "default_permissions" || key.startsWith("permissions."))),
+        permissions: request.params.permissions, sandboxPolicy: request.params.sandboxPolicy } } : {}) }) + "\n");
     if (request.id === undefined) return;
     if (request.method === "reject") { send({ id: request.id, error: { code: -32000, message: "测试：请求被明确拒绝" } }); return; }
     if (request.method === "initialize") {
       if (mode === "initialize_wait") return;
       if (mode === "initialize_disconnect") process.exit(0);
       send({ id: request.id, result: {} }); return;
+    }
+    if (request.method === "model/list") {
+      send({ id: request.id, result: { data: ["fixture-a", "fixture-b", "local-fixture", "gpt-6.1-sol", "gpt-6-astra", "gpt-6.1-terra"].map(model => ({ model, supportedReasoningEfforts: [{ reasoningEffort: "medium" }, { reasoningEffort: "high" }] })), nextCursor: null } }); return;
     }
     if (request.method === "thread/read") {
       const thread = history.threads[request.params.threadId];
@@ -68,7 +79,9 @@ export function run(mode = "completed", home, completionDelayMs = 1_000) {
       const thread = makeThread(request.params.threadId);
       thread.developerInstructions = request.params.developerInstructions;
       thread.cwd = request.params.cwd ?? process.cwd(); save();
-      send({ id: request.id, result: { thread: { id: thread.id }, model: "local-fixture" } }); return;
+      send({ id: request.id, result: { thread: { id: thread.id }, model: mode === "model_mismatch" ? "wrong-model" : request.params.model ?? "local-fixture",
+        activePermissionProfile: mode === "missing_permissions" ? null : request.params.permissions ? { id: request.params.permissions, extends: null } : null,
+        ...(mode === "missing_effort" ? {} : { reasoningEffort: request.params.config?.model_reasoning_effort ?? null }) } }); return;
     }
     if (request.method === "turn/interrupt") {
       send({ id: request.id, result: {} });
@@ -87,10 +100,36 @@ export function run(mode = "completed", home, completionDelayMs = 1_000) {
     const turn = { id: turnId, status: "inProgress", itemsView: "full", items: [{ id: "user", type: "userMessage", content: request.params.input ?? [] }] };
     thread.turns.push(turn); save();
     send({ id: request.id, result: { turn: { id: turnId, status: "inProgress" } } });
+    if (mode === "asset_phase" || mode === "asset_phase_no_image") {
+      const finish = (id, success = true) => {
+        const reply = { status: success ? "completed" : "failed", summary: "合成素材回复，不证明模型视觉能力", selectedAssetIds: id ? [id] : [], choices: [], limitations: ["仅用于系统回归"] };
+        const item = { id: "asset-phase-result", type: "agentMessage", phase: "final_answer", text: JSON.stringify(reply) };
+        turn.items.push(item); turn.status = "completed"; save();
+        send({ method: "item/completed", params: { threadId: thread.id, turnId: turn.id, item } });
+        send({ method: "turn/completed", params: { threadId: thread.id, turn: { id: turn.id, status: "completed" } } });
+      };
+      if (mode === "asset_phase_no_image") { finish(undefined); return; }
+      callTool(thread.id, turn.id, "intentframe_generate_image", { operationKey: "asset-phase-image", prompt: "合成参考图", description: "仅验证素材阶段交接" }, result => {
+        const output = result?.contentItems?.find(item => item.type === "inputText");
+        let parsed; try { parsed = JSON.parse(output?.text ?? "{}"); } catch { parsed = {}; }
+        finish(parsed.id, result?.success === true);
+      }); return;
+    }
+    if (mode === "generation_probe") {
+      callTool(thread.id, turn.id, "intentframe_generate_image", {}, result => {
+        const item = { id: "generation-result", type: "agentMessage", phase: "final_answer", text: JSON.stringify(result) };
+        turn.items.push(item); turn.status = "completed"; save();
+        send({ method: "item/completed", params: { threadId: thread.id, turnId: turn.id, item } });
+        send({ method: "turn/completed", params: { threadId: thread.id, turn: { id: turn.id, status: "completed" } } });
+      }); return;
+    }
     if (mode === "disconnect") process.exit(0);
     const organizing = Boolean(request.params.outputSchema?.properties?.checkedSourceIds);
+    const analysis = Boolean(request.params.outputSchema?.properties?.markdown && request.params.outputSchema?.properties?.limitations);
     const authoring = Boolean(request.params.outputSchema?.properties?.markdown);
+    const draftReview = Boolean(request.params.outputSchema?.properties?.issues);
     const inspecting = Boolean(request.params.outputSchema?.properties?.sufficient);
+    const visual = Boolean(request.params.outputSchema?.properties?.observations);
     const inspectionInput = inspecting ? JSON.parse(readFileSync("input.json", "utf8")) : undefined;
     const repairNeeded = mode === "quality_persistent" || (["quality_repair", "disconnect_quality"].includes(mode) && (inspectionInput?.internalRepair?.attempt ?? 0) === 0);
     const context = existsSync("context.md") ? readFileSync("context.md", "utf8") : "";
@@ -106,7 +145,15 @@ export function run(mode = "completed", home, completionDelayMs = 1_000) {
         proposals: (mode === "learn_method" || mode === "partial_learning") && sourceIds.length ? [proposal(sourceIds)] : [],
       };
       const needsInput = ["needs_input", "partial_input", "disconnect_needs_input"].includes(mode);
-      const result = inspecting ? {
+      const reviewIssue = ["draft_changes", "draft_confirmation", "disconnect_draft_changes"].includes(mode);
+      const result = analysis ? { status: mode === "analysis_needs_input" ? "needs_input" : "completed", markdown: "合成分析：保留采用设计，无需新增素材；图像观察仅验证交接。", limitations: ["合成响应，不证明真实效果。"] } : visual ? {status:'completed',summary:'合成截图理解，仅验证调用边界。',observations:[{image:'1',observation:'可见测试色块。',evidence:'本轮图像输入'}],limitations:['模拟响应不证明真实视觉能力。']} : draftReview ? {
+        status: mode === "draft_confirmation" ? "needs_confirmation" : reviewIssue ? "needs_changes" : "passed",
+        summary: "合成草稿检查，仅验证交接行为。",
+        issues: reviewIssue || mode === "draft_contradiction" ? [{ location: "第二段", problem: "合成草稿中有冲突。", reason: "与已交接的第一段要求矛盾。",
+          suggestion: "按已有原话纠正，意图不明时请用户决定。", resolver: mode === "draft_confirmation" ? "user" : "external_ai" }] : [],
+        usedExperienceRefs: mode === "draft_unread_experience" ? [{ id: "experience-unread", revision: 1, sha256: "a".repeat(64) }] : used,
+        limitations: ["合成模型，不证明真实审稿质量。"],
+      } : inspecting ? {
         sufficient: mode !== "coverage_more", notes: "合成材料核对，不代表真实视频审查。", limitations: ["仅测试协议与材料流程。"],
         ...(mode === "quality_repair" ? { sound: { status: "checked", notes: "模拟未经依据的听音声明", ranges: [] } } : {}),
         additionalRanges: mode === "coverage_more" ? [{ startSeconds: 0.1, endSeconds: 0.8, fps: 10, reason: "合成请求：需要动作中间帧。" }] : [],
@@ -124,7 +171,7 @@ export function run(mode = "completed", home, completionDelayMs = 1_000) {
         blockers: needsInput || mode === "false_completed" ? ["请提供参考素材。"] : [],
         usedExperienceRefs: used, learning,
       };
-      if (!organizing && !authoring && !inspecting && ["media_tools", "completed", "completed_exit", "partial_input", "partial_failed", "learn_method", "use_experience", "read_feedback", "disconnect_after_result", "slow_completed", "slow_render", "quality_repair", "quality_persistent", "quality_change", "disconnect_quality"].includes(mode)) {
+      if (!organizing && !authoring && !draftReview && !inspecting && !visual && ["media_tools", "completed", "completed_exit", "partial_input", "partial_failed", "learn_method", "use_experience", "read_feedback", "disconnect_after_result", "slow_completed", "slow_render", "quality_repair", "quality_persistent", "quality_change", "disconnect_quality"].includes(mode)) {
         const source = existsSync("entry.tsx") ? readFileSync("entry.tsx", "utf8") :
           'import React from "react";import {Composition,registerRoot,AbsoluteFill} from "remotion";const Scene=()=> <AbsoluteFill style={{backgroundColor:"red"}}/>;registerRoot(()=> <Composition id="Video" component={Scene} durationInFrames={10} fps={10} width={160} height={90}/>);\n';
         writeFileSync("entry.tsx", source + (mode === "slow_render" ? '\nimport {delayRender,continueRender} from "remotion";const pending=delayRender("合成停止窗口");setTimeout(()=>continueRender(pending),3000);\n' : "") + "// 本次处理：" + JSON.stringify(result.appliedFeedbackIds) + "\n" +
@@ -142,11 +189,21 @@ export function run(mode = "completed", home, completionDelayMs = 1_000) {
         send({ method: "item/completed", params: { threadId: thread.id, turnId, item: answer } });
       }
       turn.status = "completed"; save();
-      if (["disconnect_after_result", "disconnect_needs_input", "disconnect_failed"].includes(mode) || (mode === "disconnect_quality" && inspecting)) process.exit(0);
+      if ((!analysis && ["disconnect_after_result", "disconnect_needs_input", "disconnect_failed", "disconnect_draft_changes"].includes(mode)) ||
+          (mode === "disconnect_quality" && inspecting) || (["disconnect_analysis", "visual_child_disconnect"].includes(mode) && analysis)) process.exit(0);
       send({ method: "turn/completed", params: { threadId: thread.id, turn: { id: turnId, status: "completed" } } });
       if (mode === "completed_exit") setImmediate(() => process.exit(0));
     };
-    if (mode === "media_tools" && !organizing && !authoring && !inspecting) {
+    if (draftReview && mode !== "draft_skip_search") {
+      callTool(thread.id, turnId, "intentframe_search_experience", { query: "合成草稿" }, response => {
+        const page = response?.success ? JSON.parse(response.contentItems[0].text) : undefined;
+        const ref = page?.items?.[0]?.ref;
+        if (mode === "draft_use_experience" && ref) callTool(thread.id, turnId, "intentframe_read_experience", ref, answer => finish(answer?.success ? [ref] : []));
+        else finish();
+      });
+    } else if (mode === "visual_child_disconnect" && authoring && !analysis) {
+      callTool(thread.id, turnId, "intentframe_inspect_asset", { source: { kind: "library", libraryId: "test-images", path: "image.png" } }, () => finish());
+    } else if (mode === "media_tools" && !organizing && !authoring && !inspecting) {
       const args = { operationKey: "fixture-image", prompt: "合成测试图片", description: "合成内部制作素材" };
       callTool(thread.id, turnId, "intentframe_generate_image", args, first => {
         callTool(thread.id, turnId, "intentframe_generate_image", args, second => {

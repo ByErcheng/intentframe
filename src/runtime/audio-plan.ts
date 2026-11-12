@@ -4,6 +4,7 @@ import { z } from "zod";
 import { fileHash } from "../common/file-hash.ts";
 import { immutableJson, ownedPath, readJson, valueHash } from "../records/files.ts";
 import { AssetStore } from "../records/asset-store.ts";
+import { voiceInfoSchema } from "../records/asset-types.ts";
 import type { WorkRecord, WorkStore, WorkVersion } from "../records/work-store.ts";
 import { audioPlacementSchema, audioRuntimeSource, mapNarration, narrationMetadata } from "../media/audio-timing.ts";
 
@@ -18,7 +19,7 @@ export function readAudioPlan(store: WorkStore, version: WorkVersion) {
   }
   return z.object({ schemaVersion: z.literal(1), clips: z.array(z.object({ id: z.string(), assetId: z.string(), sha256: z.string(),
     source: z.string(), startMs: z.number(), endMs: z.number(), trimStartMs: z.number(), trimEndMs: z.number(), playbackRate: z.number(), volume: z.number(),
-    fadeInMs: z.number().optional(), fadeOutMs: z.number().optional(),
+    fadeInMs: z.number().optional(), fadeOutMs: z.number().optional(), voice: voiceInfoSchema.optional(),
     text: z.string().optional(), voiceInstruction: z.string().optional(), words: z.array(z.object({ text: z.string(), startMs: z.number(), endMs: z.number() })).optional() })),
     events: z.record(z.string(), z.number()), limitations: z.array(z.string()) }).parse(readJson(ownedPath(directory, planFile)));
 }
@@ -51,7 +52,7 @@ export function saveAudioPlan(store: WorkStore, work: WorkRecord, version: WorkV
     for (const [name, time] of Object.entries(timing?.events ?? {})) events[clip.id + "." + name] = time;
     const copy = assets.copyToSource(work, [asset.id], directory)[0]!;
     version.assets ??= []; if (!version.assets.some(item => item.id === asset.id)) version.assets.push(asset);
-    return { ...clip, source: copy.source, sha256: asset.sha256, trimEndMs: end,
+    return { ...clip, source: copy.source, sha256: asset.sha256, trimEndMs: end, ...(asset.voice ? { voice: asset.voice } : {}),
       endMs: clip.startMs + (end - clip.trimStartMs) / clip.playbackRate,
       ...(timing ? { text: timing.text, words: timing.words, voiceInstruction: timing.voiceInstruction, timingSource: timing.timingSource } : { timingSource: "no_word_timing" }) };
   });
@@ -61,6 +62,7 @@ export function saveAudioPlan(store: WorkStore, work: WorkRecord, version: WorkV
 export type PlaybackClip = { id: string; assetId: string; source: string; sha256: string; startMs: number; endMs: number;
   trimStartMs: number; trimEndMs: number; playbackRate: number; volume: number; fadeInMs: number; fadeOutMs: number;
   cues: {name: string; quote: string; edge: string; occurrence?: number}[]; text?: string; voiceInstruction?: string;
+  voice?: {kind: "recording" | "synthesized" | "unknown"; speaker?: string; source?: string; transcript?: {text: string; source: string}};
   timingSource: string; words?: {text: string; startMs: number; endMs: number}[] };
 export const playback: {schemaVersion: number; clips: PlaybackClip[]; events: Record<string, number>; limitations: string[]} = ${JSON.stringify(plan)};
 `;

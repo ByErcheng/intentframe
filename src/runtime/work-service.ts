@@ -3,6 +3,9 @@ import { cpSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node
 import { dirname, join } from "node:path";
 import { z } from "zod";
 import { configuration, repositoryRoot } from "../config.ts";
+import { selectModel } from "../records/model-settings.ts";
+import type { ModelsConfiguration } from "../records/model-settings.ts";
+import { checkModel, modelThreadParameters, modelThreadSchema, modelTurnParameters, verifyModelThread } from "./model-call.ts";
 import { fileHash, renderVersion, restoreVideoPreviews } from "../media/render.ts";
 import { WorkStore } from "../records/work-store.ts";
 import type { WorkRecord, WorkVersion } from "../records/work-store.ts";
@@ -11,7 +14,7 @@ import { ComparisonStore } from "../records/comparison-store.ts";
 import { immutableJson, readJson, valueHash } from "../records/files.ts";
 import { learningResultSchema } from "../records/contracts.ts";
 import { knowledgeToolDefinitions, LearningService } from "./learning-service.ts";
-import { executionConditions, productionRules, systemFingerprint } from "./context.ts";
+import { executionConditions, productionRuleContext, productionRules, systemFingerprint } from "./context.ts";
 import { processExists } from "./process-state.ts";
 import { checkExecution } from "./execution-control.ts";
 import { appliedFeedback, selectProduction } from "./production-selection.ts";
@@ -24,6 +27,7 @@ import { parseProductionResult, productionOutputSchema } from "./production-resu
 import { AuthoringService } from "./authoring-service.ts";
 import { DocumentStore } from "../records/document-store.ts";
 import { ReviewService } from "./review-service.ts";
+import { assertAnalysesSettled, ModelAnalysisService } from "./model-analysis-service.ts";
 import { AssetService } from "./asset-service.ts";
 import type { ReviewRange } from "../media/review-materials.ts";
 import { MAX_INTERNAL_REPAIRS, internalReviewPassed } from "../records/media-contracts.ts";
@@ -38,6 +42,7 @@ import {
 
 type ServiceOptions = AssetOptions & { render?: typeof renderVersion; restorePreviews?: typeof restoreVideoPreviews; codexExecutable?: string; timeoutMs?: number; knowledge?: KnowledgeStore;
   assetLibraries?: LibraryRoot[];
+  models?: ModelsConfiguration;
   prepareReview?: (record: WorkRecord, version: WorkVersion) => Promise<unknown>;
   signal?: AbortSignal; onProgress?: (phase: string) => void; onRunner?: (pid: number) => void; productionSnapshot?: WorkRecord };
 
@@ -63,7 +68,7 @@ export class WorkService {
   }
 
   assertCanProduce(record: WorkRecord, kind: "sample" | "complete"): void {
-    if (["running", "unknown"].includes(record.execution.status)) {
+    if (["running", "unknown"].includes(record.execution.status) || record.analysisRuns?.some(item => ["preparing", "running", "unknown"].includes(item.status))) {
       throw new Error("已有执行尚未取得明确结果，不能重复发起。");
     }
     if (kind === "complete" && !record.authoring && !record.directionApproval) {
@@ -111,6 +116,8 @@ export class WorkService {
       }
       const chosen = selectProduction(this.store, record, kind, feedbackId, threadMode, baseVersionId, baseReason, selection);
       const { previous, inherited, requested } = chosen;
+      const modelSelection = selectModel(this.options.models ?? configuration.models,
+        requested.length || internalRepair ? "feedback_revision" : kind === "sample" ? "sample" : "production");
       const design = this.documents.adopted(record, selection.designRef);
       const assetIds = [...new Set([...(design?.document.assetIds ?? []), ...(previous?.assets?.map(asset => asset.id) ?? []), ...(selection.assetIds ?? [])])];
       const selectedAssets = this.assets.assets.select(record, assetIds);
@@ -131,6 +138,7 @@ export class WorkService {
         directionId: chosen.newDirection || !previous ? versionId : previous.directionId ?? previous.id,
         newDirection: chosen.newDirection,
         operationId, sendState: "not_sent", systemFingerprint: systemFingerprint(),
+        modelSelection,
         designRef: design ? { id: design.document.id, sha256: design.document.sha256 } : undefined,
         designDecisionId: design?.decision.operationId,
         assets: selectedAssets,
@@ -173,7 +181,7 @@ export class WorkService {
         inherited: JSON.stringify(history.snapshot.inheritedFeedback.map(item => ({ id: item.id, versionId: item.versionId,
           supersededByFeedbackIds: item.supersededByFeedbackIds })), null, 2),
         feedbackIds: JSON.stringify(requested), direction: design ? "按上方已采用脚本及本轮制作范围执行；AI 采用不等于用户认可成片。" : record.directionApproval ? JSON.stringify(record.directionApproval, null, 2) : "尚未确认方向，仅制作样例。",
-        conditionalRules: rules.filter(r => r.section !== "经验使用").map(r => r.text).join("\n"),
+        conditionalRules: productionRuleContext(rules),
         experience: rules.find(r => r.section === "经验使用")!.text + (comparison ? "\n本轮为固定输入比较，仅使用已开放的知识范围。" : ""),
         sourceIds: JSON.stringify(sourceIds), sources: pendingSources.items.length ? JSON.stringify(pendingSources.items.map(source =>
           source.kind === "feedback" ? { id: source.id, kind: source.kind, versionId: source.versionId } : source), null, 2) : "无待整理来源。",
@@ -196,16 +204,34 @@ export class WorkService {
         writeFileSync(join(sourceDirectory, "context.md"), context);
         version.contextSha256 = fileHash(join(sourceDirectory, "context.md"));
         version.inputManifestPath = "works/" + id + "/runs/" + runId + "/input.json";
-        immutableJson(this.store.resolvePath(version.inputManifestPath), { context, developerInstructions: developer.text, turnInput,
-          outputSchema: productionOutputSchema, sources: [developer, template, startPrompt, ...rules], history: history.snapshot });
-        version.inputManifestSha256 = fileHash(this.store.resolvePath(version.inputManifestPath));
         this.store.save(record);
         this.store.appendEvent(id, runId, { kind: "production_started", versionId, basedOnVersionId: previous?.id, feedbackIds: requested });
         version.executionConditions = executionConditions(this.options.codexExecutable, this.options.timeoutMs);
         this.store.save(record);
         mediaTools = new ProductionMediaTools(this.store, record, runId, this.assets, version,
-          { libraries: this.options.assetLibraries, render: this.options.render, signal: this.options.signal });
+          { libraries: this.options.assetLibraries, render: this.options.render, signal: this.options.signal,
+            visualAnalysis: new ModelAnalysisService(this.store, this.options) });
         const currentMediaTools = mediaTools;
+        let assetPlan: Awaited<ReturnType<ModelAnalysisService["run"]>> | undefined;
+        if (design) {
+          // 素材决策先读采用脚本与本轮反馈；实际下载/生成仍沿制作工具的版本和重复保护执行。
+          assetPlan = await new ModelAnalysisService(this.store, this.options).run(record, runId, "production_assets",
+            { design: design.markdown, context, assets: selectedAssets, feedbackIds: requested, feedback: selectedFeedback }, [],
+            { definitions: mediaToolDefinitions(true), call: (name, input) => {
+              if (!mediaToolDefinitions(true).some(tool => tool.name === name)) throw new Error("素材方案只允许查找和检查。");
+              return currentMediaTools.call(name, input);
+            } });
+          assertAnalysesSettled(record);
+          immutableJson(join(dirname(this.store.resolvePath(version.inputManifestPath)), "asset-plan.json"), assetPlan);
+          if (assetPlan.status === "needs_input") {
+            version.production = "blocked"; version.error = assetPlan.markdown;
+            record.execution = { status: "waiting_input", runId, versionId, error: assetPlan.markdown }; this.store.save(record); return;
+          }
+        }
+        const actualTurnInput = turnInput + (assetPlan ? "\n按以下素材方案执行；遇到不可用来源或需改变素材决策时明确报告，不能静默改设计。\n" + JSON.stringify(assetPlan) : "");
+        immutableJson(this.store.resolvePath(version.inputManifestPath), { context, developerInstructions: developer.text, turnInput: actualTurnInput,
+          modelSelection, assetPlan, outputSchema: productionOutputSchema, sources: [developer, template, startPrompt, ...rules], history: history.snapshot });
+        version.inputManifestSha256 = fileHash(this.store.resolvePath(version.inputManifestPath)); this.store.save(record);
         codex = new CodexAppServerClient({
           cwd: sourceDirectory, executable: this.options.codexExecutable,
           onEvent: event => this.store.appendEvent(id, runId, event),
@@ -222,24 +248,28 @@ export class WorkService {
         if (codex.pid) this.options.onRunner?.(codex.pid);
         await codex.initializeConnection();
         checkExecution(this.options.signal);
-        const response = z.object({ thread: z.object({ id: z.string() }), model: z.string().optional() })
+        await checkModel(codex, modelSelection);
+        const response = modelThreadSchema
           .parse(await codex.sendRequest(threadMode === "resume" ? "thread/resume" : "thread/start", {
             ...(threadMode === "resume" ? { threadId: previous?.threadId, excludeTurns: true } : {}),
             cwd: sourceDirectory, sandbox: "workspace-write", approvalPolicy: "never",
             dynamicTools: [...knowledgeToolDefinitions, productionHistoryTool, ...mediaToolDefinitions(!design)],
-            config: { web_search: "live" },
+            ...modelThreadParameters(modelSelection, { web_search: "live" }),
             developerInstructions: developer.text,
           }));
         version.threadId = response.thread.id;
         version.model = response.model;
+        version.reasoningEffort = response.reasoningEffort;
         this.store.save(record);
+        verifyModelThread(modelSelection, response);
         checkExecution(this.options.signal);
         this.options.onProgress?.("项目主 AI 正在制作工程");
         phase = "awaiting_result";
         version.sendState = "sending"; this.store.save(record);
         const started = z.object({ turn: codexTurnSchema }).parse(await codex.sendRequest("turn/start", {
           threadId: version.threadId, outputSchema: productionOutputSchema,
-          input: [{ type: "text", text: turnInput }],
+          ...modelTurnParameters(modelSelection),
+          input: [{ type: "text", text: actualTurnInput }],
         }));
         version.turnId = started.turn.id;
         version.sendState = "acknowledged";
@@ -308,10 +338,16 @@ export class WorkService {
     }
   }
 
-  async prepareMaterials(id: string, versionId: string, ranges: ReviewRange[], operationId?: string) {
+  async prepareMaterials(id: string, versionId: string, ranges: ReviewRange[], operationId?: string,
+    mode: "materials_only" | "inspect_and_repair" = "inspect_and_repair") {
     return this.store.withLock(id, async () => {
       const record = this.store.read(id), version = this.store.version(record, versionId);
       this.assertCanProduce(record, "sample");
+      if (mode === "materials_only") {
+        const materials = await this.reviewMaterials.prepareOnly(record, version, ranges);
+        return { ...materials, mode, requestedVersionId: versionId, versionId,
+          delivery: this.store.delivery({ ...record, versions: [version] }) };
+      }
       version.reviewPreparation ??= { status: "preparing", batches: [], inspections: [] };
       version.reviewPreparation.operationId = operationId;
       record.execution = { status: "running", runId: version.runId, versionId };
@@ -321,12 +357,13 @@ export class WorkService {
       await this.finishInternalReview(record, version, operationId);
       if (!version.designRef) { record.execution = { status: "idle" }; this.store.save(record); }
       const final = record.versions.length > count ? record.versions.at(-1)! : version;
-      return { ...this.reviewMaterials.view(record, final), requestedVersionId: versionId, versionId: final.id,
+      return { ...this.reviewMaterials.view(record, final), mode, requestedVersionId: versionId, versionId: final.id,
         delivery: this.store.delivery({ ...record, versions: [final] }) };
     });
   }
 
   private applyProductionReceipt(record: WorkRecord, version: WorkVersion, receipt: ProductionReceipt): boolean {
+    assertAnalysesSettled(record);
     this.assets.assertSettled(record, version);
     version.turnId = receipt.turnId;
     version.nativeResult = { threadId: receipt.threadId, turnId: receipt.turnId, status: receipt.status, reply: receipt.reply,
@@ -354,7 +391,10 @@ export class WorkService {
     if (result.status === "failed") throw new Error(result.summary + "\n" + result.blockers.join("\n"));
     const audio = version.audioPlan ? readAudioPlan(this.store, version) : undefined;
     if (version.mediaToolsVersion === 1 && version.designRef && speechSegments(this.documents.read(record, version.designRef).markdown).length &&
-      !audio?.clips.some(clip => clip.words?.length && clip.volume > 0)) throw new Error("采用脚本包含人声，但缺少已编排的真实配音与字词时间，不能交付为完成。");
+      !audio?.clips.some(clip => clip.volume > 0 && (clip.words?.length ||
+        record.assets?.some(asset => asset.id === clip.assetId && asset.role === "narration" && asset.voice?.kind === "recording")))) {
+      throw new Error("采用脚本包含人声，但缺少已编排的真实配音或已注明来源类型的讲话录音，不能交付为完成。");
+    }
     // 已交付版本的完成事实不随媒体缺失或只补存而降级；可用性另行核对。
     if (version.production !== "ready") version.production = "source_ready";
     version.error = undefined;
@@ -390,14 +430,16 @@ export class WorkService {
       const version = record.versions.at(-1) ?? record.authoring?.designs.at(-1) ?? record.authoring?.drafts.at(-1);
       if (!version) throw new Error("暂无可关联的稿件或制作版本。");
       const runId = "learning-" + randomUUID(), directory = this.store.resolvePath("works/" + id + "/learning/" + runId);
+      const modelSelection = selectModel(this.options.models ?? configuration.models, "learning");
       mkdirSync(directory, { recursive: true });
       const learningPrompt = readPrompt("learning", "执行约束"), startPrompt = readPrompt("learning", "启动消息");
       const turnInput = fillPrompt(startPrompt.text, { runId });
-      const input = { workId: id, purpose: record.purpose ?? "unspecified", versionId: version.id,
+      const input = { workId: id, purpose: record.purpose ?? "unspecified", versionId: version.id, modelSelection,
         sources: pending.items, remaining: pending.remaining,
         rule: learningPrompt.text, promptSources: [learningPrompt, startPrompt], turnInput, outputSchema: z.toJSONSchema(learningResultSchema) };
       immutableJson(join(directory, "context.json"), input);
       record.learningRun = { id: runId, versionId: version.id, sourceIds: pending.items.map(source => source.id),
+        modelSelection,
         contextSha256: fileHash(join(directory, "context.json")), sendState: "not_sent",
         previousExecution: { ...record.execution }, completed: false, createdAt: new Date().toISOString() };
       record.execution = { status: "running", runId, versionId: version.id.startsWith("v") ? version.id : undefined };
@@ -420,15 +462,20 @@ export class WorkService {
         if (client.pid) this.options.onRunner?.(client.pid);
         await client.initializeConnection();
         checkExecution(this.options.signal);
-        const started = z.object({ thread: z.object({ id: z.string() }) }).parse(await client.sendRequest("thread/start", {
+        await checkModel(client, modelSelection);
+        const started = modelThreadSchema.parse(await client.sendRequest("thread/start", {
+          ...modelThreadParameters(modelSelection),
           cwd: directory, sandbox: "read-only", approvalPolicy: "never", dynamicTools: knowledgeToolDefinitions,
           developerInstructions: learningPrompt.text,
         }));
         run.threadId = started.thread.id;
+        run.model = started.model; run.reasoningEffort = started.reasoningEffort; this.store.save(record);
+        verifyModelThread(modelSelection, started);
         checkExecution(this.options.signal);
         run.sendState = "sending"; this.store.save(record);
         const response = z.object({ turn: codexTurnSchema }).parse(await client.sendRequest("turn/start", {
           threadId: run.threadId, outputSchema: z.toJSONSchema(learningResultSchema),
+          ...modelTurnParameters(modelSelection),
           input: [{ type: "text", text: turnInput }],
         }));
         run.turnId = response.turn.id; run.sendState = "acknowledged"; this.store.save(record);
@@ -463,6 +510,21 @@ export class WorkService {
   /** 沿原身份核对并接续已知剩余工作；未知调用不重发，原进程存活时保留现场。 */
   async recover(id: string, render = true) {
     checkExecution(this.options.signal);
+    if (this.store.read(id).analysisRuns?.some(run => ["preparing", "running", "unknown"].includes(run.status))) {
+      const pending = await this.store.withRecoveryGuard(id, async () => {
+        const record = this.store.read(id), owner = this.store.lockOwner(id);
+        if (owner && processExists(owner.pid)) return { status: "running" as const, message: "原任务仍在运行，保留分析现场。", work: this.store.summary(record) };
+        // 先核最内层只读调用，再由下方原有恢复流程核对父轮次；不解除父任务的未知保护。
+        for (const run of [...record.analysisRuns ?? []].reverse()) {
+          if (!["preparing", "running", "unknown"].includes(run.status)) continue;
+          if (await new ModelAnalysisService(this.store, this.options).reconcile(record, run) === "running") {
+            return { status: "running" as const, message: "原分析尚未结束，未重发。", work: this.store.summary(record) };
+          }
+        }
+        return undefined;
+      });
+      if (pending) return pending;
+    }
     const before = this.store.read(id);
     if (before.execution.runId?.startsWith("asset-")) return this.assets.recover(id);
     if (before.authoring?.runs.some(run => run.id === before.execution.runId)) return this.authoring.recover(id);

@@ -45,15 +45,15 @@ test("后台预览修复返回实际文件，保留视频且不再次调用模�
     const work = await fixture.createLegacyWork(client, { operationId: "preview-create", title: "预览修复", brief: "合成一秒视频", purpose: "test" });
     const started = await fixture.call(client, "produce_version", { operationId: "preview-produce", workId: work.id, kind: "sample" });
     assert.equal((await fixture.wait(client, started.executionId)).status, "succeeded");
-    const before = await fixture.call(client, "get_work", { workId: work.id }), version = before.versions[0];
+    const before = await fixture.call(client, "get_work", { view: "detail", workId: work.id }), version = before.versions[0];
     const previews = version.technicalCheck.previews as string[];
     rmSync(previews[1]!);
-    const missing = await fixture.call(client, "get_work", { workId: work.id });
+    const missing = await fixture.call(client, "get_work", { view: "detail", workId: work.id });
     assert.equal(missing.versions[0].previewAvailability.status, "incomplete");
     assert(!missing.versions[0].technicalCheck.previews.includes(previews[1]));
     const repair = await fixture.call(client, "render_version", { operationId: "preview-repair", workId: work.id, versionId: version.id });
     assert.equal((await fixture.wait(client, repair.executionId)).status, "succeeded");
-    const after = await fixture.call(client, "get_work", { workId: work.id });
+    const after = await fixture.call(client, "get_work", { view: "detail", workId: work.id });
     assert.equal(after.versions[0].previewAvailability.status, "available");
     assert(after.versions[0].technicalCheck.previews.every((path: string) => existsSync(path)));
     assert.equal(fileHash(version.videoLocation), version.videoSha256);
@@ -89,7 +89,7 @@ test("真实 MCP 在受理时冻结反馈，排队收到的新意见留待下一
     assert.equal(done.timing.receivedAt, request.receivedAt);
     assert.equal(done.timing.firstReturnedStatus, "succeeded");
     assert.deepEqual((await fixture.call(client, "get_execution", { executionId: start.executionId })).timing, done.timing);
-    const current = await fixture.call(client, "get_work", { workId: work.id });
+    const current = await fixture.call(client, "get_work", { view: "detail", workId: work.id });
     assert.equal(current.feedback.length, 1);
     assert.deepEqual(current.versions.at(-1).feedbackIds, []);
     assert.deepEqual(current.feedback[0].appliedInVersionIds, []);

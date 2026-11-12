@@ -7,6 +7,16 @@ import type { WorkVersion } from "../src/records/work-store.ts";
 import { captureSourceSnapshot, fileHash, verifySourceSnapshot } from "../src/records/source-snapshot.ts";
 import type { renderVersion } from "../src/media/render.ts";
 import { DocumentStore } from "../src/records/document-store.ts";
+import { createHash } from "node:crypto";
+import type { DraftSubmission } from "../src/records/authoring-contracts.ts";
+
+/** 调用方提供的合成文件来源与确认声明；不代表真实用户确认或真实素材。 */
+export function draftSubmission(markdown: string): DraftSubmission {
+  return { sourcePath: "/synthetic/user-reviewed-draft.md", contentSha256: createHash("sha256").update(markdown).digest("hex"),
+    authorization: { kind: "user", userInstruction: "合成用户确认：将此版本交给项目检查和设计。" } };
+}
+
+export function confirmedDraft<T extends { brief: string }>(input: T) { return { ...input, submission: draftSubmission(input.brief) }; }
 
 /** 合成已交接、已采用设计，供非模型设计能力测试复用；真实接入另测完整交接。 */
 export async function adoptedDesign(store: WorkStore, workId: string, markdown = "# 合成设计\n显示测试色块，检查交接。\n") {
@@ -15,6 +25,9 @@ export async function adoptedDesign(store: WorkStore, workId: string, markdown =
   const draft = store.read(workId).authoring!.drafts.at(-1)!;
   await documents.handoff(workId, draft, "合成用户指令：按本稿开始设计。", "fixture-handoff");
   const current = store.read(workId);
+  if (draft.reviewRequired) current.authoring!.runs.push({ id: "fixture-review", operationId: "fixture-review", kind: "review_draft", base: draft,
+    instruction: "合成通过，仅用于隔离其他模块测试。", assetIds: [], sendState: "acknowledged", status: "completed", inputPath: "fixture", inputSha256: "fixture", blockers: [],
+    draftReview: { status: "passed", summary: "合成检查", issues: [], usedExperienceRefs: [], limitations: ["不代表实际检查。"] } });
   const design = documents.append(current, "design", markdown, {
     operationId: "fixture-design", source: "project_ai", instruction: "合成设计夹具。", assetIds: [], draft,
   });
@@ -76,5 +89,6 @@ export const fixtureRender: typeof renderVersion = async (entry, output, _cache,
   mkdirSync(dirname(output), { recursive: true });
   writeFileSync(output, readFileSync(entry));
   return { width: 160, height: 90, fps: 10, durationSeconds: 1, videoCodec: "fixture", audioStreams: 0,
+    frameCount: 10, frameTiming: { checked: true, monotonic: true, expectedStepSeconds: 0.1 },
     decoded: true, sourceSha256: fileHash(entry), videoSha256: fileHash(output), previews: fixturePreviews(output), checkedAt: new Date().toISOString() };
 };

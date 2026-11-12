@@ -1,0 +1,9 @@
+{
+ "id":"effort-astra-review-one-minute","media":{"durationSeconds":60,"width":1080,"height":1920},
+ "variants":[{"id":"astra-medium","model":"gpt-6-astra","effort":"medium"},{"id":"astra-high","model":"gpt-6-astra","effort":"high"},{"id":"astra-xhigh","model":"gpt-6-astra","effort":"xhigh"},{"id":"astra-max","model":"gpt-6-astra","effort":"max"}],
+ "caseIds":["effort-review-control","effort-review-defects"],"repetitions":1,
+ "limits":{"modelTurnMs":1800000,"operationMs":7200000,"generationCalls":0,"mediaProbeMs":180000,"mediaDecodeMs":180000,"mediaPreviewMs":180000},
+ "providerKinds":[],"assetLibraries":[],
+ "repeatRule":"同一实际视频和材料准备规则；正常范围须独立核验，新发现不得直接算误报。每档一次不支持稳定排名。",
+ "choicePolicy":"模型固定Astra，四档均展示原始检查结果；等用户选强度。"
+}

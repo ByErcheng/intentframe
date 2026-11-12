@@ -75,13 +75,33 @@ chmod 600 config/local.json
 
 ## 提示词与模型配置
 
-提示词已集中维护。模型选择沿用 Codex 的配置与默认行为，机制见[模型选择](../docs/architecture.md#模型选择)；本项目不增加任务难度模型路由。图片与语音供应商的模型/音色属于工具配置，与制作主 AI 的选模分开。
+`local.json` 的必填 `models` 管理项目 Codex 调用，结构与当前初始选择见 [example.json](./example.json)。`default` 同时填写 `model` 与 `effort`；`stages` 按环节覆盖其中一项或两项，未覆盖字段继承 default。模型标识和强度不写入业务代码或提示词。此配置不修改用户全局 Codex 配置，也不改变当前外部聊天使用的模型。图片、语音、音乐等生成供应商仍独立使用 `providers`。
+
+当前初始选择是默认 Sol 6.1 / high，完整制作与独立内检覆盖为 Astra，视觉理解覆盖为 Terra 6.1；均继承 high。未来替换时只编辑本机文件对应值，重启 CLI/MCP。旧安装升级须从示例补上 `models`，不能以缺失字段静默沿用运行器默认。
+
+| stages 键 | 对应实际调用 |
+| --- | --- |
+| `draft_review`、`draft_revision` | 草稿检查、草稿修改 |
+| `design` | 视频设计，包含设计期间的素材判断与查找 |
+| `production_assets` | 采用设计后的只读素材方案：选择、搜索、检查与生成决策；不直接生成文件 |
+| `sample` | 无本轮反馈的样例制作 |
+| `production` | 无本轮反馈的完整制作 |
+| `feedback_revision` | 处理明确选定反馈的修改，包括内检提出的修复；优先于 sample/production |
+| `internal_review` | 独立新会话检查成片、设计实现与材料覆盖 |
+| `learning` | 独立经验整理 |
+| `visual_understanding` | 图片附件、实际素材图片、成片拼图的理解，向设计/制作/内检提供观察依据 |
+
+例如只将视频设计的推理强度改为 medium，在已有 `stages` 中加入 `"design": { "effort": "medium" }`；模型继续继承 default。未知键和空值会阻止启动。每次新推理先查询同一 Codex 运行器的模型目录，核对模型与强度支持情况，再显式传入 thread/start 或 thread/resume，以及 turn/start；返回模型或强度与请求不一致时停止，不降级、不自动重试。
+
+`doctor` 与 `get_runtime_info` 返回已加载的 models；这是配置状态，不等于已完成推理。每次执行保存 `modelSelection`（环节及请求值）、`model` 与 `reasoningEffort`（运行器返回值）。新版本即使接续原线程，也显式设置本轮选择；恢复只读取原轮次，不用新配置重发。已受理后台请求把 models 纳入配置指纹，修改后未启动的旧请求会明确拒绝执行。
+
+素材方案和视觉理解沿父任务串行运行，输入、输出与原生身份保存在作品的 `analysis/`。成片内检还会独立查看实际拼图，不自动接受视觉分析结论。只补材料、渲染恢复和 reconcile_only 不发起新推理。独立外部 AI 的审查与用户认可仍由外部入口记录，本项目不能替换外部聊天模型；本配置中的 internal_review 是项目提供的独立检查调用。
 
 提示词正文和任务说明模板维护在系统仓库的 [prompts/](../prompts/README.md)，按执行用途组织。程序读取、选取适用部分并填入本轮数据，内容组织见[主 AI 的必要输入](../docs/workflow.md#主-ai-的必要输入)。接口校验与执行逻辑仍由代码承担；模板只作明确占位替换，缺失必要输入会报错。
 
 通用提示词随系统版本维护，真实需求、反馈和每次实际输入保存在作品目录；来源与历史依据见[记录要求](../docs/data.md#制作输入与历史依据)。不能在本机配置中放真实任务内容，也不能在代码、提示词文件和文档中各维护一份相同长篇规则。
 
-项目启动或恢复制作会话时不显式指定模型，保存 Codex 返回的实际模型名。Codex 的显式模型配置与推荐默认项是不同信息；默认项不保证永久不变。需要调整模型时使用 Codex 自身的配置机制，不能把外部 ChatGPT 会话选择自动当作本机制作模型。Codex 登录凭据继续由运行器管理，不写入项目配置、提示词和日志；历史模型记录保留当时事实。
+Codex 登录凭据继续由运行器管理，不写入项目模型配置、提示词和日志；历史模型及强度缺值保持未知，不按当前选择补造。模型目录和线程返回值只证明客户端可核对的配置，不证明隐藏的服务端路由。接口依据见 [Codex app-server 官方文档](https://learn.chatgpt.com/docs/app-server)。
 
 ## 图片与豆包语音
 
@@ -108,7 +128,9 @@ chmod 600 config/local.json
 }
 ```
 
-`speech.model` 可省略，其他服务身份字段配置该服务时必填。服务端只返回是否配置，不回显 Key。实际声线、资源、模型和调用预算在用户确认后填写；示例值不能用于真实调用。
+`speech.model` 可省略，其他服务身份字段配置该服务时必填。服务端返回配置状态及可选音色编号和名称，不回显 Key。实际声线、资源、模型和调用预算在用户确认后填写；示例值不能用于真实调用。
+
+`speech.label` 和 `speech.description` 可选，分别说明默认音色的可辨认名称、用户提供的身份与依据；其他音色的 `voices` 项也支持 description。外部运行信息和项目内部能力查询返回 id、label、description、configured，不返回凭据。明确身份声明在适用范围内沿用；未提供的身份保持未知，配置存在不代表实调或听感已验证。具体用户身份只写本机配置或作品记录，不固化在通用代码中。
 
 使用复刻 2.0 音色并传入声音指令时，设置 `speech.resourceId` 为 `seed-icl-2.0`、`speech.model` 为 `seed-tts-2.0-expressive`。省略 model 默认使用标准模型，不能承接声音指令；项目会在发起调用前拒绝不兼容组合。声音要求随每次调用的 `voiceInstruction` 传递，不放入固定配置，具体用法见[素材调用](../scripts/README.md#图片配音与本机音乐)。
 
@@ -116,19 +138,40 @@ GPT 图片适配使用官方 Images API：无参考图调用 generations，有�
 
 请求发送前保留本机身份，网络超时或响应不明不自动重试；明确失败也不会静默换供应商。恢复只核对原保存的输出。新凭据和服务条件进入后台配置指纹；排队期间改变配置会拒绝按新条件启动。
 
-本机素材导入支持 PNG/JPEG/WebP 与 MP3/WAV/M4A/OGG/FLAC，单文件最多 128 MiB，图像最多 16,777,216 像素；实际类型和解码由媒体工具核对。背景音乐和用户自录音通过本机文件导入，不提供音乐生成、账号登录或音色训练能力。
+本机素材导入支持 PNG/JPEG/WebP 与 MP3/WAV/M4A/OGG/FLAC，单文件最多 128 MiB，图像最多 16,777,216 像素；实际类型和解码由媒体工具核对。网上下载同样支持这些格式，图片下载上限 32 MiB、音频 128 MiB，总时限 60 秒，最多三次重定向；普通文件地址可用，网页播放器、登录及提取接口未接入时会明确失败。没有新增杀毒、容器或统一重编码。
+
+### 其他音色、音乐与音效生成
+
+`speech.voices` 可选配置其他已有豆包音色，每项含 `id`、`label`、`speaker`、`resourceId`、可选 `model`。`id` 唯一且不能为保留值 default。调用时 `voiceId` 省略或为 default 使用当前默认音色；其余只接受已配置编号，使用同一账号凭据，不能通过工具传入凭据。实际服务权限与声音指令兼容性仍须核对，不提供声音训练或克隆入口。
+
+音乐和音效分别通过可选 `providers.music`、`providers.sound_effect` 接入 ElevenLabs HTTP API，每项包含 `apiKey`、`model`、`timeoutMs`（默认 300000）。示例模型为 `music_v2_5` 和 `eleven_text_to_sound_v3`；接入时按实际账号核对。本机原配置未自动增加这两项，`config/example.json` 继续以空 providers 表示默认不启用付费服务。
+
+音乐接收 prompt、3–600 秒 durationSeconds，以及 forceInstrumental（默认 true）；音效接收 prompt、0.5–30 秒 durationSeconds，以及 loop（默认 false）。输出请求为 MP3；时长和循环是生成要求，实际文件另行技术检查，不证明听感。未配置时在发送前拒绝；超时或不完整响应保持未知，已有完整响应可离线恢复，不使用新凭据重发。
+
+接口依据：[音乐生成](https://elevenlabs.io/docs/api-reference/music/compose)、[音效生成](https://elevenlabs.io/docs/api-reference/text-to-sound-effects/convert)。配置存在不代表真实调用已经验证；验证状态见[当前实现](../docs/architecture.md#当前实现与下一步)。
 
 ## 本机素材库
 
-可选 `assetLibraries` 指定项目允许检索的本机目录，默认 `[]`。每项有唯一 `id`、绝对路径或相对仓库的 `path`，以及 `role`（reference/image/narration/music）。目录只读，跳过符号链接；选择后复制入作品，源文件不移动。当前用户本机音乐目录在私有配置登记，不写入通用默认配置。名称与分类用于筛选候选，不代表图片已查看或音乐已试听。
+可选 `assetLibraries` 指定项目允许检索的本机目录，默认 `[]`。每项有唯一 `id`、绝对路径或相对仓库的 `path`，以及 `role`（reference/image/narration/music/sound_effect）。可选 `roleOverrides` 按库内文件或子目录的相对路径覆盖用途，最长的完整路径匹配优先；路径不能越界或重复。这样可以保留原分类，同时单独检索音效。目录只读，跳过符号链接；选择后复制入作品，源文件不移动。实际素材位置只在私有配置登记。
+
+可选 `usageNotes` 保存用户对该库的使用声明及依据，例如已确认可商用；`attributionPaths` 列出需要署名的库内相对目录或文件，按完整路径边界匹配，可为 `[]` 表示该库未要求署名。未配置不从目录名推断许可或署名要求。声明和提醒通过素材检索、导入、复用及版本摘要返回；历史保存内容与当前配置说明分别表达。使用规则统一见[素材来源与使用说明](../docs/data.md#素材来源与使用说明)。
 
 ```json
 {
   "assetLibraries": [
-    { "id": "background-music", "path": "/your/local/music", "role": "music" }
+    {
+      "id": "background-music",
+      "path": "../intentframe-data/library/music",
+      "role": "music",
+      "roleOverrides": [{ "path": "自然-特效", "role": "sound_effect" }]
+    },
+    { "id": "shared-images", "path": "../intentframe-data/library/images", "role": "image" },
+    { "id": "shared-narration", "path": "../intentframe-data/library/narration", "role": "narration" }
   ]
 }
 ```
+
+修改配置后重启已有 MCP 连接。运行 `./scripts/intentframe index-assets` 建立或刷新总数据目录的 `library/index.json`；该命令只读取文件并计算摘要，不解码、试听或联网。索引内容、过期处理和作品副本的分工见[共享素材库与索引](../docs/data.md#共享素材库与索引)。
 
 自动听音已按用户要求移除；项目只提供音频元信息、字词时间及试听文件，不配置音频理解模型，也不把音频内容传给制作和审查模型。听感保持未检查，用户可通过本机音频确认。
 

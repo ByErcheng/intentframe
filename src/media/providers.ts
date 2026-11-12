@@ -1,12 +1,32 @@
 import { randomUUID } from "node:crypto";
 import { z } from "zod";
 import type { providersSchema } from "../config.ts";
+import { identifyMedia } from "./download-asset.ts";
 
 export type ProviderSettings = z.infer<typeof providersSchema>;
 export type Fetcher = typeof fetch;
-export type ProviderResponse = { status: number; body: string };
+export type ProviderResponse = { status: number; body: string; bodyEncoding?: "base64"; headers?: Record<string, string> };
 export type ProviderExchange = { saved?: ProviderResponse; capture?: (response: ProviderResponse) => void };
 export const voiceInstructionSchema = z.string().trim().min(1).max(2000);
+export const voiceIdSchema = z.string().regex(/^[a-z0-9-]{1,40}$/);
+/** 只返回供选择和沟通的配置声明，不能泄露账号凭据或把配置当作试听验证。 */
+export function configuredVoices(settings: ProviderSettings) {
+  const speech = settings.speech;
+  return speech ? [{ id: "default", label: speech.label ?? "本机默认音色", description: speech.description, configured: true },
+    ...(speech.voices ?? []).map(({ id, label, description }) => ({ id, label, description, configured: true }))] : [];
+}
+export function selectSpeechVoice(settings: NonNullable<ProviderSettings["speech"]>, voiceId?: string) {
+  if (!voiceId || voiceId === "default") return settings;
+  const voice = settings.voices?.find(item => item.id === voiceId);
+  if (!voice) throw new Error("所选音色未配置，请从媒体能力返回的音色编号选择。");
+  return { ...settings, label: voice.label, description: voice.description, speaker: voice.speaker, resourceId: voice.resourceId, model: voice.model };
+}
+export const musicInputSchema = z.object({ prompt: z.string().trim().min(1).max(4100),
+  durationSeconds: z.number().min(3).max(600), forceInstrumental: z.boolean().default(true) });
+export const soundEffectInputSchema = z.object({ prompt: z.string().trim().min(1).max(2000),
+  durationSeconds: z.number().min(0.5).max(30), loop: z.boolean().default(false) });
+export type AudioGeneration = ({ kind: "music" } & z.infer<typeof musicInputSchema>) |
+  ({ kind: "sound_effect" } & z.infer<typeof soundEffectInputSchema>);
 
 /** 标准复刻模型会忽略声音指令；调用前拒绝，避免脚本要求被静默丢弃。 */
 export function validateVoiceInstruction(settings: NonNullable<ProviderSettings["speech"]>, value?: string) {
@@ -30,7 +50,7 @@ export function speechSegments(markdown: string) {
   if ((markdown.match(/^```speech:/gm)?.length ?? 0) !== segments.length || new Set(segments.map(item => item.id)).size !== segments.length || segments.some(item => !item.text.trim())) throw new Error("人声台词区块未闭合、为空或编号重复。");
   return segments;
 }
-async function limitedBody(response: Response, limit: number): Promise<string> {
+async function limitedBytes(response: Response, limit: number): Promise<Buffer> {
   if (!response.body) throw new ProviderRequestError("服务未返回内容，保留原请求。", true);
   const reader = response.body.getReader(); const chunks: Uint8Array[] = []; let size = 0;
   try {
@@ -40,7 +60,7 @@ async function limitedBody(response: Response, limit: number): Promise<string> {
       chunks.push(result.value);
     }
   } finally { reader.releaseLock(); }
-  return Buffer.concat(chunks).toString("utf8");
+  return Buffer.concat(chunks);
 }
 async function send(fetcher: Fetcher, endpoint: string, init: RequestInit, timeoutMs: number, signal?: AbortSignal,
   exchange?: ProviderExchange, secret?: string) {
@@ -49,7 +69,7 @@ async function send(fetcher: Fetcher, endpoint: string, init: RequestInit, timeo
     let result = exchange?.saved;
     if (!result) {
       const response = await fetcher(endpoint, { ...init, redirect: "error", signal: signal ? AbortSignal.any([signal, deadline]) : deadline });
-      const body = await limitedBody(response, 100 * 1024 * 1024);
+      const body = (await limitedBytes(response, 100 * 1024 * 1024)).toString("utf8");
       result = { status: response.status, body: secret ? body.replaceAll(secret, "[REDACTED]") : body };
       // 在解析媒体和字幕之前保存完整响应；解析或登记失败可沿原请求离线恢复。
       exchange?.capture?.(result);
@@ -62,6 +82,43 @@ async function send(fetcher: Fetcher, endpoint: string, init: RequestInit, timeo
     if (error instanceof ProviderRequestError) throw error;
     // 网络错误和响应正文均可能携带凭据，不把底层文本转发给模型或日志。
     throw new ProviderRequestError("生成服务连接结果未核实，保留原请求且不自动重发。", true);
+  }
+}
+
+/** 音乐与音效共用二进制交接，服务参数分别校验；响应落盘后才检查和登记。 */
+export async function generateAudio(settings: NonNullable<ProviderSettings["music"]>, input: AudioGeneration,
+  fetcher: Fetcher = fetch, signal?: AbortSignal, exchange?: ProviderExchange) {
+  const parameters = input.kind === "music" ? musicInputSchema.parse(input) : soundEffectInputSchema.parse(input);
+  const body = input.kind === "music"
+    ? { prompt: parameters.prompt, music_length_ms: Math.round(parameters.durationSeconds * 1000), model_id: settings.model,
+        force_instrumental: musicInputSchema.parse(input).forceInstrumental }
+    : { text: parameters.prompt, duration_seconds: parameters.durationSeconds, model_id: settings.model,
+        loop: soundEffectInputSchema.parse(input).loop };
+  let result = exchange?.saved;
+  try {
+    if (!result) {
+      const deadline = AbortSignal.timeout(settings.timeoutMs);
+      const response = await fetcher("https://api.elevenlabs.io/v1/" + (input.kind === "music" ? "music" : "sound-generation") + "?output_format=mp3_44100_128",
+        { method: "POST", redirect: "error", signal: signal ? AbortSignal.any([signal, deadline]) : deadline,
+          headers: { "xi-api-key": settings.apiKey, "Content-Type": "application/json" }, body: JSON.stringify(body) });
+      const bytes = await limitedBytes(response, response.ok ? 128 * 1024 * 1024 : 1024 * 1024);
+      const headers = Object.fromEntries(["content-type", "request-id", "song-id", "character-cost"]
+        .flatMap(key => { const value = response.headers.get(key); return value ? [[key, value.replaceAll(settings.apiKey, "[REDACTED]")]] : []; }));
+      result = { status: response.status, body: response.ok ? bytes.toString("base64") : bytes.toString("utf8").replaceAll(settings.apiKey, "[REDACTED]"),
+        ...(response.ok ? { bodyEncoding: "base64" as const } : {}), headers };
+      exchange?.capture?.(result);
+    }
+    if (result.status < 200 || result.status >= 300) {
+      throw new ProviderRequestError("音频生成服务返回 HTTP " + result.status + "；未自动重试。", ![400, 401, 403, 404, 422, 429].includes(result.status));
+    }
+    if (result.bodyEncoding !== "base64") throw new Error("缺少原始音频编码。");
+    const bytes = decodeBase64(result.body, 128 * 1024 * 1024);
+    if (identifyMedia(bytes).extension !== ".mp3") throw new Error("服务未返回请求的 MP3。");
+    return { bytes, metadata: { provider: "elevenlabs", kind: input.kind, model: settings.model, parameters: body,
+      responseHeaders: result.headers ?? {}, listeningStatus: "not_checked" } };
+  } catch (error) {
+    if (error instanceof ProviderRequestError) throw error;
+    throw new ProviderRequestError("音频生成响应或本机保存未核实，保留原请求且不自动重发。", true);
   }
 }
 function decodeBase64(value: string, limit: number) {

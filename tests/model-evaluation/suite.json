@@ -1,0 +1,32 @@
+{
+  "version": 2,
+  "cases": [
+    {"id":"draft-basic","operation":"review_draft","level":"control","evaluates":["draft_review"],"input":"inputs/drafts/basic-correction.md","requires":[]},
+    {"id":"draft-intent","operation":"review_draft","level":"control","evaluates":["draft_review"],"input":"inputs/drafts/open-decision.md","requires":[]},
+    {"id":"draft-clean","operation":"review_draft","level":"control","evaluates":["draft_review"],"input":"inputs/drafts/clean.md","requires":[]},
+    {"id":"draft-complex","operation":"review_draft","level":"representative","evaluates":["draft_review"],"input":"inputs/drafts/commute-review.md","requires":[]},
+    {"id":"revise-basic","operation":"revise_draft","level":"control","evaluates":["draft_revision"],"input":"inputs/drafts/revise-basic.md","requires":[]},
+    {"id":"revise-complex","operation":"revise_draft","level":"representative","evaluates":["draft_revision"],"input":"inputs/drafts/commute-revise.md","requires":[]},
+    {"id":"design-market","operation":"design_video","level":"representative","evaluates":["design","design_assets"],"input":"inputs/market.md","requires":["checked_draft"]},
+    {"id":"design-commute","operation":"design_video","level":"representative","evaluates":["design","design_assets"],"input":"inputs/commute.md","requires":["checked_draft"]},
+    {"id":"produce-commute","operation":"produce_version","level":"representative","evaluates":["production","production_assets"],"input":"inputs/designs/commute.md","requires":["adopted_common_design","frozen_resources"]},
+    {"id":"review-clean","operation":"inspect_only","level":"representative","evaluates":["internal_review"],"input":"inputs/review.md","requires":["library_clean","verified_review_materials"]},
+    {"id":"review-defects","operation":"inspect_only","level":"representative","evaluates":["internal_review"],"input":"inputs/review.md","requires":["library_defects","verified_review_materials"]},
+    {"id":"revise-library","operation":"produce_version","level":"representative","evaluates":["feedback_revision"],"input":"inputs/feedback.md","requires":["library_defects","fixed_feedback"]},
+    {"id":"learning-history","operation":"organize_experience","level":"representative","evaluates":["learning"],"input":"inputs/learning/records.md","requires":["traceable_learning_sources"]},
+    {"id":"prepare-library","operation":"produce_version","level":"representative","evaluates":["baseline_preparation"],"input":"inputs/designs/library.md","requires":["adopted_common_design"]},
+    {"id":"asset-decisions","operation":"prepare_assets","level":"representative","evaluates":["production_assets"],"input":"inputs/asset-decisions.md","requires":["adopted_common_design","image_provider"]},
+    {"id":"effort-draft-errors","operation":"review_draft","level":"representative","evaluates":["draft_review"],"input":"inputs/one-minute/draft-errors.md","requires":[]},
+    {"id":"effort-draft-clean","operation":"review_draft","level":"control","evaluates":["draft_review"],"input":"inputs/one-minute/draft-clean.md","requires":[]},
+    {"id":"effort-draft-intent","operation":"review_draft","level":"control","evaluates":["draft_review"],"input":"inputs/one-minute/draft-intent.md","requires":[]},
+    {"id":"effort-revise","operation":"revise_draft","level":"representative","evaluates":["draft_revision"],"input":"inputs/one-minute/revise.md","requires":[]},
+    {"id":"effort-design","operation":"design_video","level":"representative","evaluates":["design","design_assets"],"input":"inputs/one-minute/brief.md","requires":["checked_draft"]},
+    {"id":"effort-produce","operation":"produce_version","level":"representative","evaluates":["production","production_assets"],"input":"inputs/one-minute/design.md","requires":["adopted_common_design","frozen_resources"]},
+    {"id":"effort-review-control","operation":"inspect_only","level":"representative","evaluates":["internal_review"],"input":"inputs/one-minute/review.md","requires":["minute_control","verified_review_materials"]},
+    {"id":"effort-review-defects","operation":"inspect_only","level":"representative","evaluates":["internal_review"],"input":"inputs/one-minute/review.md","requires":["minute_defects","verified_review_materials"]},
+    {"id":"effort-feedback","operation":"produce_version","level":"representative","evaluates":["feedback_revision"],"input":"inputs/one-minute/feedback.md","requires":["minute_defects","fixed_feedback"]},
+    {"id":"effort-assets","operation":"prepare_assets","level":"representative","evaluates":["production_assets"],"input":"inputs/one-minute/assets.md","requires":["adopted_common_design","image_provider"]},
+    {"id":"effort-learning","operation":"organize_experience","level":"representative","evaluates":["learning"],"input":"inputs/one-minute/learning.md","requires":["traceable_learning_sources"]},
+    {"id":"effort-visual","operation":"inspect_visuals","level":"representative","evaluates":["visual_understanding"],"input":"inputs/one-minute/visual.md","requires":["minute_control","verified_review_materials"]}
+  ]
+}

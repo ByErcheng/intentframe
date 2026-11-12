@@ -4,7 +4,7 @@ import { existsSync, linkSync, mkdirSync, readFileSync, realpathSync, renameSync
 import { createRequire } from "node:module";
 import { dirname, isAbsolute, join, relative, sep } from "node:path";
 import { bundle } from "@remotion/bundler";
-import { makeCancelSignal, renderMedia, selectComposition } from "@remotion/renderer";
+import { makeCancelSignal, openBrowser, renderMedia, selectComposition } from "@remotion/renderer";
 import type { Compiler } from "webpack";
 import { z } from "zod";
 import { configuration, repositoryRoot } from "../config.ts";
@@ -13,6 +13,7 @@ import { fileHash } from "../common/file-hash.ts";
 import type { SourceSnapshot } from "../records/source-snapshot.ts";
 import { checkExecution, ExecutionBudgetExceeded } from "../runtime/execution-control.ts";
 import { previewFractions, previewPath } from "./previews.ts";
+import { assertRendererPatch } from "./renderer-patch.ts";
 export { fileHash } from "../common/file-hash.ts";
 
 const require = createRequire(import.meta.url);
@@ -30,7 +31,19 @@ function inside(root: string, path: string) {
 }
 
 const receiptSchema = z.object({ sourceFingerprint: z.string(), videoSha256: z.string(), frameRange: z.tuple([z.number(), z.number()]).optional() });
-export type RenderOptions = { sourceSnapshot?: SourceSnapshot; expectedVideoSha256?: string; signal?: AbortSignal; frameRange?: [number, number] };
+export type RenderStage = "bundle" | "browser" | "composition" | "render" | "frames" | "encoding" | "verification" | "cleanup";
+export type RenderOptions = { sourceSnapshot?: SourceSnapshot; expectedVideoSha256?: string; signal?: AbortSignal; frameRange?: [number, number];
+  onStage?: (stage: RenderStage) => void };
+
+/** 本项目导出恒定帧率视频；技术时间连续性不表示动作或节奏已审查。 */
+export function verifyFrameTiming(frameCount: number, frameTimes: number[], expectedFrames: number, fps: number) {
+  if (!Number.isFinite(fps) || fps <= 0 || !Number.isSafeInteger(expectedFrames) || expectedFrames < 1 ||
+    frameCount !== expectedFrames || frameTimes.length !== expectedFrames || frameTimes.some((time, index) =>
+      !Number.isFinite(time) || (index > 0 && time <= frameTimes[index - 1]!) || Math.abs(time - index / fps) > 0.1 / fps + 0.0001)) {
+    throw new Error("成片帧数或帧时间戳与制作工程不一致。");
+  }
+  return { checked: true, monotonic: true, expectedStepSeconds: 1 / fps };
+}
 
 /** 停止后等实际子进程关闭，避免释放任务占用时媒体工具仍在写文件。 */
 export function mediaCommand(executable: string, args: string[], timeoutMs: number, signal?: AbortSignal): Promise<string> {
@@ -62,6 +75,7 @@ export function mediaCommand(executable: string, args: string[], timeoutMs: numb
 
 /** 现有成片只有在来源与字节均能核对时才复用；未知文件保留并报错。 */
 export async function renderVersion(entryPoint: string, output: string, cacheDirectory: string, options: RenderOptions = {}) {
+  assertRendererPatch();
   const deadline = new AbortController();
   const timer = setTimeout(() => deadline.abort(new ExecutionBudgetExceeded("渲染达到已配置的等待上限。")), configuration.media.renderTimeoutMs);
   const signal = options.signal ? AbortSignal.any([options.signal, deadline.signal]) : deadline.signal;
@@ -113,6 +127,48 @@ async function restorePreviews(output: string, expectedVideoSha256: string, sign
   return { previews, previewsCheckedAt: new Date().toISOString() };
 }
 
+/** 每次渲染持有自己的浏览器，成功、失败与取消都等待该实例关闭。 */
+async function renderCandidate(serveUrl: string, candidate: string, createMedia: boolean, options: RenderOptions) {
+  options.onStage?.("browser"); checkExecution(options.signal);
+  const browser = await openBrowser("chrome");
+  let failure: unknown;
+  try {
+    checkExecution(options.signal);
+    options.onStage?.("composition");
+    const composition = await selectComposition({ serveUrl, id: "Video", puppeteerInstance: browser });
+    if (options.frameRange && (!options.frameRange.every(Number.isSafeInteger) || options.frameRange[0] < 0 ||
+      options.frameRange[1] < options.frameRange[0] || options.frameRange[1] >= composition.durationInFrames)) throw new Error("预览帧范围超出工程。");
+    checkExecution(options.signal);
+    if (createMedia) {
+      const { cancel, cancelSignal } = makeCancelSignal();
+      let started = false, encodingReported = false;
+      // 4.0.541 在启动完成前取消会先执行 cleanup，随后才创建轮换标签页的定时器。
+      // 先记住取消，等 onStart 表明启动清理已注册后再交给依赖；不以 Promise 返回代替资源关闭。
+      const abort = () => { if (started) cancel(); };
+      options.signal?.addEventListener("abort", abort, { once: true });
+      try {
+        checkExecution(options.signal); options.onStage?.("render");
+        await renderMedia({ serveUrl, composition, codec: "h264", outputLocation: candidate, puppeteerInstance: browser,
+          pixelFormat: "yuv420p", concurrency: configuration.media.concurrency, overwrite: true, cancelSignal, frameRange: options.frameRange,
+          onStart: () => { started = true; options.onStage?.("frames"); if (options.signal?.aborted) cancel(); },
+          onProgress: progress => { if (progress.encodedFrames > 0 && !encodingReported) { encodingReported = true; options.onStage?.("encoding"); } },
+        });
+      } finally { options.signal?.removeEventListener("abort", abort); }
+    }
+    checkExecution(options.signal);
+    return composition;
+  } catch (error) {
+    failure = options.signal?.aborted ? options.signal.reason ?? error : error;
+    throw failure;
+  } finally {
+    try { options.onStage?.("cleanup"); }
+    finally {
+      try { await browser.close({ silent: true }); }
+      catch (error) { throw new AggregateError(failure ? [failure, error] : [error], "渲染浏览器清理失败，未确认资源已关闭。"); }
+    }
+  }
+}
+
 async function renderAndVerify(entryPoint: string, output: string, cacheDirectory: string, options: RenderOptions) {
   checkExecution(options.signal);
   const snapshot = options.sourceSnapshot ?? captureSourceSnapshot(entryPoint);
@@ -135,6 +191,7 @@ async function renderAndVerify(entryPoint: string, output: string, cacheDirector
   const sourceRoot = realpathSync(dirname(entryPoint));
   const dependencies = realpathSync(join(repositoryRoot, "node_modules"));
   const configFiles = new Set(["package.json", "tsconfig.json"].map(name => realpathSync(join(repositoryRoot, name))));
+  options.onStage?.("bundle");
   const serveUrl = await bundle({
     entryPoint, rootDir: repositoryRoot, outDir: join(cacheDirectory, "bundle"),
     publicDir: existsSync(join(sourceRoot, "public")) ? join(sourceRoot, "public") : null,
@@ -159,38 +216,32 @@ async function renderAndVerify(entryPoint: string, output: string, cacheDirector
     }),
   });
   checkExecution(options.signal);
-  const composition = await selectComposition({ serveUrl, id: "Video" });
-  if (options.frameRange && (!options.frameRange.every(Number.isSafeInteger) || options.frameRange[0] < 0 ||
-    options.frameRange[1] < options.frameRange[0] || options.frameRange[1] >= composition.durationInFrames)) throw new Error("预览帧范围超出工程。");
-  checkExecution(options.signal);
   const temporary = output + ".partial.mp4", candidate = outputExists ? output : temporary;
-  if (!outputExists) {
-    const { cancel, cancelSignal } = makeCancelSignal();
-    options.signal?.addEventListener("abort", cancel, { once: true });
-    try {
-      checkExecution(options.signal);
-      await renderMedia({ serveUrl, composition, codec: "h264", outputLocation: temporary,
-        pixelFormat: "yuv420p", concurrency: configuration.media.concurrency, overwrite: true, cancelSignal, frameRange: options.frameRange });
-    } finally { options.signal?.removeEventListener("abort", cancel); }
-  }
+  const composition = await renderCandidate(serveUrl, candidate, !outputExists, options);
   checkExecution(options.signal);
+  options.onStage?.("verification");
   const { ffmpeg, ffprobe } = mediaBinaries();
   const metadata = z.object({
     streams: z.array(z.object({ codec_type: z.string(), codec_name: z.string().optional(),
-      width: z.number().optional(), height: z.number().optional(), avg_frame_rate: z.string().optional() })),
+      width: z.number().optional(), height: z.number().optional(), avg_frame_rate: z.string().optional(), nb_read_frames: z.string().optional() })),
+    frames: z.array(z.object({ media_type: z.string(), best_effort_timestamp_time: z.string().optional() })),
     format: z.object({ duration: z.string() }),
-  }).parse(JSON.parse(await mediaCommand(ffprobe, ["-v", "error", "-show_streams", "-show_format", "-of", "json", candidate],
+  }).parse(JSON.parse(await mediaCommand(ffprobe, ["-v", "error", "-count_frames", "-show_streams", "-show_format", "-show_frames",
+    "-show_entries", "stream:format:frame=media_type,best_effort_timestamp_time", "-of", "json", candidate],
     configuration.media.probeTimeoutMs, options.signal)));
   const video = metadata.streams.find(stream => stream.codec_type === "video");
   const [numerator, denominator] = (video?.avg_frame_rate ?? "").split("/").map(Number);
   const fps = numerator !== undefined && denominator !== undefined ? numerator / denominator : NaN;
   const duration = Number(metadata.format.duration), expectedFrames = options.frameRange ? options.frameRange[1] - options.frameRange[0] + 1 : composition.durationInFrames;
   const expectedDuration = expectedFrames / composition.fps;
+  const frameCount = Number(video?.nb_read_frames), frameTimes = metadata.frames.filter(frame => frame.media_type === "video")
+    .map(frame => frame.best_effort_timestamp_time === undefined ? NaN : Number(frame.best_effort_timestamp_time));
   if (!video || video.width !== composition.width || video.height !== composition.height ||
       !Number.isFinite(fps) || Math.abs(fps - composition.fps) > 0.001 ||
       !Number.isFinite(duration) || Math.abs(duration - expectedDuration) > 0.15) {
     throw new Error("成片规格（包括实际帧率）与制作工程不一致。");
   }
+  const frameTiming = verifyFrameTiming(frameCount, frameTimes, expectedFrames, fps);
   // 包内精简 FFmpeg 需要显式选择解码验证的输出编码器。
   await mediaCommand(ffmpeg, ["-v", "error", "-xerror", "-i", candidate, "-c:v", "rawvideo", "-c:a", "pcm_s16le", "-f", "null", "-"],
     configuration.media.decodeTimeoutMs, options.signal);
@@ -211,6 +262,7 @@ async function renderAndVerify(entryPoint: string, output: string, cacheDirector
   if (fileHash(output) !== videoSha256) throw new Error("检查期间成片发生变化，结果未获确认。");
   verifySourceSnapshot(entryPoint, snapshot);
   return { width: video.width, height: video.height, fps, durationSeconds: duration,
+    frameCount, frameTiming,
     videoCodec: video.codec_name, audioStreams: metadata.streams.filter(s => s.codec_type === "audio").length,
     decoded: true, videoSha256, sourceSha256: fileHash(entryPoint), previews, checkedAt: new Date().toISOString() };
 }

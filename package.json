@@ -10,7 +10,9 @@
     "start": "node src/cli.ts",
     "mcp": "node src/cli.ts mcp",
     "doctor": "node src/cli.ts doctor",
-    "test": "node --test tests/*.test.ts",
+    "test": "node --test --test-concurrency=4 tests/*.test.ts",
+    "pretest": "node scripts/patch-renderer.ts --check",
+    "patch:renderer": "node scripts/patch-renderer.ts",
     "check": "tsc --noEmit",
     "test:local": "node scripts/test-local-handoff.ts",
     "backup:local": "node scripts/backup-local.ts"

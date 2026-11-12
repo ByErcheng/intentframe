@@ -1,0 +1,15 @@
+{
+  "id": "round-01-models-medium",
+  "variants": [
+    {"id":"sol61-medium","model":"gpt-6.1-sol","effort":"medium"},
+    {"id":"astra-medium","model":"gpt-6-astra","effort":"medium"},
+    {"id":"terra61-medium","model":"gpt-6.1-terra","effort":"medium"}
+  ],
+  "caseIds": ["draft-basic","draft-intent","draft-clean","draft-complex","revise-basic","revise-complex","design-market","design-commute","produce-commute","review-clean","review-defects","revise-library","learning-history"],
+  "repetitions": 1,
+  "limits": {"modelTurnMs":1800000,"operationMs":7200000,"generationCalls":24,"mediaProbeMs":180000,"mediaDecodeMs":180000,"mediaPreviewMs":180000},
+  "providerKinds": ["image","speech"],
+  "assetLibraries": "configured",
+  "repeatRule": "首轮用于观察；结果接近、波动或影响选择时，各候选等量复测，不挑选最佳一次。未完成复测时不宣称稳定排名。",
+  "choicePolicy": "先展示产物和逐环节比较，记录用户原话、对应运行和选择；允许并列、暂缓或均不合适。"
+}

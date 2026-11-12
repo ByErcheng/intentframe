@@ -11,7 +11,7 @@ import { checkExecution } from "../runtime/execution-control.ts";
 import { mediaBinaries, mediaEnvironment, mediaCommand } from "./render.ts";
 
 export const reviewRangeSchema = z.object({ startSeconds: z.number().finite().nonnegative(), endSeconds: z.number().finite().positive(),
-  fps: z.number().finite().positive().max(15), reason: z.string().trim().min(1).max(1000) })
+  fps: z.number().finite().positive().max(60), reason: z.string().trim().min(1).max(1000) })
   .refine(value => value.endSeconds > value.startSeconds, "补帧区间结束须晚于开始。");
 export type ReviewRange = z.infer<typeof reviewRangeSchema>;
 const artifactSchema = z.object({ path: z.string(), sha256: z.string() });
@@ -20,6 +20,8 @@ export const reviewBatchSchema = z.object({
   fps: z.number(), frameCount: z.number(), durationSeconds: z.number(), width: z.number(), height: z.number(),
   frames: z.array(artifactSchema.extend({ frame: z.number().int(), seconds: z.number(), reason: z.string() })),
   sheets: z.array(artifactSchema), audio: artifactSchema.optional(),
+  temporalAnalysis: artifactSchema.extend({ method: z.literal("adjacent-sampled-rgb-v1"), framePairs: z.number().int().nonnegative(),
+    sampledPixelStride: z.literal(16), maxMeanDifference: z.number().nonnegative().max(1) }).optional(),
   ranges: z.array(reviewRangeSchema), frameLimitReached: z.boolean(), limitations: z.array(z.string()), createdAt: z.string(),
 });
 export type ReviewBatch = z.infer<typeof reviewBatchSchema>;
@@ -50,12 +52,14 @@ const digits: Record<string, string[]> = {
   "8": ["111", "101", "111", "101", "111"], "9": ["111", "101", "111", "001", "111"], ".": ["000", "000", "000", "000", "010"],
 };
 function contactSheet(width: number, height: number, items: { pixels: Buffer; frame: number }[], fps: number) {
-  const columns = 3, label = 24, scale = 2, tileWidth = Math.floor(width / scale), tileHeight = Math.floor(height / scale);
+  const columns = 3, label = 24, scale = 2, imageWidth = Math.floor(width / scale), tileHeight = Math.floor(height / scale);
+  // 小尺寸画面仍需容纳完整时间标签，不能让标签写入相邻格或越过像素缓冲区。
+  const tileWidth = Math.max(imageWidth, ...items.map(item => 12 + (item.frame / fps).toFixed(2).length * 12));
   const sheetWidth = tileWidth * columns, sheetHeight = Math.ceil(items.length / columns) * (tileHeight + label);
   const pixels = Buffer.alloc(sheetWidth * sheetHeight * 3, 255);
   items.forEach((item, index) => {
     const x = index % columns * tileWidth, y = Math.floor(index / columns) * (tileHeight + label);
-    for (let row = 0; row < tileHeight; row++) for (let column = 0; column < tileWidth; column++) {
+    for (let row = 0; row < tileHeight; row++) for (let column = 0; column < imageWidth; column++) {
       const source = (row * scale * width + column * scale) * 3, target = ((y + label + row) * sheetWidth + x + column) * 3;
       item.pixels.copy(pixels, target, source, source + 3);
     }
@@ -72,7 +76,7 @@ function contactSheet(width: number, height: number, items: { pixels: Buffer; fr
 export function readReviewBatch(directory: string, expectedHash: string): ReviewBatch {
   const batch = reviewBatchSchema.parse(readJson(ownedPath(directory, "index.json")));
   if (batch.videoSha256 !== expectedHash) throw new Error("审查材料不属于当前视频。");
-  for (const item of [...batch.frames, ...batch.sheets, ...(batch.audio ? [batch.audio] : [])]) {
+  for (const item of [...batch.frames, ...batch.sheets, ...(batch.audio ? [batch.audio] : []), ...(batch.temporalAnalysis ? [batch.temporalAnalysis] : [])]) {
     if (fileHash(ownedPath(directory, item.path)) !== item.sha256) throw new Error("审查文件已变化或缺失：" + item.path);
   }
   return batch;
@@ -83,7 +87,7 @@ export async function prepareReviewBatch(video: string, expectedHash: string, di
   ranges: ReviewRange[] = [], signal?: AbortSignal, frameLimit = 240): Promise<ReviewBatch> {
   if (fileHash(video) !== expectedHash) throw new Error("原视频已变化，不能准备审查材料。");
   ranges = z.array(reviewRangeSchema).max(12).parse(ranges);
-  const planHash = valueHash({ ranges, frameLimit, algorithm: "temporal-motion-v1" });
+  const planHash = valueHash({ ranges, frameLimit, algorithm: "temporal-motion-v3-scoped-rate-grid" });
   if (existsSync(ownedPath(directory, "index.json"))) {
     const previous = readReviewBatch(directory, expectedHash);
     if (previous.planHash !== planHash) throw new Error("本批抽帧参数已固定，补充材料须使用新批次。");
@@ -99,19 +103,26 @@ export async function prepareReviewBatch(video: string, expectedHash: string, di
   if (ranges.some(range => range.endSeconds > duration + 1 / fps)) throw new Error("补帧范围超过实际成片时长。");
   const factor = Math.min(1, 640 / Math.max(stream.width, stream.height));
   const width = Math.max(2, Math.round(stream.width * factor)), height = Math.max(2, Math.round(stream.height * factor));
-  const required = new Set<number>([0, frameCount - 1]);
+  const required = new Set<number>();
   if (!ranges.length) {
+    required.add(0); required.add(frameCount - 1);
     const stride = Math.max(1, Math.ceil(fps / 2), Math.ceil(frameCount / Math.min(160, frameLimit / 2)));
     for (let frame = 0; frame < frameCount; frame += stride) required.add(frame);
   } else for (const range of ranges) {
-    const first = Math.floor(range.startSeconds * fps), last = Math.min(frameCount - 1, Math.ceil(range.endSeconds * fps));
-    for (let frame = first; frame <= last; frame += Math.max(1, Math.floor(fps / range.fps))) required.add(frame);
+    // 指定范围已有自己的端点；额外加入全片首尾会挤占约定预算并引入范围外材料。
+    const first = Math.max(0, Math.ceil(range.startSeconds * fps - 1e-8));
+    const last = Math.min(frameCount - 1, Math.floor(range.endSeconds * fps + 1e-8));
+    if (first > last) throw new Error("补帧区间未包含实际视频帧，请扩展至至少一帧。");
+    // 保留非整数步长，避免30fps视频的8fps请求因步长向下取整而被抽成10fps。
+    const step = Math.max(1, fps / range.fps);
+    for (let sample = 0; first + sample * step <= last + 1e-8; sample++) required.add(Math.min(last, Math.round(first + sample * step)));
     required.add(last);
   }
   if (required.size > frameLimit) throw new Error("请求的补帧数量超过单批上限，请缩小范围或拆分批次。");
   mkdirSync(directory, { recursive: true });
   const selected: { frame: number; reason: string; pixels: Buffer }[] = [];
   let reached = false, previous: Buffer | undefined, count = 0, lastAdaptive = -Infinity;
+  const changes: { frame: number; seconds: number; meanDifference: number }[] = [];
   await new Promise<void>((resolve, reject) => {
     checkExecution(signal);
     const child = spawn(mediaBinaries().ffmpeg, ["-v", "error", "-i", video, "-vf", `scale=${width}:${height}`, "-c:v", "rawvideo", "-pix_fmt", "rgb24", "-f", "image2pipe", "pipe:1"],
@@ -124,8 +135,16 @@ export async function prepareReviewBatch(video: string, expectedHash: string, di
     child.stdout.on("data", (chunk: Buffer) => {
       buffer = Buffer.concat([buffer, chunk]); const bytes = width * height * 3;
       while (buffer.length >= bytes) {
-        const current = buffer.subarray(0, bytes); let change = 0, samples = 0;
-        if (previous) for (let i = 0; i < bytes; i += 48) { change += Math.abs(current[i]! - previous[i]!); samples++; }
+        const current = buffer.subarray(0, bytes); let change = 0, rgbChange = 0, samples = 0;
+        if (previous) {
+          for (let i = 0; i < bytes; i += 48) {
+            const redDifference = Math.abs(current[i]! - previous[i]!);
+            change += redDifference;
+            rgbChange += redDifference + Math.abs(current[i + 1]! - previous[i + 1]!) + Math.abs(current[i + 2]! - previous[i + 2]!);
+            samples++;
+          }
+          changes.push({ frame: count, seconds: count / fps, meanDifference: Number((rgbChange / (samples * 3 * 255)).toFixed(6)) });
+        }
         const adaptive = !ranges.length && change / Math.max(1, samples) / 255 > 0.006 && count - lastAdaptive >= Math.max(1, Math.floor(fps / 10));
         const mandatory = required.has(count);
         // 为尚未经过的均匀采样保留位置，不能用开头的密集动作耗尽整片覆盖。
@@ -165,9 +184,15 @@ export async function prepareReviewBatch(video: string, expectedHash: string, di
     audio = { path: "mixed-audio.wav", sha256: fileHash(path) };
   }
   if (fileHash(video) !== expectedHash) throw new Error("抽帧期间视频变化，结果未获确认。");
+  const temporalAnalysis = { ...artifact("frame-changes.json", Buffer.from(JSON.stringify({ videoSha256: expectedHash,
+    method: "adjacent-sampled-rgb-v1", decodedFrames: count, width, height, fps, sampledPixelStride: 16,
+    timeBasis: "frame-index / average-frame-rate", changes,
+    limitation: "每个相邻解码帧均参与计算，但仅在缩放图像上每16个像素取样；变化量用于定位，不判断动作是否自然或语义是否正确。" }, null, 2) + "\n")),
+    method: "adjacent-sampled-rgb-v1" as const, framePairs: changes.length, sampledPixelStride: 16 as const,
+    maxMeanDifference: changes.reduce((maximum, item) => Math.max(maximum, item.meanDifference), 0) };
   const result: ReviewBatch = { schemaVersion: 1, id: directory.split(/[\\/]/).at(-1)!, videoSha256: expectedHash, planHash,
-    fps, frameCount, durationSeconds: duration, width, height, frames, sheets, audio, ranges, frameLimitReached: reached,
-    limitations: ["图片为实际视频抽帧；静帧与拼图不等于连续播放或听音检查。", "像素变化仅用于采样，不能证明所有语义问题或短暂事件均已覆盖。",
+    fps, frameCount, durationSeconds: duration, width, height, frames, sheets, audio, temporalAnalysis, ranges, frameLimitReached: reached,
+    limitations: ["图片为实际视频抽帧；静帧与拼图不等于连续播放或听音检查。", "相邻帧变化量仅用于采样与定位，不能证明所有语义问题或短暂事件均已覆盖。",
       ...(reached ? ["自动加密达到本批数量上限，仍保留全片时间覆盖；必要时按重点另建补充批次。"] : [])], createdAt: new Date().toISOString() };
   immutableJson(ownedPath(directory, "index.json"), result); return result;
 }

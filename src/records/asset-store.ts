@@ -11,9 +11,10 @@ import type { DocumentRef } from "./authoring-contracts.ts";
 import type { WorkRecord, WorkStore } from "./work-store.ts";
 import { mediaBinaries, mediaCommand } from "../media/render.ts";
 import { checkExecution } from "../runtime/execution-control.ts";
+import { assetMimeTypes, isAudioRole, voiceInfoSchema } from "./asset-types.ts";
+import type { VoiceInfo, LibraryUsage } from "./asset-types.ts";
+import { currentLibraryUsage } from "./asset-library.ts";
 
-export const assetMimeTypes: Record<string, string> = { ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp",
-  ".mp3": "audio/mpeg", ".wav": "audio/wav", ".m4a": "audio/mp4", ".ogg": "audio/ogg", ".flac": "audio/flac" };
 export class AssetStore {
   readonly store: WorkStore;
   constructor(store: WorkStore) { this.store = store; }
@@ -28,7 +29,7 @@ export class AssetStore {
 
   view(record: WorkRecord, id: string) {
     const asset = this.get(record, id);
-    return { ...asset, location: this.store.resolvePath(asset.path),
+    return { ...asset, currentLibraryUsage: currentLibraryUsage(asset.origin, configuration.assetLibraries, asset.usage), location: this.store.resolvePath(asset.path),
       metadata: asset.metadataPath ? readJson(this.store.resolvePath(asset.metadataPath)) : undefined };
   }
 
@@ -38,10 +39,12 @@ export class AssetStore {
   }
 
   async write(record: WorkRecord, input: { bytes: Buffer; extension: string; role: Asset["role"]; description: string; origin: string;
-    operationId: string; document?: DocumentRef; metadata?: unknown }, signal?: AbortSignal): Promise<Asset> {
+    operationId: string; document?: DocumentRef; metadata?: unknown; voice?: VoiceInfo; usage?: LibraryUsage }, signal?: AbortSignal): Promise<Asset> {
     checkExecution(signal);
+    const voice = input.voice === undefined ? undefined : voiceInfoSchema.parse(input.voice);
+    if (voice && input.role !== "narration") throw new Error("说话人和讲话记录仅适用于人声素材。");
     if (!input.bytes.length || input.bytes.length > 128 * 1024 * 1024 || !assetMimeTypes[input.extension]) throw new Error("素材类型或体积不受支持。");
-    const isAudio = ["music", "narration"].includes(input.role);
+    const isAudio = isAudioRole(input.role);
     if (!assetMimeTypes[input.extension]!.startsWith(isAudio ? "audio/" : "image/")) throw new Error("素材用途与文件类型不符。");
     const id = "asset-" + valueHash({ workId: record.id, operationId: input.operationId }).slice(0, 24);
     const directory = join("works", record.id, "assets", id), path = join(directory, "asset" + input.extension);
@@ -61,7 +64,7 @@ export class AssetStore {
     const metadataPath = join(directory, "metadata.json");
     immutableJson(this.store.resolvePath(metadataPath), { source: input.metadata ?? null, probe: checked });
     return assetSchema.parse({ id, path, sha256, bytes: input.bytes.length, mimeType: assetMimeTypes[input.extension], role: input.role,
-      description: input.description, origin: input.origin, operationId: input.operationId, document: input.document,
+      description: input.description, origin: input.origin, operationId: input.operationId, document: input.document, voice, usage: input.usage,
       metadataPath, metadataSha256: fileHash(this.store.resolvePath(metadataPath)), createdAt: new Date().toISOString() });
   }
 
@@ -75,7 +78,7 @@ export class AssetStore {
     return this.view(record, asset.id);
   }
 
-  async import(workId: string, sourcePath: string, role: Asset["role"], description: string, operationId: string, document?: DocumentRef, signal?: AbortSignal) {
+  async import(workId: string, sourcePath: string, role: Asset["role"], description: string, operationId: string, document?: DocumentRef, signal?: AbortSignal, voice?: VoiceInfo) {
     checkExecution(signal);
     if (!isAbsolute(sourcePath)) throw new Error("本机素材路径须为明确的绝对路径。");
     return this.store.withLock(workId, async () => {
@@ -90,7 +93,8 @@ export class AssetStore {
         bytes = readFileSync(descriptor);
       } finally { closeSync(descriptor); }
       const record = this.store.read(workId), asset = await this.write(record, { bytes, extension, role, description,
-        origin: "local:" + sourcePath, operationId, document }, signal);
+        origin: "local:" + sourcePath, operationId, document, voice,
+        usage: currentLibraryUsage("local:" + sourcePath, configuration.assetLibraries) }, signal);
       checkExecution(signal);
       return this.register(record, asset);
     });
@@ -109,7 +113,8 @@ export class AssetStore {
         if (!existsSync(metadata)) copyFileSync(this.store.resolvePath(asset.metadataPath), metadata, constants.COPYFILE_EXCL);
         if (fileHash(metadata) !== asset.metadataSha256) throw new Error("素材元数据副本不一致。");
       }
-      return { ...asset, source: "assets/" + basename(target), metadataSource: asset.metadataPath ? "assets/" + asset.id + "-metadata.json" : undefined };
+      return { ...asset, currentLibraryUsage: currentLibraryUsage(asset.origin, configuration.assetLibraries, asset.usage),
+        source: "assets/" + basename(target), metadataSource: asset.metadataPath ? "assets/" + asset.id + "-metadata.json" : undefined };
     });
   }
 }

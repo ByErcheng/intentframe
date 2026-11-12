@@ -5,7 +5,7 @@ import { Client } from "@modelcontextprotocol/client";
 import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
 import { repositoryRoot } from "../src/config.ts";
 import { ExecutionStore } from "../src/records/execution-store.ts";
-import { fakeCodex, fixtureRoot } from "./helpers.ts";
+import { fakeCodex, fixtureRoot, confirmedDraft } from "./helpers.ts";
 import { WorkStore } from "../src/records/work-store.ts";
 
 export function backgroundFixture(mode = "slow_completed", runtime: Record<string, number> = {}) {
@@ -49,7 +49,7 @@ export function backgroundFixture(mode = "slow_completed", runtime: Record<strin
   };
   // 明确构造升级前的记录；旧后台故障回归继续覆盖历史任务，新流程使用原始 call(create_work)。
   const createLegacyWork = async (client: Client, args: Record<string, unknown>) => {
-    const work = await call(client, "create_work", args);
+    const work = await call(client, "create_work", confirmedDraft({ ...args, brief: String(args.brief) }));
     const store = new WorkStore(args.purpose === "test" ? join(data, "testing") : data,
       args.purpose === "test" ? "test" : "production", data);
     const record = store.read(work.id); delete record.authoring; store.save(record);
@@ -81,7 +81,7 @@ export function backgroundFixture(mode = "slow_completed", runtime: Record<strin
       for (const id of existsSync(directory) ? readdirSync(directory) : []) {
         try {
           const work = JSON.parse(readFileSync(join(directory, id, "task.json"), "utf8"));
-          for (const run of [...work.versions, work.learningRun, ...(work.authoring?.runs ?? []),
+          for (const run of [...work.versions, work.learningRun, ...(work.authoring?.runs ?? []), ...(work.analysisRuns ?? []),
             ...work.versions.flatMap((version: { reviewPreparation?: { inspections: unknown[] } }) => version.reviewPreparation?.inspections ?? [])].filter(Boolean)) if (run.runnerPid) processes.add(run.runnerPid);
         } catch { /* 只清理本用例已登记的进程。 */ }
       }

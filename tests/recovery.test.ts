@@ -35,7 +35,7 @@ test("原结果已保存但任务写回失败，只补原结果并完成渲染�
     assert.equal(store.read(work.id).versions[0]!.production, "source_ready");
     assert(!existsSync(store.resolvePath(version.mediaPath)), "只补存不能生成媒体或声称已交付");
     assert.equal(new OperationStore(root.path).read("produce-once").state, "failed");
-    const recovered = await executeTool("recover_work", { operationId: "recover-once", workId: work.id }, new WorkService(store, {
+    const recovered = await executeTool("recover_work", { mode: "resume", operationId: "recover-once", workId: work.id }, new WorkService(store, {
       codexExecutable: fakeCodex(root.path, "read_only"), render: fixtureRender,
     }));
     assert(recovered);
@@ -109,7 +109,7 @@ test("仅补存缺失成片的已认可版本，保留完成与确认事实且�
       assert.equal(renders, 2);
       assert.equal(operations.read(request.operationId).state, "failed", "历史完成不能代替当前成片可用，提前补认成功回执");
     }
-    await executeTool("recover_work", { operationId: "recover-with-render", workId: work.id }, service);
+    await executeTool("recover_work", { mode: "resume", operationId: "recover-with-render", workId: work.id }, service);
     const restored = store.read(work.id);
     assert.equal(restored.versions[1]!.production, "ready");
     assert.equal(restored.versions[1]!.acceptance, "accepted");
